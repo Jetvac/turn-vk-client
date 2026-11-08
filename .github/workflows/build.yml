@@ -58,7 +58,9 @@ jobs:
           gomobile init
           mkdir -p android/app/libs
           gomobile bind -target=android/arm64,android/arm,android/amd64 -androidapi 24 \
-            -trimpath -ldflags="-s -w" -o android/app/libs/turnvk.aar ./mobile
+            -trimpath -ldflags="-s -w -checklinkname=0" -o android/app/libs/turnvk.aar ./mobile
+          # -checklinkname=0: github.com/wlynxg/anet (used by pion on Android)
+          # links to net internals, which newer Go refuses by default.
       - name: Build the app
         run: gradle -p android assembleRelease --no-daemon
       - uses: actions/upload-artifact@v4

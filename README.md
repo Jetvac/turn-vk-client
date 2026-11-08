@@ -52,7 +52,7 @@ Android (нужны Android SDK, NDK, JDK 17, Gradle 8.11):
 ```bash
 go install golang.org/x/mobile/cmd/gomobile@latest
 gomobile init
-gomobile bind -target=android -androidapi 24 -o android/app/libs/turnvk.aar ./mobile
+gomobile bind -target=android -androidapi 24 -ldflags="-checklinkname=0" -o android/app/libs/turnvk.aar ./mobile
 gradle -p android assembleRelease
 ```
 
