@@ -104,7 +104,8 @@ class MainActivity : ComponentActivity() {
 
     private fun connect(link: String, sessions: Int, obfs: String) {
         prefs.edit().putString("link", link).putInt("sessions", sessions).putString("obfs", obfs).putBoolean("captcha_mode", captchaMode).apply()
-        mobile.SetCaptchaMode(if captchaMode { "auto" } else { "manual" })
+        val mode = if captchaMode { "auto" } else { "manual" }
+        mobile.SetCaptchaMode(mode)
         val start = { TunnelService.connect(this, link, sessions, obfs) }
         val ask = VpnService.prepare(this)
         if (ask != null) {
