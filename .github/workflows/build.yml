@@ -76,11 +76,6 @@ jobs:
           done
           # -checklinkname=0: github.com/wlynxg/anet (used by pion on Android)
           # links to net internals, which newer Go refuses by default.
-      - name: Upload the Go binding (TEMP-DEBUG)
-        uses: actions/upload-artifact@v4
-        with:
-          name: turnvk-binding
-          path: android/app/libs/turnvk.aar
       - name: Build the app
         run: gradle -p android assembleRelease --no-daemon
       - uses: actions/upload-artifact@v4
