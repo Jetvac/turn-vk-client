@@ -35,6 +35,7 @@ import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
@@ -100,7 +101,8 @@ class MainActivity : ComponentActivity() {
     private val linkOverride = mutableStateOf<String?>(null)
 
     private fun connect(link: String, sessions: Int, obfs: String) {
-        prefs.edit().putString("link", link).putInt("sessions", sessions).putString("obfs", obfs).apply()
+        prefs.edit().putString("link", link).putInt("sessions", sessions).putString("obfs", obfs).putBoolean("captcha_mode", captchaMode).apply()
+        mobile.SetCaptchaMode(captchaMode)
         val start = { TunnelService.connect(this, link, sessions, obfs) }
         val ask = VpnService.prepare(this)
         if (ask != null) {
@@ -123,6 +125,7 @@ class MainActivity : ComponentActivity() {
         var link by remember { mutableStateOf(prefs.getString("link", "") ?: "") }
         var sessions by remember { mutableFloatStateOf(prefs.getInt("sessions", 16).toFloat()) }
         var obfs by remember { mutableStateOf(prefs.getString("obfs", "audio") ?: "audio") }
+        var captchaMode by remember { mutableStateOf(prefs.getBoolean("captcha_mode", false)) }
         LaunchedEffect(override) { override?.let { link = it } }
 
         // Open the captcha page as soon as VK asks for one.
@@ -158,6 +161,10 @@ class MainActivity : ComponentActivity() {
                     val cm = getSystemService(ClipboardManager::class.java)
                     cm.primaryClip?.getItemAt(0)?.coerceToText(this@MainActivity)?.toString()?.trim()?.let { link = it }
                 }) { Text("Вставить") }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Автокапча", style = MaterialTheme.typography.bodySmall)
+                Switch(checked = captchaMode, onCheckedChange = { captchaMode = it })
             }
 
             Text("Сессий: ${sessions.toInt()}")

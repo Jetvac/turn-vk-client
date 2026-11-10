@@ -171,6 +171,16 @@ func SubmitCaptcha(token string) { captcha.answer(token, nil) }
 // CancelCaptcha reports that the user closed the captcha.
 func CancelCaptcha() { captcha.answer("", errors.New("closed by the user")) }
 
+// SetCaptchaMode switches the engine's captcha handling between manual mode
+// (show VK's page and let the user solve it) and auto mode (solve it with the
+// captcha-auto solver). Call it before connecting so the next captcha uses the
+// selected mode.
+func SetCaptchaMode(auto bool) {
+	captcha.mu.Lock()
+	captcha.auto = auto
+	captcha.mu.Unlock()
+}
+
 // Address returns the tunnel address once connected, e.g. "10.66.66.7".
 func Address() string {
 	mu.Lock()
@@ -201,14 +211,6 @@ type result struct {
 func (s *solver) setPlatform(p Platform) {
 	s.mu.Lock()
 	s.p = p
-	s.mu.Unlock()
-}
-
-// SetCaptchaMode switches between manual mode (show VK's page) and auto mode
-// (solve it with the captcha-auto solver). The app sets it before connecting.
-func (s *solver) SetCaptchaMode(auto bool) {
-	s.mu.Lock()
-	s.auto = auto
 	s.mu.Unlock()
 }
 
