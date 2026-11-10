@@ -69,6 +69,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        captchaMode.value = prefs.getBoolean("captcha_mode", false)
         enableEdgeToEdge()
         handleLink(intent)
         if (Build.VERSION.SDK_INT >= 33 &&
@@ -99,10 +100,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private val linkOverride = mutableStateOf<String?>(null)
+    private val captchaMode by mutableStateOf(false)
 
     private fun connect(link: String, sessions: Int, obfs: String) {
-        prefs.edit().putString("link", link).putInt("sessions", sessions).putString("obfs", obfs).putBoolean("captcha_mode", captchaMode).apply()
-        mobile.SetCaptchaMode(if captchaMode { "auto" } else { "manual" })
+        prefs.edit().putString("link", link).putInt("sessions", sessions).putString("obfs", obfs).putBoolean("captcha_mode", captchaMode.value).apply()
+        mobile.SetCaptchaMode(if captchaMode.value { "auto" } else { "manual" })
         val start = { TunnelService.connect(this, link, sessions, obfs) }
         val ask = VpnService.prepare(this)
         if (ask != null) {
@@ -125,7 +127,6 @@ class MainActivity : ComponentActivity() {
         var link by remember { mutableStateOf(prefs.getString("link", "") ?: "") }
         var sessions by remember { mutableFloatStateOf(prefs.getInt("sessions", 16).toFloat()) }
         var obfs by remember { mutableStateOf(prefs.getString("obfs", "audio") ?: "audio") }
-        var captchaMode by remember { mutableStateOf(prefs.getBoolean("captcha_mode", false)) }
         LaunchedEffect(override) { override?.let { link = it } }
 
         // Open the captcha page as soon as VK asks for one.
@@ -151,7 +152,7 @@ class MainActivity : ComponentActivity() {
                 singleLine = true,
                 enabled = !active,
                 visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                keyboardOptions = KeyboardOptions(keyboardType=KeyboardType.Password),
                 isError = linkError.isNotEmpty(),
                 supportingText = { if (linkError.isNotEmpty()) Text(linkError) },
                 modifier = Modifier.fillMaxWidth(),
@@ -164,7 +165,7 @@ class MainActivity : ComponentActivity() {
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Автокапча", style = MaterialTheme.typography.bodySmall)
-                Switch(checked = captchaMode, onCheckedChange = { captchaMode = it })
+                Switch(checked = captchaMode.value, onCheckedChange = { captchaMode.value = it })
             }
 
             Text("Сессий: ${sessions.toInt()}")
