@@ -173,11 +173,18 @@ func CancelCaptcha() { captcha.answer("", errors.New("closed by the user")) }
 
 // SetCaptchaMode switches the engine's captcha handling between manual mode
 // (show VK's page and let the user solve it) and auto mode (solve it with the
-// captcha-auto solver). Call it before connecting so the next captcha uses the
+// captcha-auto solver). mode is "auto" or "manual". It's bound for gomobile,
+// so it takes a string rather than a bool (bool can't be a C function
+// parameter name). Call it before connecting so the next captcha uses the
 // selected mode.
-func SetCaptchaMode(auto bool) {
+func SetCaptchaMode(mode string) {
 	captcha.mu.Lock()
-	captcha.auto = auto
+	switch mode {
+	case "auto":
+		captcha.auto = true
+	default:
+		captcha.auto = false
+	}
 	captcha.mu.Unlock()
 }
 
