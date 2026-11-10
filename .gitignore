@@ -7,3 +7,7 @@ android/app/libs/
 android/local.properties
 .idea/
 *.iml
+
+# Local build artifacts
+_apk/
+*.apk
