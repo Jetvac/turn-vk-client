@@ -19,8 +19,6 @@ import (
 	"sync"
 	"time"
 
-	neturl "net/url"
-
 	fhttp "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
 
@@ -328,18 +326,20 @@ func parseCaptchaV2Page(html string) (*captchaV2Page, error) {
 	}
 	page.Init = &init
 
-	match = reCaptchaV2ScriptSrc.FindStringSubmatch(html)
-	if len(match) < 2 {
-		return nil, errors.New("captcha script url not found")
-	}
-	page.ScriptURL = match[1]
-
 	if m := reCaptchaV2PowInput.FindStringSubmatch(html); len(m) >= 2 {
 		page.PowInput = m[1]
 	}
 	if page.PowInput == "" {
 		return page, nil
 	}
+
+	// ScriptURL is only needed when a PoW is present (solveOnce uses it
+	// after the PoW check), so it's not required for a PoW-less page.
+	match = reCaptchaV2ScriptSrc.FindStringSubmatch(html)
+	if len(match) < 2 {
+		return nil, errors.New("captcha script url not found")
+	}
+	page.ScriptURL = match[1]
 
 	match = reCaptchaV2Difficulty.FindStringSubmatch(html)
 	if len(match) < 2 {

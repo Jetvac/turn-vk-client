@@ -64,7 +64,7 @@ func New(profile profile.Profile, saved *profile.SavedProfile, maxAttempts int) 
 		tlsclient.WithCookieJar(tlsclient.NewCookieJar()))
 	if err != nil {
 		log.Printf("[CAPTCHA] tls-client init failed: %v; using default", err)
-		client = tlsclient.NewHttpClient(tlsclient.NewNoopLogger())
+		client, err = tlsclient.NewHttpClient(tlsclient.NewNoopLogger())
 	}
 	return &Solver{client: client, profile: profile, saved: saved, maxAtts: maxAttempts}
 }

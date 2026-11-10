@@ -2,7 +2,6 @@ package captchaauto
 
 import (
 	"context"
-	"log"
 
 	"github.com/Jetvac/captcha-auto/profile"
 )

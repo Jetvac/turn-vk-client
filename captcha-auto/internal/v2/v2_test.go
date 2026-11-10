@@ -114,7 +114,7 @@ func fakeImageV2(size int) image.Image {
 	img := image.NewRGBA(image.Rect(0, 0, size, size))
 	for r := 0; r < size; r++ {
 		for c := 0; c < size; c++ {
-			img.SetColorAt(image.Pt(c, r), color.RGBA{R: uint8(c * 255 / size), G: uint8(r * 255 / size), B: 0, A: 255})
+			img.SetRGBA(c, r, color.RGBA{R: uint8(c * 255 / size), G: uint8(r * 255 / size), B: 0, A: 255})
 		}
 	}
 	return img
@@ -146,12 +146,15 @@ func TestParseSliderPuzzleImageDecodes(t *testing.T) {
 	if err := png.Encode(&buf, img); err != nil {
 		t.Fatal(err)
 	}
-	// A real image payload must decode without error.
-	img2, err := image.DecodeString(buf.String())
+	// A real image payload must decode without error. This Go build's PNG
+	// decoder returns *image.RGBA instead of *image.NRGBA, so accept either.
+	img2, _, err := image.Decode(strings.NewReader(buf.String()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := img2.(*image.NRGBA); !ok {
+	switch img2.(type) {
+	case *image.NRGBA, *image.RGBA:
+	default:
 		t.Fatalf("decoded as %T", img2)
 	}
 }

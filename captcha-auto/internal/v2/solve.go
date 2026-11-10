@@ -37,5 +37,5 @@ func SolveVkCaptchaV2(
 	savedProfile *profile.SavedProfile,
 	maxAttempts int,
 ) (string, string, error) {
-	return solveVkCaptchaV2(ctx, captchaErr, client, profile, savedProfile, maxAttempts)
+	return solveVkCaptchaV2Attempts(ctx, captchaErr, client, profile, savedProfile, maxAttempts)
 }

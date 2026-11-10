@@ -17,8 +17,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
-	fhttp "github.com/bogdanfinn/fhttp"
 )
 
 // solveSliderCaptcha solves a slider captcha. capType is "slider" on success.

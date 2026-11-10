@@ -133,6 +133,19 @@ func SetActiveFingerprint(fp string) { activeFingerprint = fp }
 // GetActiveFingerprint returns the current default profile pool.
 func GetActiveFingerprint() string { return activeFingerprint }
 
+// RandomProfile returns a random impersonation identity from the active pool.
+// It is the identity the solver sends with each request.
+func RandomProfile() Profile { return getRandomProfile() }
+
+// AndroidProfile returns the Android Chrome identity, best matched to the
+// platform that runs the engine.
+func AndroidProfile() Profile {
+	if len(androidProfiles) > 0 {
+		return androidProfiles[0]
+	}
+	return profileList[0]
+}
+
 func getRandomProfile() Profile {
 	switch activeFingerprint {
 	case "android":

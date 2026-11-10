@@ -2,6 +2,11 @@ module github.com/Jetvac/turn-vk-client
 
 go 1.26.0
 
+// captcha-auto is a local submodule (own go.mod). It's wired in here so the
+// engine can run the automatic VK captcha solver without pulling the heavy
+// tls-client dependency into the main module's build graph.
+replace github.com/Jetvac/captcha-auto => ./captcha-auto
+
 require (
 	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808
 	github.com/pion/dtls/v3 v3.1.15

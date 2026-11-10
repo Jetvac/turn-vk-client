@@ -16,6 +16,9 @@ import (
 
 	"golang.zx2c4.com/wireguard/tun"
 
+	"github.com/Jetvac/captcha-auto"
+	"github.com/Jetvac/captcha-auto/profile"
+
 	"github.com/Jetvac/turn-vk-client/core/engine"
 	"github.com/Jetvac/turn-vk-client/core/link"
 	"github.com/Jetvac/turn-vk-client/core/netx"
@@ -185,6 +188,9 @@ type solver struct {
 	mu      sync.Mutex
 	p       Platform
 	pending chan result
+	// auto, when true, solves captchas with the captcha-auto solver instead
+	// of showing VK's page to the user.
+	auto bool
 }
 
 type result struct {
@@ -198,14 +204,26 @@ func (s *solver) setPlatform(p Platform) {
 	s.mu.Unlock()
 }
 
+// SetCaptchaMode switches between manual mode (show VK's page) and auto mode
+// (solve it with the captcha-auto solver). The app sets it before connecting.
+func (s *solver) SetCaptchaMode(auto bool) {
+	s.mu.Lock()
+	s.auto = auto
+	s.mu.Unlock()
+}
+
 func (s *solver) SolveCaptcha(ctx context.Context, url string) (string, error) {
 	ch := make(chan result, 1)
 	s.mu.Lock()
 	s.pending = ch
+	auto := s.auto
 	p := s.p
 	s.mu.Unlock()
 	if p == nil {
 		return "", errors.New("no app to show the captcha")
+	}
+	if auto {
+		return s.solveAuto(ctx, url)
 	}
 	p.OnCaptcha(url)
 	select {
@@ -216,13 +234,27 @@ func (s *solver) SolveCaptcha(ctx context.Context, url string) (string, error) {
 	}
 }
 
+// solveAuto solves the captcha with the captcha-auto solver and returns the
+// success token VK issued. It never returns VK rejection errors.
+func (s *solver) solveAuto(ctx context.Context, url string) (string, error) {
+	prof := profile.AndroidProfile()
+	saved, _ := profile.LoadProfileFromDisk()
+	solver := captchaauto.CaptchaSolverFromProfile(prof, saved, 10)
+	return solver.SolveCaptcha(ctx, url)
+}
+
 func (s *solver) answer(token string, err error) {
 	s.mu.Lock()
 	ch := s.pending
+	auto := s.auto
+	p := s.p
 	s.pending = nil
 	s.mu.Unlock()
 	if ch != nil {
 		ch <- result{token, err}
+	}
+	if auto && token != "" && p != nil {
+		p.Log("автокапча пройдена")
 	}
 }
 
