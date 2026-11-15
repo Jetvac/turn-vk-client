@@ -7,8 +7,11 @@
 //  4. calls.okcdn.ru auth.anonymLogin        → session key
 //  5. calls.okcdn.ru vchat.joinConversationByLink → turn_server
 //
-// VK may answer step 2 or 3 with a captcha (error 14). The captcha is shown
+// VK may answer steps 1–3 with a captcha (error 14). The captcha is shown
 // to the user through a CaptchaSolver; nothing here solves it automatically.
+// The tokens of steps 1–3 live for a day and are kept in a Cache, so a
+// captcha comes up at most once a day per call: later credentials need
+// only steps 4 and 5.
 package vkcreds
 
 import (
@@ -39,6 +42,8 @@ const (
 	// Lifetime is how long credentials are used for new allocations.
 	// Allocations made with them keep working after that.
 	Lifetime = 8 * time.Minute
+	// Refresh is how often credentials with a known expiry are renewed.
+	Refresh = time.Hour
 	// minInterval spaces requests to VK so that several sessions starting
 	// together do not hit its rate limits.
 	minInterval = 2 * time.Second
@@ -51,6 +56,28 @@ type Creds struct {
 	Password string
 	Servers  []string // host:port of UDP TURN servers
 	Fetched  time.Time
+	// Expires is when VK stops accepting the credentials (zero: unknown).
+	Expires time.Time
+}
+
+// Fresh reports whether the credentials are still the ones to use for new
+// allocations. Credentials with a known expiry (VK's are good for 8 hours)
+// are renewed every Refresh; each renewal joins the call again, and VK
+// answers too frequent joins with "flood".
+func (c *Creds) Fresh() bool {
+	if c.Expires.IsZero() {
+		return time.Since(c.Fetched) < Lifetime
+	}
+	return time.Since(c.Fetched) < Refresh && c.Usable(30*time.Minute)
+}
+
+// Usable reports whether the credentials still work for new allocations
+// at least for d.
+func (c *Creds) Usable(d time.Duration) bool {
+	if c.Expires.IsZero() {
+		return time.Since(c.Fetched) < Lifetime
+	}
+	return time.Until(c.Expires) > d
 }
 
 // Captcha describes a captcha VK asked for.
@@ -96,16 +123,36 @@ func (e *APIError) Error() string {
 // RateLimited reports whether VK asked to slow down.
 func (e *APIError) RateLimited() bool { return e.Code == 6 || e.Code == 9 || e.Code == 29 }
 
+// Flood: VK refuses this guest more joins for a while
+// (participant.check.flood); a fresh guest is let in at once.
+func (e *APIError) Flood() bool { return strings.Contains(strings.ToLower(e.Message), "flood") }
+
 // Client fetches credentials. It is safe for concurrent use; requests to VK
 // are serialized.
 type Client struct {
 	HTTP    *http.Client
 	Captcha CaptchaSolver
+	Cache   *Cache
 	Logf    func(format string, args ...any)
 
-	mu   sync.Mutex
+	once sync.Once
+	sem  chan struct{} // one request sequence at a time; see lock
 	last time.Time
 }
+
+// lock waits for the client's turn, or for ctx: a captcha the user is
+// solving holds the client, and others give up when their time is up.
+func (c *Client) lock(ctx context.Context) error {
+	c.once.Do(func() { c.sem = make(chan struct{}, 1) })
+	select {
+	case c.sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Client) unlock() { <-c.sem }
 
 func (c *Client) logf(format string, args ...any) {
 	if c.Logf != nil {
@@ -115,8 +162,17 @@ func (c *Client) logf(format string, args ...any) {
 
 // Fetch joins the call with the given hash and returns its TURN credentials.
 func (c *Client) Fetch(ctx context.Context, hash string) (*Creds, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	return c.FetchAs(ctx, hash, 0)
+}
+
+// FetchAs is Fetch as guest number n of the call. VK limits the TURN
+// allocations of one guest (about 16–20), so more sessions than that need
+// more guests; each has its own saved tokens.
+func (c *Client) FetchAs(ctx context.Context, hash string, n int) (*Creds, error) {
+	if err := c.lock(ctx); err != nil {
+		return nil, err
+	}
+	defer c.unlock()
 	if wait := minInterval - time.Since(c.last); wait > 0 {
 		select {
 		case <-ctx.Done():
@@ -126,23 +182,54 @@ func (c *Client) Fetch(ctx context.Context, hash string) (*Creds, error) {
 	}
 	defer func() { c.last = time.Now() }()
 
-	link := joinBase + hash
-	device := uuid()
-	name := guestName()
+	key := hash
+	if n > 0 {
+		key = fmt.Sprintf("%s#%d", hash, n)
+	}
+	g := c.Cache.get(key)
+	if g != nil {
+		cr, err := c.join(ctx, hash, g)
+		var ae *APIError
+		if !errors.As(err, &ae) || ae.RateLimited() {
+			return cr, err
+		}
+		// VK no longer takes the saved guest (expired, or it joined too
+		// often): join as a new one.
+		c.logf("VK call %.8s…: saved guest refused (%v), joining as a new one", hash, err)
+		c.Cache.put(key, nil)
+	}
+	c.logf("VK call %.8s…: joining as new guest %d", hash, n+1)
+	g, err := c.newGuest(ctx, hash)
+	if err != nil {
+		return nil, err
+	}
+	c.Cache.put(key, g)
+	return c.join(ctx, hash, g)
+}
 
+// newGuest joins the call as a new anonymous guest (steps 1–3). These are
+// the steps VK may ask a captcha for.
+func (c *Client) newGuest(ctx context.Context, hash string) (*guest, error) {
+	link := joinBase + hash
+	g := &guest{Device: uuid(), Name: guestName()}
 	r, err := c.callsAPI(ctx, "auth.getAnonymToken", url.Values{
-		"client_id": {callsClientID}, "link": {link}, "device_id": {device}, "anonymName": {name},
+		"client_id": {callsClientID}, "link": {link}, "device_id": {g.Device}, "anonymName": {g.Name},
 	})
 	if err != nil {
 		return nil, err
 	}
-	anon, err := str(r, "response", "token")
-	if err != nil {
+	if g.Anon, err = str(r, "response", "token"); err != nil {
 		return nil, fmt.Errorf("VK getAnonymToken: %w", err)
+	}
+	if exp, err := num(r, "response", "expired_at"); err == nil {
+		g.Expires, _ = strconv.ParseInt(exp, 10, 64)
+	}
+	if g.Expires == 0 {
+		g.Expires = time.Now().Add(12 * time.Hour).Unix()
 	}
 
 	r, err = c.callsAPI(ctx, "messages.getCallPreview", url.Values{
-		"anonymous_token": {anon}, "device_id": {device}, "extended": {"1"}, "fields": {"first_name,last_name"}, "link": {link},
+		"anonymous_token": {g.Anon}, "device_id": {g.Device}, "extended": {"1"}, "fields": {"first_name,last_name"}, "link": {link},
 	})
 	if err != nil {
 		return nil, err
@@ -157,18 +244,21 @@ func (c *Client) Fetch(ctx context.Context, hash string) (*Creds, error) {
 	}
 
 	r, err = c.callsAPI(ctx, "messages.getAnonymCallToken", url.Values{
-		"anonymous_token": {anon}, "device_id": {device}, "link": {link}, "name": {name},
+		"anonymous_token": {g.Anon}, "device_id": {g.Device}, "link": {link}, "name": {g.Name},
 		"user_id": {userID}, "secret": {secret},
 	})
 	if err != nil {
 		return nil, err
 	}
-	callToken, err := str(r, "response", "token")
-	if err != nil {
+	if g.Call, err = str(r, "response", "token"); err != nil {
 		return nil, fmt.Errorf("VK getAnonymCallToken: %w", err)
 	}
+	return g, nil
+}
 
-	r, err = c.okAPI(ctx, "auth.anonymLogin", url.Values{
+// join gets TURN credentials for the guest (steps 4 and 5; no captcha).
+func (c *Client) join(ctx context.Context, hash string, g *guest) (*Creds, error) {
+	r, err := c.okAPI(ctx, "auth.anonymLogin", url.Values{
 		"session_data": {fmt.Sprintf(`{"version":2,"device_id":"%s","client_version":"1.0.1"}`, uuid())},
 	})
 	if err != nil {
@@ -180,7 +270,7 @@ func (c *Client) Fetch(ctx context.Context, hash string) (*Creds, error) {
 	}
 
 	r, err = c.okAPI(ctx, "vchat.joinConversationByLink", url.Values{
-		"joinLink": {hash}, "isVideo": {"false"}, "protocolVersion": {"5"}, "anonymToken": {callToken}, "session_key": {sessionKey},
+		"joinLink": {hash}, "isVideo": {"false"}, "protocolVersion": {"5"}, "anonymToken": {g.Call}, "session_key": {sessionKey},
 	})
 	if err != nil {
 		return nil, err
@@ -198,6 +288,7 @@ func (c *Client) Fetch(ctx context.Context, hash string) (*Creds, error) {
 	if len(cr.Servers) == 0 {
 		return nil, errors.New("VK returned no UDP TURN servers")
 	}
+	cr.Expires = turnExpiry(cr.Username)
 	return cr, nil
 }
 

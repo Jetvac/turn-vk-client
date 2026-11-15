@@ -54,6 +54,14 @@ type Params struct {
 	// OnReset is called when the server says it no longer knows this
 	// session (it restarted): the other sessions are likely stale too.
 	OnReset func()
+
+	// Direct selects the direct protocol (TurnVK servers) instead of
+	// DTLS + GETCONF. Keys is the client's WireGuard key pair; ServerKey,
+	// if set, is the only server key accepted.
+	Direct        bool
+	Keys          *Keys
+	ServerKey     []byte
+	DirectTimeout time.Duration // for the first WELCOME (default 6 s)
 }
 
 // DeniedError is the server refusing the connection password.
@@ -69,6 +77,10 @@ func (e *DeniedError) Error() string {
 		return "the connection password is disabled"
 	case "device_mismatch":
 		return "the connection password is bound to another device"
+	case "newer_connection":
+		return "this device connected again elsewhere (a newer connection took over)"
+	case "server_key":
+		return "the server's key does not match the link: not your server, or the server was reinstalled (get a new link)"
 	}
 	return "the server denied access (" + e.Reason + ")"
 }
@@ -90,6 +102,12 @@ func (e *TURNError) CredentialsRejected() bool {
 	return false
 }
 
+// QuotaReached reports VK refusing the guest more allocations (486).
+func (e *TURNError) QuotaReached() bool {
+	s := strings.ToLower(e.Err.Error())
+	return strings.Contains(s, "486") || strings.Contains(s, "quota")
+}
+
 // Session is an open transport session.
 type Session struct {
 	ID      int
@@ -107,7 +125,30 @@ type Session struct {
 	once   sync.Once
 
 	RxBytes, TxBytes, RxPackets, TxPackets atomic.Uint64
-	LastRx                                 atomic.Int64 // unix nanoseconds
+	// RxLost counts the server's packets lost on this path (direct
+	// protocol: gaps in the RTP sequence).
+	RxLost atomic.Uint64
+	// Pace paces what this session sends (direct protocol, once the server
+	// sends FEEDBACK); rx counts what the server sends (read loop only).
+	Pace   PathRate
+	rx     RxTrack
+	LastRx atomic.Int64 // unix nanoseconds
+	// RTT is the path's last measured round trip (direct protocol), ns.
+	RTT atomic.Int64
+
+	// Direct protocol.
+	direct    bool
+	aead      cipher.AEAD
+	peer      *net.UDPAddr
+	sealer    *wrap.Sealer
+	params    Params
+	rbuf      [maxPacket + wrap.MaxOverhead]byte
+	mu        sync.Mutex
+	pending   []byte    // nonce of the HELLO awaiting its WELCOME
+	lastHello time.Time // when the last re-attach HELLO went out
+	resetAt   time.Time // first RESET not yet answered by a WELCOME
+	denied    atomic.Pointer[error]
+	probeAt   atomic.Int64 // last probe not yet answered, unix ns
 }
 
 var handshakeSlots = make(chan struct{}, 4)
@@ -154,7 +195,19 @@ func Dial(ctx context.Context, p Params) (*Session, error) {
 		return nil, &TURNError{fmt.Errorf("allocate: %w", err)}
 	}
 	s.Relay = s.relay.LocalAddr().String()
-
+	if p.Direct {
+		timeout := p.DirectTimeout
+		if timeout <= 0 {
+			timeout = 6 * time.Second
+		}
+		if err = s.dialDirect(p, timeout); err != nil {
+			return nil, err
+		}
+		ok = true
+		s.LastRx.Store(time.Now().UnixNano())
+		go s.pingLoop()
+		return s, nil
+	}
 	select {
 	case handshakeSlots <- struct{}{}:
 	case <-ctx.Done():
@@ -257,6 +310,9 @@ func (s *Session) keepalive() {
 
 // Read returns the next packet from the server, skipping keepalives.
 func (s *Session) Read(b []byte) (int, error) {
+	if s.direct {
+		return s.readDirectData(b)
+	}
 	for {
 		n, err := s.dtls.Read(b)
 		if err != nil {
@@ -274,6 +330,14 @@ func (s *Session) Read(b []byte) (int, error) {
 
 // Write sends one packet to the server.
 func (s *Session) Write(b []byte) error {
+	if s.direct {
+		if err := s.sendDirect(b); err != nil {
+			return err
+		}
+		s.TxBytes.Add(uint64(len(b)))
+		s.TxPackets.Add(1)
+		return nil
+	}
 	if _, err := s.dtls.Write(b); err != nil {
 		return err
 	}
@@ -285,6 +349,12 @@ func (s *Session) Write(b []byte) error {
 // Probe sends a keepalive; a server that lost the session answers it with
 // a reset, which closes the session.
 func (s *Session) Probe() {
+	if s.direct {
+		if !s.Closed() {
+			s.probe()
+		}
+		return
+	}
 	if !s.Closed() {
 		_, _ = s.dtls.Write([]byte{KeepaliveByte})
 	}
@@ -299,6 +369,7 @@ func (s *Session) Closed() bool { return s.closed.Load() }
 // Close tears the session down (DTLS close_notify, TURN deallocation).
 func (s *Session) Close() {
 	s.once.Do(func() {
+		s.bye()
 		s.closed.Store(true)
 		close(s.done)
 		if s.dtls != nil {

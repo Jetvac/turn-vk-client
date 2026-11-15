@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/crypto/curve25519"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun"
 
@@ -37,7 +38,10 @@ type Config struct {
 	TURNServer string // host:port, overrides the servers VK returns
 	Net        *netx.Net
 	Captcha    vkcreds.CaptchaSolver
-	Logf       func(format string, args ...any)
+	// VKCache is the file that keeps VK guest tokens between runs, so that
+	// a restart does not bring up a captcha ("" keeps them in memory).
+	VKCache string
+	Logf    func(format string, args ...any)
 	// OnStatus is called (from any goroutine) when the status changes.
 	OnStatus func(Status)
 }
@@ -66,14 +70,44 @@ type Status struct {
 	Reconnects uint64 `json:"reconnects"`
 	LastError  string `json:"last_error,omitempty"`
 	Since      int64  `json:"since"`
+	// Protocol is "direct" (TurnVK server) or "dtls" (standard server).
+	Protocol string `json:"protocol,omitempty"`
+	RTT      int    `json:"rtt_ms,omitempty"` // average over the paths
+	// Captcha: VK is waiting for the user to pass its check. The state
+	// shows it only while there is no working session; a connection
+	// that works meanwhile stays "connected".
+	Captcha bool `json:"captcha,omitempty"`
+	// Paths lists the open sessions (routes through VK TURN).
+	Paths []PathStatus `json:"paths,omitempty"`
+}
+
+// PathStatus is one session in the status.
+type PathStatus struct {
+	ID     int    `json:"id"`
+	Server string `json:"server"`           // VK TURN server
+	RTT    int    `json:"rtt_ms,omitempty"` // last measured round trip
+	Fresh  bool   `json:"fresh"`            // heard from recently
+	Rx     uint64 `json:"rx"`
+	Tx     uint64 `json:"tx"`
+	// RxPackets and Lost: the server's packets received and lost on the
+	// way (direct protocol).
+	RxPackets uint64 `json:"rx_packets"`
+	Lost      uint64 `json:"lost"`
+	// Upload pacing (once the server sends FEEDBACK): rate in bytes/s,
+	// loss the server reports, queue delay over the path's base.
+	UpRate  int     `json:"up_rate,omitempty"`
+	UpLoss  float64 `json:"up_loss,omitempty"`
+	UpQueue int     `json:"up_queue_ms,omitempty"`
 }
 
 const (
 	defaultSessions = 16
 	maxSessions     = 64
 	setupTimeout    = 45 * time.Second
+	firstWait       = 2 * time.Minute // longest wait for VK before the first session
 	staleRx         = 180 * time.Second
 	silentActive    = 8 * time.Second
+	silentProbe     = 2 * time.Second // direct protocol: probe the paths
 )
 
 // Engine is one running connection.
@@ -105,9 +139,24 @@ type Engine struct {
 	captchas  atomic.Int32
 
 	hadSessions atomic.Bool
+	learned     session.LearnedRates // upload rates per TURN server
 	rekeying    atomic.Bool
 	lastReset   atomic.Int64
+
+	// keys is this connection's own WireGuard key pair (direct protocol:
+	// the server never sees the private key). mode is modeUnknown until
+	// the first session shows whether the server speaks the direct
+	// protocol; a link with the server's key always uses it.
+	keys    session.Keys
+	mode    atomic.Int32
+	probing atomic.Bool
 }
+
+const (
+	modeUnknown int32 = iota
+	modeDirect
+	modeDTLS
+)
 
 // rehandshake drops WireGuard's current keys and starts a new handshake.
 func (e *Engine) rehandshake(why string) {
@@ -144,7 +193,8 @@ func (e *Engine) rehandshake(why string) {
 // perCreds, each with credentials of its own: VK limits the allocations
 // one set of credentials may hold.
 type hashState struct {
-	hash string
+	hash  string
+	cache *vkcreds.Cache // saved credentials of the groups
 
 	mu        sync.Mutex
 	dead      error
@@ -153,11 +203,20 @@ type hashState struct {
 }
 
 type credSlot struct {
-	mu    sync.Mutex
-	creds *vkcreds.Creds
+	mu    sync.Mutex // held while fetching
+	cur   atomic.Pointer[vkcreds.Creds]
+	bg    atomic.Bool  // a background refresh is running
+	guest atomic.Int32 // which guest of the call fetches for this group
 }
 
-const perCreds = 8
+const (
+	perCreds = 8
+	// perGuest is how many sessions share one VK guest. VK refuses more
+	// allocations than about 16–20 per guest (error 486), and each new
+	// guest may cost a captcha: two groups per guest.
+	perGuest  = 16
+	maxGuests = 8
+)
 
 // New prepares an engine; Start connects.
 func New(cfg Config) (*Engine, error) {
@@ -179,13 +238,27 @@ func New(cfg Config) (*Engine, error) {
 	}
 	e := &Engine{cfg: cfg, aead: aead, b: newBind(), state: StateStopped, since: time.Now(), done: make(chan struct{})}
 	e.gen = randomID()
+	if _, err := rand.Read(e.keys.Private[:]); err != nil {
+		return nil, err
+	}
+	e.keys.Private[0] &= 248
+	e.keys.Private[31] = e.keys.Private[31]&127 | 64
+	pub, err := curve25519.X25519(e.keys.Private[:], curve25519.Basepoint)
+	if err != nil {
+		return nil, err
+	}
+	copy(e.keys.Public[:], pub)
+	if len(cfg.Link.ServerKey) == 32 {
+		e.mode.Store(modeDirect)
+	}
 	e.vk = &vkcreds.Client{
 		HTTP:    &http.Client{Timeout: 20 * time.Second, Transport: &http.Transport{DialContext: cfg.Net.Dialer().DialContext, ForceAttemptHTTP2: true, TLSHandshakeTimeout: 10 * time.Second}},
 		Captcha: &captchaGate{e: e, next: cfg.Captcha},
+		Cache:   &vkcreds.Cache{Path: cfg.VKCache},
 		Logf:    e.logf,
 	}
 	for _, h := range cfg.Link.Hashes {
-		e.hashes = append(e.hashes, &hashState{hash: h})
+		e.hashes = append(e.hashes, &hashState{hash: h, cache: e.vk.Cache})
 	}
 	if len(e.hashes) == 0 {
 		return nil, errors.New("no VK call in the link")
@@ -218,12 +291,25 @@ func (e *Engine) start(ctx context.Context, mk TunFactory) error {
 	if e.peer, err = e.cfg.Net.ResolveUDP(ctx, e.cfg.Link.Peer()); err != nil {
 		return fmt.Errorf("resolve server %s: %w", e.cfg.Link.Peer(), err)
 	}
-	// The first session: a few tries, across TURN servers.
+	// The first session: a few tries, across TURN servers. When VK asks
+	// to slow down, wait as long as it says (up to firstWait in all)
+	// instead of giving up.
 	var first *session.Session
+	waited := time.Duration(0)
 	for attempt := 0; ; attempt++ {
 		first, err = e.dial(ctx, attempt*len(e.hashes))
 		if err == nil {
 			break
+		}
+		var we *waitError
+		if errors.As(err, &we) && waited+we.Wait <= firstWait && ctx.Err() == nil && e.ctx.Err() == nil {
+			e.logf("VK asks to wait %s before new credentials", we.Wait.Round(time.Second))
+			if !sleep(ctx, we.Wait+500*time.Millisecond) {
+				return ctx.Err()
+			}
+			waited += we.Wait
+			attempt--
+			continue
 		}
 		if fatal(err) || ctx.Err() != nil || e.ctx.Err() != nil || attempt >= 4 {
 			return err
@@ -264,7 +350,7 @@ func (e *Engine) start(ctx context.Context, mk TunFactory) error {
 		e.dev.Close()
 		return fmt.Errorf("WireGuard: %w", err)
 	}
-	e.logf("connected: address %s, MTU %d, %d VK call(s), %d sessions", e.wg.Address, e.wg.MTU, len(e.hashes), e.cfg.Sessions)
+	e.logf("connected: address %s, MTU %d, %d VK call(s), %d sessions, %s protocol", e.wg.Address, e.wg.MTU, len(e.hashes), e.cfg.Sessions, e.protocol())
 
 	e.workers.Add(e.cfg.Sessions)
 	go e.worker(0, first)
@@ -286,6 +372,8 @@ func (e *Engine) start(ctx context.Context, mk TunFactory) error {
 func (e *Engine) worker(i int, s *session.Session) {
 	defer e.workers.Done()
 	backoff := time.Second
+	// Only sessions that replace an earlier one count as reconnects.
+	opened := s != nil
 	for e.ctx.Err() == nil {
 		if s == nil {
 			var err error
@@ -305,10 +393,15 @@ func (e *Engine) worker(i int, s *session.Session) {
 				backoff = min(backoff*2, 30*time.Second)
 				continue
 			}
-			e.reconnect.Add(1)
+			if opened {
+				e.reconnect.Add(1)
+			}
+			opened = true
 		}
 		n := len(e.b.list())
 		if !e.b.has(s) {
+			// Upload starts at the rate this TURN server allowed lately.
+			s.Pace.Seed(e.learned.Start(s.Server))
 			n = e.b.add(s)
 			if n == 1 && e.hadSessions.Load() {
 				// Every session had dropped: the server probably restarted
@@ -324,6 +417,7 @@ func (e *Engine) worker(i int, s *session.Session) {
 			e.notify()
 		}
 		e.readLoop(s)
+		e.learned.Note(s.Server, &s.Pace)
 		e.b.remove(s)
 		s.Close()
 		e.rxClosed.Add(s.RxBytes.Load())
@@ -348,9 +442,16 @@ func (e *Engine) readLoop(s *session.Session) {
 		n, err := s.Read(buf)
 		if err != nil {
 			putBuf(buf)
+			if d := s.Denied(); d != nil && e.ctx.Err() == nil {
+				e.fail(d)
+			}
 			return
 		}
-		e.b.deliver(buf[:n])
+		if s.Direct() {
+			e.b.deliverOrdered(buf[:n])
+		} else {
+			e.b.deliver(buf[:n])
+		}
 	}
 }
 
@@ -367,14 +468,38 @@ func (e *Engine) dial(ctx context.Context, i int) (*session.Session, error) {
 	if server == "" {
 		server = creds.Servers[(i/len(e.hashes))%len(creds.Servers)]
 	}
-	s, err := session.Dial(ctx, session.Params{
+	mode := e.mode.Load()
+	p := session.Params{
 		Peer: e.peer, TURNServer: server, Username: creds.Username, Password: creds.Password,
 		AEAD: e.aead, Mode: e.cfg.Mode, Net: e.cfg.Net,
 		ConnPassword: e.cfg.Link.Password, DeviceID: e.cfg.DeviceID, Generation: e.gen, Worker: i,
 		OnReset: e.serverReset,
-	})
+		Direct:  mode != modeDTLS, Keys: &e.keys, ServerKey: e.cfg.Link.ServerKey,
+	}
+	if mode == modeUnknown {
+		p.DirectTimeout = 4 * time.Second
+	}
+	s, err := session.Dial(ctx, p)
+	if mode == modeUnknown {
+		switch {
+		case err == nil:
+			e.mode.CompareAndSwap(modeUnknown, modeDirect)
+		case errors.Is(err, session.ErrNoWelcome):
+			// Not a TurnVK server (or a wrong password): the standard
+			// protocol, on a fresh allocation.
+			e.logf("the server does not speak the direct protocol, using DTLS")
+			e.mode.CompareAndSwap(modeUnknown, modeDTLS)
+			p.Direct = false
+			s, err = session.Dial(ctx, p)
+		}
+	}
 	var te *session.TURNError
-	if errors.As(err, &te) && te.CredentialsRejected() {
+	switch {
+	case errors.As(err, &te) && te.QuotaReached():
+		if n, moved := hs.nextGuest(g, creds); moved {
+			e.logf("VK call %s…: the guest has no allocations left, group %d moves to guest %d", short(hs.hash), g+1, n+1)
+		}
+	case errors.As(err, &te) && te.CredentialsRejected():
 		hs.invalidate(g, creds)
 	}
 	return s, err
@@ -409,6 +534,11 @@ func (hs *hashState) slot(g int) *credSlot {
 	cs := hs.groups[g]
 	if cs == nil {
 		cs = &credSlot{}
+		cs.guest.Store(int32(g * perCreds / perGuest))
+		// Credentials saved by an earlier run: no VK request at all.
+		if c := hs.cache.Creds(hs.credsKey(g, cs)); c != nil {
+			cs.cur.Store(c)
+		}
 		hs.groups[g] = cs
 	}
 	return cs
@@ -421,22 +551,52 @@ func (hs *hashState) blocked() error {
 		return hs.dead
 	}
 	if wait := time.Until(hs.waitUntil); wait > 0 {
-		return fmt.Errorf("VK credentials: retrying in %s", wait.Round(time.Second))
+		return &waitError{wait}
 	}
 	return nil
 }
 
+// waitError: VK asked to slow down (or a captcha was passed over); new
+// credentials can be asked for after Wait.
+type waitError struct{ Wait time.Duration }
+
+func (e *waitError) Error() string {
+	return fmt.Sprintf("VK credentials: retrying in %s", e.Wait.Round(time.Second))
+}
+
+// get returns credentials for group g. Credentials past their refresh
+// time but not yet expired are returned at once while fresh ones are
+// fetched in the background: a captcha nobody has solved yet, or a rate
+// limit, never holds up a new session.
 func (hs *hashState) get(ctx context.Context, e *Engine, g int) (*vkcreds.Creds, error) {
 	cs := hs.slot(g)
+	if c := cs.cur.Load(); c != nil {
+		if c.Fresh() {
+			return c, nil
+		}
+		if c.Usable(10 * time.Minute) {
+			if cs.bg.CompareAndSwap(false, true) {
+				go func() {
+					defer cs.bg.Store(false)
+					_, _ = hs.fetch(e.ctx, e, g, cs)
+				}()
+			}
+			return c, nil
+		}
+	}
+	return hs.fetch(ctx, e, g, cs)
+}
+
+func (hs *hashState) fetch(ctx context.Context, e *Engine, g int, cs *credSlot) (*vkcreds.Creds, error) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
-	if cs.creds != nil && time.Since(cs.creds.Fetched) < vkcreds.Lifetime {
-		return cs.creds, nil
+	if c := cs.cur.Load(); c != nil && c.Fresh() {
+		return c, nil
 	}
 	if err := hs.blocked(); err != nil {
 		return nil, err
 	}
-	c, err := e.vk.Fetch(ctx, hs.hash)
+	c, err := e.vk.FetchAs(ctx, hs.hash, int(cs.guest.Load()))
 	if err != nil {
 		var ce *vkcreds.CallError
 		var ae *vkcreds.APIError
@@ -446,7 +606,13 @@ func (hs *hashState) get(ctx context.Context, e *Engine, g int) (*vkcreds.Creds,
 			hs.dead = err
 			e.logf("VK call %s… is unusable: %v", short(hs.hash), err)
 		case errors.Is(err, vkcreds.ErrCaptchaRequired):
-			hs.waitUntil = time.Now().Add(60 * time.Second)
+			// While the previous credentials still work, a captcha the
+			// user passed over is not asked again for a while.
+			wait := 60 * time.Second
+			if c := cs.cur.Load(); c != nil && c.Usable(10*time.Minute) {
+				wait = 15 * time.Minute
+			}
+			hs.waitUntil = time.Now().Add(wait)
 		case errors.As(err, &ae) && ae.RateLimited():
 			hs.waitUntil = time.Now().Add(30 * time.Second)
 		default:
@@ -456,17 +622,45 @@ func (hs *hashState) get(ctx context.Context, e *Engine, g int) (*vkcreds.Creds,
 		return nil, err
 	}
 	e.logf("VK call %s… group %d: TURN credentials, %d server(s)", short(hs.hash), g+1, len(c.Servers))
-	cs.creds = c
+	cs.cur.Store(c)
+	hs.cache.PutCreds(hs.credsKey(g, cs), c)
 	return c, nil
 }
 
-func (hs *hashState) invalidate(g int, c *vkcreds.Creds) {
+// nextGuest moves group g to a guest no other group uses, after VK
+// refused its guest more allocations. c are the refused credentials: a
+// group already moved is left alone.
+func (hs *hashState) nextGuest(g int, c *vkcreds.Creds) (int, bool) {
 	cs := hs.slot(g)
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	if cs.creds == c && time.Since(c.Fetched) > 15*time.Second {
-		cs.creds = nil
+	if !cs.cur.CompareAndSwap(c, nil) {
+		return 0, false
 	}
+	hs.cache.PutCreds(hs.credsKey(g, cs), nil)
+	hs.mu.Lock()
+	n := int32(0)
+	for _, o := range hs.groups {
+		n = max(n, o.guest.Load())
+	}
+	hs.mu.Unlock()
+	if n+1 >= maxGuests {
+		return 0, false
+	}
+	cs.guest.Store(n + 1)
+	return int(n + 1), true
+}
+
+func (hs *hashState) invalidate(g int, c *vkcreds.Creds) {
+	if time.Since(c.Fetched) > 15*time.Second {
+		cs := hs.slot(g)
+		if cs.cur.CompareAndSwap(c, nil) {
+			hs.cache.PutCreds(hs.credsKey(g, cs), nil)
+		}
+	}
+}
+
+// credsKey names group g's saved credentials: the call, its guest, the group.
+func (hs *hashState) credsKey(g int, cs *credSlot) string {
+	return fmt.Sprintf("%s#%d/%d", hs.hash, cs.guest.Load(), g)
 }
 
 // watchdog recycles the sessions when the server has gone silent:
@@ -492,7 +686,11 @@ func (e *Engine) watchdog() {
 		}
 		silent := time.Since(rxAt)
 		reason := ""
+		direct := e.mode.Load() == modeDirect
 		switch {
+		case direct && silent > silentProbe && e.b.tx.Load()-txAtRx >= 5:
+			// Direct paths are probed, not dropped, so look early.
+			reason = fmt.Sprintf("no answer from the server for %s while sending", silent.Round(time.Second))
 		case silent > silentActive && e.b.tx.Load()-txAtRx >= 10:
 			reason = fmt.Sprintf("no answer from the server for %s while sending", silent.Round(time.Second))
 		case silent > staleRx:
@@ -501,11 +699,54 @@ func (e *Engine) watchdog() {
 		if reason == "" {
 			continue
 		}
+		if e.mode.Load() == modeDirect {
+			// Each path answers pings: find the dead ones and replace
+			// only those; the others keep the tunnel up.
+			if e.probing.CompareAndSwap(false, true) {
+				go e.replaceDeadPaths(reason, silent, list)
+			}
+			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
+			continue
+		}
 		e.noteError(reason + ", reconnecting all sessions")
 		for _, s := range list {
 			s.Close()
 		}
 		lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
+	}
+}
+
+// replaceDeadPaths probes every path and closes those that do not answer
+// (their workers open new ones). If none answers, the server is likely
+// gone or restarted: WireGuard re-keys once paths are back.
+func (e *Engine) replaceDeadPaths(reason string, silent time.Duration, list []*session.Session) {
+	defer e.probing.Store(false)
+	for _, s := range list {
+		s.Probe()
+	}
+	if !sleep(e.ctx, 2500*time.Millisecond) {
+		return
+	}
+	now := time.Now()
+	dead := 0
+	for _, s := range list {
+		if !s.Fresh(now) {
+			s.Close()
+			dead++
+		}
+	}
+	switch {
+	case dead == 0:
+		// Every path answers: the traffic itself may simply get no
+		// reply. Only a long silence suggests lost WireGuard keys.
+		if silent >= silentActive {
+			e.logf("%s; every path answers, re-keying", reason)
+			e.rehandshake("silent tunnel")
+		}
+	case dead == len(list):
+		e.noteError(fmt.Sprintf("%s; no path answers, reconnecting", reason))
+	default:
+		e.logf("%s; replacing %d of %d paths that stopped answering", reason, dead, len(list))
 	}
 }
 
@@ -610,16 +851,49 @@ func (e *Engine) Status() Status {
 		st.RxBytes += s.RxBytes.Load()
 		st.TxBytes += s.TxBytes.Load()
 	}
+	now := time.Now()
+	for _, s := range list {
+		ps := PathStatus{ID: s.ID, Server: s.Server, RTT: int(s.RTT.Load() / int64(time.Millisecond)), Fresh: s.Fresh(now), Rx: s.RxBytes.Load(), Tx: s.TxBytes.Load(), RxPackets: s.RxPackets.Load(), Lost: s.RxLost.Load()}
+		if s.Pace.HasFeedback() {
+			rate, loss, q := s.Pace.State()
+			ps.UpRate, ps.UpLoss, ps.UpQueue = int(rate), loss, int(q/time.Millisecond)
+		}
+		st.Paths = append(st.Paths, ps)
+	}
+	sum, n := int64(0), int64(0)
+	for _, s := range list {
+		if r := s.RTT.Load(); r > 0 {
+			sum += r
+			n++
+		}
+	}
+	if n > 0 {
+		st.RTT = int(sum / n / int64(time.Millisecond))
+	}
+	st.Protocol = e.protocol()
 	e.mu.Lock()
 	st.State, st.LastError, st.Since = e.state, e.lastErr, e.since.Unix()
 	e.mu.Unlock()
 	if e.captchas.Load() > 0 && st.State != StateFailed && st.State != StateStopped {
-		st.State = StateCaptcha
+		st.Captcha = true
+		if st.State != StateConnected || st.Sessions == 0 {
+			st.State = StateCaptcha
+		}
 	}
 	if e.wg != nil {
 		st.Address = e.wg.Address.String()
 	}
 	return st
+}
+
+func (e *Engine) protocol() string {
+	switch e.mode.Load() {
+	case modeDirect:
+		return "direct"
+	case modeDTLS:
+		return "dtls"
+	}
+	return ""
 }
 
 func (e *Engine) notify() {

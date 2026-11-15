@@ -8,9 +8,11 @@
 package link
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -23,6 +25,10 @@ type Link struct {
 	LocalPort int
 	Password  string
 	Hashes    []string
+	// ServerKey is the server's WireGuard public key (32 bytes), from a
+	// "?pk=" suffix that TurnVK links carry. With it the client speaks the
+	// direct protocol and refuses any other server key.
+	ServerKey []byte
 }
 
 // Peer is the server address the client talks to through TURN.
@@ -30,7 +36,28 @@ func (l Link) Peer() string { return net.JoinHostPort(l.Host, strconv.Itoa(l.DTL
 
 // String formats the link back.
 func (l Link) String() string {
-	return fmt.Sprintf("wdtt://%s:%d:%d:%d:%s:%s", l.Host, l.DTLSPort, l.WGPort, l.LocalPort, l.Password, strings.Join(l.Hashes, ","))
+	s := fmt.Sprintf("wdtt://%s:%d:%d:%d:%s:%s", l.Host, l.DTLSPort, l.WGPort, l.LocalPort, l.Password, strings.Join(l.Hashes, ","))
+	if len(l.ServerKey) == 32 {
+		s += "?pk=" + base64.RawURLEncoding.EncodeToString(l.ServerKey)
+	}
+	return s
+}
+
+var pkParam = regexp.MustCompile(`[?&]pk=([A-Za-z0-9_\-+/]{43}=?)`)
+
+// cutServerKey removes the "?pk=" parameter from the call list.
+func cutServerKey(s string) (string, []byte, error) {
+	m := pkParam.FindStringSubmatchIndex(s)
+	if m == nil {
+		return s, nil, nil
+	}
+	enc := strings.TrimRight(s[m[2]:m[3]], "=")
+	enc = strings.NewReplacer("+", "-", "/", "_").Replace(enc)
+	k, err := base64.RawURLEncoding.DecodeString(enc)
+	if err != nil || len(k) != 32 {
+		return s, nil, errors.New("bad server key (pk) in the link")
+	}
+	return s[:m[0]] + s[m[1]:], k, nil
 }
 
 // Parse reads a wdtt:// link. The password must not contain ":"; everything
@@ -56,7 +83,12 @@ func Parse(raw string) (Link, error) {
 	if l.LocalPort, err = port(parts[3]); err != nil {
 		l.LocalPort = 9000
 	}
-	l.Hashes = ParseHashes(parts[5])
+	calls, key, err := cutServerKey(parts[5])
+	if err != nil {
+		return Link{}, err
+	}
+	l.ServerKey = key
+	l.Hashes = ParseHashes(calls)
 	switch {
 	case l.Host == "":
 		return Link{}, errors.New("wdtt:// link has no server address")

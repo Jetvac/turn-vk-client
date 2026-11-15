@@ -4,29 +4,32 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.drawable.Icon
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.VpnService
 import android.os.Build
 import android.provider.Settings
+import android.service.quicksettings.TileService
 import java.util.concurrent.Executors
 
 /**
  * The VPN service: runs the Go engine (mobile.Mobile) and gives it the TUN
- * interface, socket protection and a way to show captchas.
+ * interface, socket protection and a way to show captchas. It connects to
+ * the selected profile with the saved settings, whoever starts it: the
+ * app, the quick settings tile, the boot receiver or Android's always-on
+ * VPN.
  */
 class TunnelService : VpnService(), mobile.Platform {
 
     companion object {
         const val ACTION_CONNECT = "connect"
         const val ACTION_DISCONNECT = "disconnect"
-        const val EXTRA_LINK = "link"
-        const val EXTRA_SESSIONS = "sessions"
-        const val EXTRA_OBFS = "obfs"
 
         private const val CHANNEL = "tunnel"
         private const val CHANNEL_CAPTCHA = "captcha"
@@ -34,24 +37,27 @@ class TunnelService : VpnService(), mobile.Platform {
         private const val NOTE_CAPTCHA = 2
 
         /** Packages whose traffic never enters the tunnel. */
-        private val BYPASS = listOf("com.vkontakte.android", "com.vk.calls")
+        val BYPASS = listOf("com.vkontakte.android", "com.vk.calls")
 
-        fun connect(ctx: Context, link: String, sessions: Int, obfs: String) {
-            val i = Intent(ctx, TunnelService::class.java)
-                .setAction(ACTION_CONNECT)
-                .putExtra(EXTRA_LINK, link)
-                .putExtra(EXTRA_SESSIONS, sessions)
-                .putExtra(EXTRA_OBFS, obfs)
+        fun connect(ctx: Context) {
+            val i = Intent(ctx, TunnelService::class.java).setAction(ACTION_CONNECT)
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
         }
 
         fun disconnect(ctx: Context) {
             ctx.startService(Intent(ctx, TunnelService::class.java).setAction(ACTION_DISCONNECT))
         }
+
+        /** The captcha was answered or is no longer needed. */
+        fun clearCaptcha(ctx: Context) {
+            TunnelState.setCaptcha(null)
+            runCatching { ctx.getSystemService(NotificationManager::class.java).cancel(NOTE_CAPTCHA) }
+        }
     }
 
     private val worker = Executors.newSingleThreadExecutor()
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val store by lazy { Store(this) }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -59,41 +65,54 @@ class TunnelService : VpnService(), mobile.Platform {
                 stopTunnel()
                 return START_NOT_STICKY
             }
-            ACTION_CONNECT -> {
-                startForegroundCompat(note(getString(R.string.app_name), "Подключение…"))
-                val link = intent.getStringExtra(EXTRA_LINK).orEmpty()
-                val sessions = intent.getIntExtra(EXTRA_SESSIONS, 16)
-                val obfs = intent.getStringExtra(EXTRA_OBFS) ?: "audio"
-                worker.execute { run(link, sessions, obfs) }
+            // The app, the tile and the boot receiver send ACTION_CONNECT;
+            // always-on VPN starts the service with SERVICE_INTERFACE.
+            ACTION_CONNECT, SERVICE_INTERFACE, null -> {
+                startForegroundCompat(note("Подключение…"))
+                worker.execute { run() }
             }
         }
         return START_NOT_STICKY
     }
 
-    private fun run(link: String, sessions: Int, obfs: String) {
+    private fun run() {
         if (mobile.Mobile.running()) return
+        val profile = store.current
+        if (profile == null) {
+            fail("Добавьте сервер: ссылку wdtt://")
+            return
+        }
+        val sessions = store.sessions
         TunnelState.setError(null)
         TunnelState.setStatus(Status(state = "connecting", target = sessions))
+        log("подключение к «${profile.name}», сессий $sessions")
         val deviceId = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID) ?: "android"
         try {
-            mobile.Mobile.start(link, deviceId, sessions.toLong(), obfs, this)
+            mobile.Mobile.setCaptchaMode(if (store.captchaAuto) "auto" else "manual")
+            // VK guest tokens are kept here between runs: fewer captchas.
+            mobile.Mobile.setDataDir(filesDir.absolutePath)
+            mobile.Mobile.start(profile.link, deviceId, sessions.toLong(), store.obfs, this)
             watchNetwork()
         } catch (e: Exception) {
-            val msg = e.message ?: e.toString()
-            log("не удалось подключиться: $msg")
-            TunnelState.setError(msg)
-            TunnelState.setStatus(Status(state = "failed", lastError = msg))
-            stopTunnel()
+            fail(e.message ?: e.toString())
         }
+    }
+
+    private fun fail(msg: String) {
+        log("не удалось подключиться: $msg")
+        TunnelState.setError(msg)
+        TunnelState.setStatus(Status(state = "failed", lastError = msg))
+        stopTunnel()
     }
 
     private fun stopTunnel() {
         unwatchNetwork()
         worker.execute {
             mobile.Mobile.stop()
-            TunnelState.setCaptcha(null)
+            clearCaptcha(this)
             val s = TunnelState.status.value
             if (s.state != "failed") TunnelState.setStatus(Status(state = "stopped"))
+            updateTile()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -116,7 +135,7 @@ class TunnelService : VpnService(), mobile.Platform {
 
     override fun openTun(address: String, prefixLen: Long, dns: String, mtu: Long): Long {
         val b = Builder()
-            .setSession(getString(R.string.app_name))
+            .setSession(store.current?.name ?: getString(R.string.app_name))
             .setMtu(mtu.toInt())
             .addAddress(address, prefixLen.toInt())
             .addRoute("0.0.0.0", 0)
@@ -124,10 +143,14 @@ class TunnelService : VpnService(), mobile.Platform {
         // does not leak around the VPN.
         runCatching { b.addAddress("fd00:7475:726e::1", 128).addRoute("::", 0) }
         dns.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach { runCatching { b.addDnsServer(it) } }
-        // The app's own sockets (TURN, VK API) and VK apps go around the tunnel.
+        // The app's own sockets (TURN, VK API), VK apps and the apps the
+        // user excluded go around the tunnel.
         runCatching { b.addDisallowedApplication(packageName) }
-        BYPASS.forEach { p ->
-            try { b.addDisallowedApplication(p) } catch (_: PackageManager.NameNotFoundException) {}
+        (BYPASS + store.excludedApps).toSet().forEach { p ->
+            try {
+                b.addDisallowedApplication(p)
+            } catch (_: PackageManager.NameNotFoundException) {
+            }
         }
         if (Build.VERSION.SDK_INT >= 29) b.setMetered(false)
         b.setConfigureIntent(
@@ -141,16 +164,21 @@ class TunnelService : VpnService(), mobile.Platform {
         val s = Status.parse(status)
         val prev = TunnelState.status.value
         TunnelState.setStatus(s)
-        if (s.state != prev.state || s.sessions != prev.sessions) {
+        if (s.state != prev.state || s.sessions != prev.sessions || s.captcha != prev.captcha) {
             val text = when (s.state) {
-                "connected" -> "Подключено · сессий ${s.sessions}/${s.target}"
+                "connected" -> if (s.captcha) {
+                    "Подключено · нужна проверка VK"
+                } else {
+                    "Подключено · маршрутов ${s.sessions} из ${s.target}"
+                }
                 "captcha" -> "Нужно пройти проверку VK"
                 "connecting" -> "Подключение…"
                 "failed" -> "Ошибка: ${s.lastError}"
                 else -> s.state
             }
-            notify(NOTE_ID, note(getString(R.string.app_name), text))
+            notify(NOTE_ID, note(text))
         }
+        if (s.state != prev.state) updateTile()
         if (s.state == "failed") {
             TunnelState.setError(s.lastError)
             stopTunnel()
@@ -164,19 +192,41 @@ class TunnelService : VpnService(), mobile.Platform {
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             .putExtra(CaptchaActivity.EXTRA_URL, url)
         val pi = PendingIntent.getActivity(this, 1, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        val n = noteBuilder(CHANNEL_CAPTCHA)
+        val working = TunnelState.status.value.state == "connected"
+        val text = if (working) {
+            "VPN работает. Пройдите проверку, чтобы он и дальше переподключался без перебоев."
+        } else {
+            "Подключение ждёт: подтвердите в VK, что вы не робот."
+        }
+        val b = noteBuilder(CHANNEL_CAPTCHA)
             .setSmallIcon(R.drawable.ic_stat_vpn)
-            .setContentTitle("Проверка VK")
-            .setContentText("Нажмите, чтобы подтвердить, что вы не робот")
+            .setContentTitle("Нужна проверка VK")
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text))
             .setContentIntent(pi)
+            .setCategory(Notification.CATEGORY_REMINDER)
+            .setShowWhen(true)
             .setAutoCancel(true)
-            .build()
-        notify(NOTE_CAPTCHA, n)
+            .addAction(Notification.Action.Builder(null as Icon?, "Пройти проверку", pi).build())
+        if (Build.VERSION.SDK_INT < 26) headsUp(b)
+        val nm = getSystemService(NotificationManager::class.java)
+        if (nm == null || !nm.areNotificationsEnabled()) {
+            log("уведомления отключены: откройте приложение, чтобы пройти проверку")
+        }
+        notify(NOTE_CAPTCHA, b.build())
         // In the foreground the app opens the captcha itself (MainActivity
         // watches TunnelState.captcha).
     }
 
+    override fun onCaptchaDone() = clearCaptcha(this)
+
     override fun log(line: String) = TunnelState.log(line)
+
+    // --- quick settings tile ---
+
+    private fun updateTile() {
+        runCatching { TileService.requestListeningState(this, ComponentName(this, QuickTile::class.java)) }
+    }
 
     // --- network changes ---
 
@@ -186,7 +236,10 @@ class TunnelService : VpnService(), mobile.Platform {
         var current: Network? = null
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                if (!first && network != current) mobile.Mobile.networkChanged()
+                if (!first && network != current) {
+                    log("сеть сменилась, переподключаем маршруты")
+                    mobile.Mobile.networkChanged()
+                }
                 first = false
                 current = network
             }
@@ -206,7 +259,18 @@ class TunnelService : VpnService(), mobile.Platform {
         if (Build.VERSION.SDK_INT < 26) return
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel(CHANNEL, "Подключение", NotificationManager.IMPORTANCE_LOW))
-        nm.createNotificationChannel(NotificationChannel(CHANNEL_CAPTCHA, "Проверка VK", NotificationManager.IMPORTANCE_HIGH))
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_CAPTCHA, "Проверка VK", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "Когда VK просит подтвердить, что вы не робот"
+                enableVibration(true)
+            }
+        )
+    }
+
+    /** Before Android 8 the alert level is set per notification. */
+    @Suppress("DEPRECATION")
+    private fun headsUp(b: Notification.Builder) {
+        b.setPriority(Notification.PRIORITY_HIGH).setDefaults(Notification.DEFAULT_ALL)
     }
 
     @Suppress("DEPRECATION")
@@ -215,14 +279,18 @@ class TunnelService : VpnService(), mobile.Platform {
         return if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, channel) else Notification.Builder(this)
     }
 
-    private fun note(title: String, text: String): Notification {
-        val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+    private fun note(text: String): Notification {
+        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val stop = PendingIntent.getService(
+            this, 2, Intent(this, TunnelService::class.java).setAction(ACTION_DISCONNECT), PendingIntent.FLAG_IMMUTABLE,
+        )
         return noteBuilder(CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_vpn)
-            .setContentTitle(title)
+            .setContentTitle(store.current?.name ?: getString(R.string.app_name))
             .setContentText(text)
-            .setContentIntent(pi)
+            .setContentIntent(open)
             .setOngoing(true)
+            .addAction(Notification.Action.Builder(null as Icon?, "Отключить", stop).build())
             .build()
     }
 

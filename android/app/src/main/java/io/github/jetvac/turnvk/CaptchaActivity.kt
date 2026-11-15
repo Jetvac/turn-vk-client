@@ -2,6 +2,7 @@ package io.github.jetvac.turnvk
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.Intent
 import android.graphics.Bitmap
 import android.os.Bundle
 import android.view.ViewGroup
@@ -54,7 +55,9 @@ class CaptchaActivity : Activity() {
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val url = intent.getStringExtra(EXTRA_URL) ?: TunnelState.captcha.value
+        // Only a check the engine still waits for: an old notification
+        // tapped after it was answered or timed out opens nothing.
+        val url = TunnelState.captcha.value
         if (url == null) {
             finish()
             return
@@ -96,10 +99,21 @@ class CaptchaActivity : Activity() {
         web.loadUrl(url)
     }
 
+    /** A new check while this one is open (e.g. from the notification). */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        val url = TunnelState.captcha.value ?: return
+        if (::web.isInitialized && url != web.url) {
+            answered = false
+            web.loadUrl(url)
+        }
+    }
+
     private fun answer(token: String?) {
         if (answered) return
         answered = true
-        TunnelState.setCaptcha(null)
+        TunnelService.clearCaptcha(this)
         if (token != null) {
             TunnelState.log("проверка VK пройдена")
             mobile.Mobile.submitCaptcha(token)

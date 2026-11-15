@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 
@@ -13,9 +14,9 @@ import (
 )
 
 // bind connects WireGuard straight to the transport sessions: there is no
-// local UDP socket. Outgoing packets go to one session for a run of
-// `chunk` packets, then to the next; a lightly loaded tunnel therefore uses
-// one relay at a time (no reordering), a busy one spreads over all of them.
+// local UDP socket. Each outgoing packet goes on the session where it would
+// arrive first (see pick): small packets never wait behind an upload, big
+// ones spread over all sessions.
 type bind struct {
 	recv chan []byte
 
@@ -23,8 +24,16 @@ type bind struct {
 	closed chan struct{}
 
 	sessions atomic.Pointer[[]*session.Session]
-	cur      atomic.Uint32
-	run      atomic.Uint32
+
+	pacer    *pacer
+	reorder  Reorder[[]byte] // what the server spreads over many sessions, in order again
+	pacedAt  atomic.Int64    // unix ns of the last check whether to pace
+	pacedNow atomic.Bool
+
+	qmu    sync.Mutex
+	queues map[*session.Session]*pathQueue
+	last   *session.Session // session of the last bulk packet
+	run    int              // bulk packets in a row on it
 
 	dropped atomic.Uint64
 	rx      atomic.Uint64
@@ -32,7 +41,6 @@ type bind struct {
 }
 
 const (
-	chunk     = 16
 	batchSize = 32
 	recvQueue = 2048
 )
@@ -40,7 +48,9 @@ const (
 var errNoSession = errors.New("no transport session")
 
 func newBind() *bind {
-	b := &bind{recv: make(chan []byte, recvQueue), closed: make(chan struct{})}
+	b := &bind{recv: make(chan []byte, recvQueue), closed: make(chan struct{}), queues: map[*session.Session]*pathQueue{}}
+	b.pacer = newPacer(b)
+	b.reorder.Out = b.deliver
 	empty := []*session.Session{}
 	b.sessions.Store(&empty)
 	return b
@@ -68,6 +78,12 @@ func (b *bind) remove(s *session.Session) int {
 		}
 	}
 	b.sessions.Store(&next)
+	b.qmu.Lock()
+	delete(b.queues, s)
+	if b.last == s {
+		b.last = nil
+	}
+	b.qmu.Unlock()
 	return len(next)
 }
 
@@ -92,6 +108,16 @@ func (b *bind) deliver(pkt []byte) {
 		b.dropped.Add(1)
 		putBuf(pkt)
 	}
+}
+
+// deliverOrdered is deliver for packets of a TurnVK server, which spreads
+// them over all sessions: WireGuard data goes through the reorder buffer.
+func (b *bind) deliverOrdered(pkt []byte) {
+	if idx, ctr, ok := WGData(pkt); ok {
+		b.reorder.Push(idx, ctr, pkt)
+		return
+	}
+	b.deliver(pkt)
 }
 
 func (b *bind) Open(uint16) ([]conn.ReceiveFunc, uint16, error) {
@@ -150,38 +176,149 @@ func (b *bind) Send(bufs [][]byte, _ conn.Endpoint) error {
 	if len(list) == 0 {
 		return errNoSession
 	}
+	now := time.Now()
+	if b.paced(list, now) {
+		b.pacer.enqueue(bufs)
+		return nil
+	}
+	var arr [batchSize]*session.Session
+	plan := arr[:0]
+	if len(bufs) > len(arr) {
+		plan = make([]*session.Session, 0, len(bufs))
+	}
+	b.qmu.Lock()
 	for _, p := range bufs {
-		if err := b.sendOne(list, p); err != nil {
+		plan = append(plan, b.pick(list, len(p), now))
+	}
+	b.qmu.Unlock()
+	for i, p := range bufs {
+		if s := plan[i]; s != nil && s.Write(p) == nil {
+			b.tx.Add(1)
+			continue
+		} else if s != nil {
+			s.Close()
+		}
+		if err := b.sendAny(list, p, plan[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (b *bind) sendOne(list []*session.Session, p []byte) error {
-	n := uint32(len(list))
-	start := b.cur.Load() % n
-	if b.run.Add(1) > chunk {
-		b.run.Store(1)
-		start = (start + 1) % n
-		b.cur.Store(start)
+// paced reports whether some session's server sends FEEDBACK, so that
+// uploads go through the pacer (pacer.go). Checked every 200 ms.
+func (b *bind) paced(list []*session.Session, now time.Time) bool {
+	ns := now.UnixNano()
+	if ns-b.pacedAt.Load() < int64(200*time.Millisecond) {
+		return b.pacedNow.Load()
 	}
-	for i := uint32(0); i < n; i++ {
-		s := list[(start+i)%n]
-		if s.Closed() {
+	b.pacedAt.Store(ns)
+	on := false
+	for _, s := range list {
+		if !s.Closed() && s.Pace.HasFeedback() {
+			on = true
+			break
+		}
+	}
+	b.pacedNow.Store(on)
+	return on
+}
+
+// sendAny sends on any open session but skip, for when the chosen one failed.
+func (b *bind) sendAny(list []*session.Session, p []byte, skip *session.Session) error {
+	for _, s := range list {
+		if s == skip || s.Closed() {
 			continue
 		}
 		if err := s.Write(p); err == nil {
 			b.tx.Add(1)
-			if i > 0 {
-				b.cur.Store((start + i) % n)
-				b.run.Store(1)
-			}
 			return nil
 		}
 		s.Close()
 	}
 	return errNoSession
+}
+
+// pick chooses the session for one packet of n bytes and books it there:
+// the one it would arrive first on, given what is queued on each (VK
+// relays an allocation at about pathRate) and its round trip. Sessions
+// that do not answer are used only when none does. Called with qmu held.
+func (b *bind) pick(list []*session.Session, n int, now time.Time) *session.Session {
+	ns := now.UnixNano()
+	var best *session.Session
+	var bestQ *pathQueue
+	bestD := 0.0
+	for pass := 0; pass < 2 && best == nil; pass++ {
+		for _, s := range list {
+			if s.Closed() || (pass == 0 && !s.Fresh(now)) {
+				continue
+			}
+			q := b.queue(s)
+			d := q.arrival(ns, s.RTT.Load())
+			if best == nil || d < bestD {
+				best, bestQ, bestD = s, q, d
+			}
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	if n >= bulkSize {
+		if l := b.last; l != nil && l != best && b.run < bulkRun && !l.Closed() && l.Fresh(now) {
+			if q := b.queue(l); q.arrival(ns, l.RTT.Load()) <= bestD+stickSlack {
+				best, bestQ = l, q
+			}
+		}
+		if best == b.last {
+			b.run++
+		} else {
+			b.last, b.run = best, 1
+		}
+	}
+	bestQ.add(ns, n+wireOverhead)
+	return best
+}
+
+func (b *bind) queue(s *session.Session) *pathQueue {
+	q := b.queues[s]
+	if q == nil {
+		q = &pathQueue{}
+		b.queues[s] = q
+	}
+	return q
+}
+
+// pathQueue models the bytes a session has yet to deliver: VK relays each
+// allocation at about pathRate, anything sent faster waits in its queue.
+type pathQueue struct {
+	bytes float64
+	at    int64 // unix ns of the last update
+}
+
+const (
+	pathRate     = 175_000.0 // bytes/s one VK allocation relays (~1.4 Mbit/s, measured)
+	bulkSize     = 512       // smaller packets are latency-sensitive
+	bulkRun      = 4         // bulk packets kept on one session in a row
+	stickSlack   = 0.025     // s: how much later a bulk packet may arrive to stay on its session
+	wireOverhead = 40        // RTP header, tag, TURN ChannelData
+)
+
+func (q *pathQueue) backlog(now int64) float64 {
+	b := q.bytes - pathRate*float64(now-q.at)/1e9
+	if b < 0 {
+		return 0
+	}
+	return b
+}
+
+func (q *pathQueue) add(now int64, n int) {
+	q.bytes = q.backlog(now) + float64(n)
+	q.at = now
+}
+
+// arrival estimates in seconds when a packet sent now gets through.
+func (q *pathQueue) arrival(now int64, rtt int64) float64 {
+	return q.backlog(now)/pathRate + float64(rtt)/2e9
 }
 
 // endpoint is the only peer address: the server, reached through sessions.

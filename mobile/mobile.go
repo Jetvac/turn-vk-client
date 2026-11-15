@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -37,6 +38,9 @@ type Platform interface {
 	// OnCaptcha asks the user to solve the captcha at url; the app answers
 	// with SubmitCaptcha or CancelCaptcha.
 	OnCaptcha(url string)
+	// OnCaptchaDone: the engine no longer waits for that captcha (answered,
+	// cancelled, timed out or stopped). It comes before any next OnCaptcha.
+	OnCaptchaDone()
 	// Log receives one log line.
 	Log(line string)
 }
@@ -45,7 +49,17 @@ var (
 	mu      sync.Mutex
 	current *engine.Engine
 	captcha = &solver{}
+	dataDir string
 )
+
+// SetDataDir sets the app's private directory (Context.filesDir). The
+// engine keeps VK guest tokens there, so that restarts of the app do not
+// bring up a captcha. Call it before Start.
+func SetDataDir(dir string) {
+	mu.Lock()
+	dataDir = dir
+	mu.Unlock()
+}
 
 // ValidateLink returns "" for a usable wdtt:// link, else the problem.
 func ValidateLink(raw string) string {
@@ -69,6 +83,10 @@ func Start(rawLink, deviceID string, sessions int, obfs string, p Platform) erro
 		return errors.New("already running")
 	}
 	captcha.setPlatform(p)
+	vkCache := ""
+	if dataDir != "" {
+		vkCache = filepath.Join(dataDir, "vk-guests.json")
+	}
 	e, err := engine.New(engine.Config{
 		Link: l, DeviceID: deviceID, Sessions: sessions, Mode: wrap.ParseMode(obfs),
 		Net: &netx.Net{
@@ -81,6 +99,7 @@ func Start(rawLink, deviceID string, sessions int, obfs string, p Platform) erro
 			},
 		},
 		Captcha:  captcha,
+		VKCache:  vkCache,
 		Logf:     func(f string, a ...any) { p.Log(fmt.Sprintf(f, a...)) },
 		OnStatus: func(s engine.Status) { b, _ := json.Marshal(s); p.OnStatus(string(b)) },
 	})
@@ -235,6 +254,7 @@ func (s *solver) SolveCaptcha(ctx context.Context, url string) (string, error) {
 		return s.solveAuto(ctx, url)
 	}
 	p.OnCaptcha(url)
+	defer p.OnCaptchaDone()
 	select {
 	case r := <-ch:
 		return r.token, r.err

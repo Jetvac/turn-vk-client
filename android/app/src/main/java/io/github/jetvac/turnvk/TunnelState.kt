@@ -5,6 +5,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.json.JSONObject
 
+/** One route through VK TURN. */
+data class PathInfo(
+    val id: Int,
+    val server: String,
+    val rttMs: Int,
+    val fresh: Boolean,
+    val rx: Long,
+    val tx: Long,
+)
+
 /** Engine status as the UI shows it. */
 data class Status(
     val state: String = "stopped",
@@ -15,10 +25,32 @@ data class Status(
     val txBytes: Long = 0,
     val reconnects: Long = 0,
     val lastError: String = "",
+    /** VK is waiting for the user to pass its check. */
+    val captcha: Boolean = false,
+    /** Unix seconds of the last state change. */
+    val since: Long = 0,
+    /** "direct" (TurnVK server) or "dtls" (standard server). */
+    val protocol: String = "",
+    val rttMs: Int = 0,
+    val paths: List<PathInfo> = emptyList(),
 ) {
+    val active: Boolean get() = state in setOf("connecting", "connected", "captcha")
+
     companion object {
         fun parse(json: String): Status = runCatching {
             val o = JSONObject(json)
+            val pa = o.optJSONArray("paths")
+            val paths = if (pa == null) emptyList() else (0 until pa.length()).map {
+                val p = pa.getJSONObject(it)
+                PathInfo(
+                    id = p.optInt("id"),
+                    server = p.optString("server"),
+                    rttMs = p.optInt("rtt_ms"),
+                    fresh = p.optBoolean("fresh"),
+                    rx = p.optLong("rx"),
+                    tx = p.optLong("tx"),
+                )
+            }
             Status(
                 state = o.optString("state", "stopped"),
                 sessions = o.optInt("sessions"),
@@ -28,6 +60,11 @@ data class Status(
                 txBytes = o.optLong("tx_bytes"),
                 reconnects = o.optLong("reconnects"),
                 lastError = o.optString("last_error"),
+                captcha = o.optBoolean("captcha"),
+                since = o.optLong("since"),
+                protocol = o.optString("protocol"),
+                rttMs = o.optInt("rtt_ms"),
+                paths = paths.sortedBy { it.id },
             )
         }.getOrDefault(Status())
     }
@@ -56,6 +93,8 @@ object TunnelState {
     fun log(line: String) {
         val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ROOT).format(java.util.Date())
         val next = _log.value + "$t $line"
-        _log.value = if (next.size > 300) next.takeLast(300) else next
+        _log.value = if (next.size > 500) next.takeLast(500) else next
     }
+
+    fun clearLog() { _log.value = emptyList() }
 }

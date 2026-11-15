@@ -16,10 +16,14 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 
@@ -41,6 +45,11 @@ func main() {
 	download := flag.String("download", "", "download a URL through the tunnel, print the speed and exit")
 	hold := flag.Duration("hold", 0, "with -test: keep requesting once a second for this long")
 	verbose := flag.Bool("v", false, "verbose log")
+	pingHost := flag.String("ping", "", "with -test or -download: ICMP ping this address through the tunnel (e.g. the server's tunnel address)")
+	pings := flag.Int("pings", 50, "number of pings, 5 per second")
+	stats := flag.Bool("stats", false, "print speed and route round trips every second")
+	upload := flag.Int("upload", 0, "upload this many MB through the tunnel, print the speed and exit")
+	uploadURL := flag.String("upload-url", "https://speed.cloudflare.com/__up", "where -upload sends its data (HTTP POST)")
 	flag.Parse()
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
@@ -71,6 +80,7 @@ func main() {
 		Link: l, DeviceID: *devID, Sessions: *sessions, Mode: wrap.ParseMode(*obfs), TURNServer: *turnS,
 		Net:     &netx.Net{DNS: dnsList},
 		Captcha: newCaptchaSolver(),
+		VKCache: vkCacheFile(),
 		Logf: func(f string, a ...any) {
 			log.Printf(f, a...)
 		},
@@ -103,8 +113,22 @@ func main() {
 	defer e.Stop()
 
 	switch {
-	case *test || *download != "":
+	case *test || *download != "" || *upload > 0:
+		if *stats {
+			go printStats(ctx, e)
+		}
+		var pr chan string
+		if *pingHost != "" {
+			pr = make(chan string, 1)
+			go func() { pr <- pingStats(ctx, tnet, *pingHost, *pings, *verbose) }()
+		}
 		code := runTests(ctx, e, tnet, *test, *hold, *download)
+		if *upload > 0 && runUpload(ctx, e, tnet, *upload, *uploadURL) != 0 {
+			code = 1
+		}
+		if pr != nil {
+			fmt.Println(<-pr)
+		}
 		e.Stop()
 		os.Exit(code)
 	default:
@@ -154,6 +178,11 @@ func runTests(ctx context.Context, e *engine.Engine, tnet *netstack.Net, test bo
 		resp, err := client.Get(dl)
 		if err != nil {
 			fmt.Println("DOWNLOAD_FAIL", err)
+			return 1
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			fmt.Println("DOWNLOAD_FAIL HTTP", resp.StatusCode)
 			return 1
 		}
 		n, err := io.Copy(io.Discard, resp.Body)
@@ -216,3 +245,148 @@ func size(n uint64) string {
 }
 
 var _ = net.IPv4len
+
+// vkCacheFile is where VK guest tokens are kept between runs, so that a
+// restart does not bring up a captcha.
+func vkCacheFile() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "turnvk", "vk-guests.json")
+}
+
+// pingStats pings host through the tunnel n times, 5 per second, and
+// returns the round-trip summary.
+func pingStats(ctx context.Context, tnet *netstack.Net, host string, n int, each bool) string {
+	c, err := tnet.DialContext(ctx, "ping4", host)
+	if err != nil {
+		return "PING_FAIL " + err.Error()
+	}
+	defer c.Close()
+	var rtts []time.Duration
+	buf := make([]byte, 1500)
+	for i := 0; i < n && ctx.Err() == nil; i++ {
+		t := time.Now()
+		msg := icmp.Message{Type: ipv4.ICMPTypeEcho, Body: &icmp.Echo{ID: 1234, Seq: i, Data: []byte("turnvk-ping-turnvk-ping")}}
+		b, _ := msg.Marshal(nil)
+		if _, err := c.Write(b); err != nil {
+			continue
+		}
+		_ = c.SetReadDeadline(t.Add(2 * time.Second))
+		for {
+			m, err := c.Read(buf)
+			if err != nil {
+				break
+			}
+			r, err := icmp.ParseMessage(1, buf[:m])
+			if err != nil || r.Type != ipv4.ICMPTypeEchoReply {
+				continue
+			}
+			if e, ok := r.Body.(*icmp.Echo); ok && e.Seq == i {
+				rtts = append(rtts, time.Since(t))
+				if each {
+					fmt.Printf("PINGSAMPLE %s %d %.1f\n", t.Format("15:04:05.000"), i, float64(time.Since(t))/1e6)
+				}
+				break
+			}
+		}
+		if d := 200*time.Millisecond - time.Since(t); d > 0 {
+			time.Sleep(d)
+		}
+	}
+	if len(rtts) == 0 {
+		return fmt.Sprintf("PING %s lost %d/%d", host, n, n)
+	}
+	sorted := append([]time.Duration(nil), rtts...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	var sum time.Duration
+	for _, r := range rtts {
+		sum += r
+	}
+	ms := func(d time.Duration) string { return fmt.Sprintf("%.1f", float64(d)/1e6) }
+	return fmt.Sprintf("PING %s min=%s avg=%s p50=%s p95=%s max=%s ms, lost %d/%d", host,
+		ms(sorted[0]), ms(sum/time.Duration(len(rtts))), ms(sorted[len(sorted)/2]), ms(sorted[len(sorted)*95/100]), ms(sorted[len(sorted)-1]), n-len(rtts), n)
+}
+
+// printStats prints the speed and the routes' round trips every second.
+func printStats(ctx context.Context, e *engine.Engine) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	prev := e.Status()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		s := e.Status()
+		var rtts []int
+		fresh := 0
+		var got, lost, got0, lost0 uint64
+		for _, p := range prev.Paths {
+			got0 += p.RxPackets
+			lost0 += p.Lost
+		}
+		for _, p := range s.Paths {
+			got += p.RxPackets
+			lost += p.Lost
+			if p.RTT > 0 {
+				rtts = append(rtts, p.RTT)
+			}
+			if p.Fresh {
+				fresh++
+			}
+		}
+		sort.Ints(rtts)
+		med, worst := 0, 0
+		if len(rtts) > 0 {
+			med, worst = rtts[len(rtts)/2], rtts[len(rtts)-1]
+		}
+		upRate, upLoss, upQ, upN := 0, 0.0, 0, 0
+		for _, p := range s.Paths {
+			if p.UpRate > 0 {
+				upRate += p.UpRate
+				upLoss += p.UpLoss
+				upQ += p.UpQueue
+				upN++
+			}
+		}
+		up := ""
+		if upN > 0 {
+			up = fmt.Sprintf(" | up pace=%.1f Mbit/s loss=%.1f%% queue=%d ms", float64(upRate)*8/1e6, upLoss*100/float64(upN), upQ/upN)
+		}
+		loss := 0.0
+		if dg, dl := int64(got-got0), int64(lost-lost0); dg+dl > 0 && dl >= 0 {
+			loss = float64(dl) * 100 / float64(dg+dl)
+		}
+		fmt.Printf("STATS down=%.1f up=%.2f Mbit/s routes=%d/%d rtt median=%d worst=%d ms loss=%.1f%%%s\n",
+			float64(s.RxBytes-prev.RxBytes)*8/1e6, float64(s.TxBytes-prev.TxBytes)*8/1e6, fresh, len(s.Paths), med, worst, loss, up)
+		prev = s
+	}
+}
+
+// runUpload sends mb megabytes to a speed test endpoint through the tunnel.
+func runUpload(ctx context.Context, e *engine.Engine, tnet *netstack.Net, mb int, url string) int {
+	for i := 0; i < 20 && e.Status().Sessions < e.Status().Target; i++ {
+		time.Sleep(500 * time.Millisecond)
+	}
+	client := &http.Client{Transport: &http.Transport{DialContext: tnet.DialContext}, Timeout: 300 * time.Second}
+	body := strings.NewReader(strings.Repeat("turnvk-upload-test-", mb<<20/19+1)[:mb<<20])
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
+	t := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println("UPLOAD_FAIL", err)
+		return 1
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	d := time.Since(t)
+	if resp.StatusCode != http.StatusOK {
+		fmt.Println("UPLOAD_FAIL HTTP", resp.StatusCode)
+		return 1
+	}
+	fmt.Printf("UPLOAD %d MB in %v = %.1f Mbit/s (sessions %d)\n", mb, d.Round(time.Millisecond), float64(mb<<20)*8/d.Seconds()/1e6, e.Status().Sessions)
+	return 0
+}
