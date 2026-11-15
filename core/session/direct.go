@@ -419,11 +419,22 @@ func (s *Session) pingLoop() {
 			s.Close()
 			return
 		}
+		// Every ping is also a probe: a path that does not answer within
+		// probeWait stops carrying traffic until it does (about 4 s after
+		// it went silent instead of PathFresh).
+		if s.probeAt.Load() <= s.LastRx.Load() {
+			s.probeAt.Store(time.Now().UnixNano())
+		}
 		if s.ping() != nil {
 			s.Close()
 			return
 		}
 	}
+}
+
+// Silent returns how long the path has not heard from the server.
+func (s *Session) Silent(now time.Time) time.Duration {
+	return time.Duration(now.UnixNano() - s.LastRx.Load())
 }
 
 // ping measures the path's round trip and reports the loss seen on it:

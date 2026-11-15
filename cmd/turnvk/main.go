@@ -75,12 +75,18 @@ func main() {
 		}
 	}
 
+	tcpT, err := parseTCPTuning(os.Getenv("TURNVK_TCP"))
+	if err != nil {
+		log.Fatal(err)
+	}
 	var tnet *netstack.Net
 	e, err := engine.New(engine.Config{
 		Link: l, DeviceID: *devID, Sessions: *sessions, Mode: wrap.ParseMode(*obfs), TURNServer: *turnS,
 		Net:     &netx.Net{DNS: dnsList},
 		Captcha: newCaptchaSolver(),
 		VKCache: vkCacheFile(),
+		// TURNVK_SCORE=off: plain rotation over VK's TURN servers (comparisons).
+		NoRelayScoring: os.Getenv("TURNVK_SCORE") == "off",
 		Logf: func(f string, a ...any) {
 			log.Printf(f, a...)
 		},
@@ -103,8 +109,18 @@ func main() {
 			dnsAddrs = []netip.Addr{netip.MustParseAddr("1.1.1.1")}
 		}
 		td, n, err := netstack.CreateNetTUN([]netip.Addr{c.Address.Addr()}, dnsAddrs, c.MTU)
+		if err != nil {
+			return nil, err
+		}
 		tnet = n
-		return td, err
+		if os.Getenv("TURNVK_TCP") == "off" {
+			log.Printf("TCP: gVisor's defaults")
+		} else if err := tuneTCP(n, tcpT); err != nil {
+			log.Printf("TCP tuning: %v (using gVisor's defaults)", err)
+		} else if *verbose || os.Getenv("TURNVK_TCP") != "" {
+			log.Printf("TCP: %v", tcpT)
+		}
+		return td, nil
 	})
 	if err != nil {
 		log.Fatalf("connect: %v", err)
@@ -128,6 +144,9 @@ func main() {
 		}
 		if pr != nil {
 			fmt.Println(<-pr)
+		}
+		if *stats {
+			printRoutes(e)
 		}
 		e.Stop()
 		os.Exit(code)
@@ -248,6 +267,22 @@ var _ = net.IPv4len
 
 // vkCacheFile is where VK guest tokens are kept between runs, so that a
 // restart does not bring up a captcha.
+// printRoutes prints one ROUTE line per open route: its VK TURN server,
+// round trip, the server's packets it received and lost, and its upload
+// pacing.
+func printRoutes(e *engine.Engine) {
+	s := e.Status()
+	fmt.Printf("ROUTES open=%d target=%d replaced=%d\n", s.Sessions, s.Target, s.Reconnects)
+	for _, p := range s.Paths {
+		loss := 0.0
+		if p.RxPackets+p.Lost > 0 {
+			loss = 100 * float64(p.Lost) / float64(p.RxPackets+p.Lost)
+		}
+		fmt.Printf("ROUTE %d server=%s rtt=%d rx=%d lost=%.2f%% up_rate=%.1f up_loss=%.2f%% fresh=%v\n",
+			p.ID, p.Server, p.RTT, p.RxPackets, loss, float64(p.UpRate)*8/1e6, 100*p.UpLoss, p.Fresh)
+	}
+}
+
 func vkCacheFile() string {
 	dir, err := os.UserCacheDir()
 	if err != nil {

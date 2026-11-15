@@ -4,6 +4,8 @@
 #
 #   BENCH_LINK=wdtt://…      the link (required)
 #   BENCH_SSH=root@host      the server, for scenarios that change it (optional)
+#   BENCH_LOCAL=1            run on the server itself (scenarios that change it
+#                            run their commands locally; needs root)
 #   BENCH_UNIT=tvkdev        its systemd unit (restart scenario)
 #   BENCH_PORT=56010         its UDP port (loss scenario)
 #   BENCH_PING=10.66.67.1    the server's address in the tunnel
@@ -35,7 +37,16 @@ OUT=${BENCH_OUT:-bench-results.txt}
 LOG=$(mktemp)
 trap 'rm -f "$LOG"; cleanup_loss' EXIT
 
-remote() { [ -n "${BENCH_SSH:-}" ] && ssh -o BatchMode=yes "$BENCH_SSH" "$@"; }
+remote() {
+	if [ -n "${BENCH_LOCAL:-}" ]; then
+		sh -c "$*"
+	elif [ -n "${BENCH_SSH:-}" ]; then
+		ssh -o BatchMode=yes "$BENCH_SSH" "$@"
+	else
+		return 1
+	fi
+}
+can_remote() { [ -n "${BENCH_LOCAL:-}${BENCH_SSH:-}" ]; }
 
 # summary pulls the numbers out of one client run.
 summary() {
@@ -73,7 +84,7 @@ run() { # name, client flags…
 	local line
 	local repo
 	repo=$(dirname "$0")
-	line="$(date '+%F %T') $(git -C "$repo" rev-parse --short HEAD 2>/dev/null)$(git -C "$repo" diff --quiet 2>/dev/null || echo +) $(summary "$name")"
+	line="$(date '+%F %T') $(git -C "$repo" rev-parse --short HEAD 2>/dev/null)$(git -C "$repo" diff --quiet 2>/dev/null || echo +) $(summary "$name")${TURNVK_TCP:+ tcp=$TURNVK_TCP}"
 	echo "$line"
 	echo "$line" >>"$OUT"
 	# The whole client log, to look into a bad run later.
@@ -94,13 +105,13 @@ for s in "${@:-idle load16 load32 up16 loss16 restart}"; do
 		up16) run up16 -sessions 16 -stats -upload 20 -upload-url "$UPURL" -ping "$PING" -pings 100 ;;
 		loss16)
 			# 2% of the server's packets to VK dropped at random.
-			if [ -z "${BENCH_SSH:-}" ]; then echo "loss16: needs BENCH_SSH"; continue; fi
+			if ! can_remote; then echo "loss16: needs BENCH_SSH or BENCH_LOCAL"; continue; fi
 			remote "iptables -I $(loss_rule)"
 			run loss16 -sessions 16 -stats -download "$URL" -ping "$PING" -pings 100
 			cleanup_loss
 			;;
 		restart)
-			if [ -z "${BENCH_SSH:-}" ]; then echo "restart: needs BENCH_SSH"; continue; fi
+			if ! can_remote; then echo "restart: needs BENCH_SSH or BENCH_LOCAL"; continue; fi
 			(sleep 22 && remote "systemctl restart $UNIT") &
 			run restart -sessions 16 -test -hold 45s
 			wait

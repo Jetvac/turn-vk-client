@@ -41,7 +41,10 @@ type Config struct {
 	// VKCache is the file that keeps VK guest tokens between runs, so that
 	// a restart does not bring up a captcha ("" keeps them in memory).
 	VKCache string
-	Logf    func(format string, args ...any)
+	// NoRelayScoring keeps the plain rotation over VK's TURN servers
+	// (for comparisons; see relays.go).
+	NoRelayScoring bool
+	Logf           func(format string, args ...any)
 	// OnStatus is called (from any goroutine) when the status changes.
 	OnStatus func(Status)
 }
@@ -108,6 +111,9 @@ const (
 	staleRx         = 180 * time.Second
 	silentActive    = 8 * time.Second
 	silentProbe     = 2 * time.Second // direct protocol: probe the paths
+	// pathReplace: a direct path silent this long while others answer is
+	// replaced (three missed pings).
+	pathReplace = 6 * time.Second
 )
 
 // Engine is one running connection.
@@ -140,6 +146,7 @@ type Engine struct {
 
 	hadSessions atomic.Bool
 	learned     session.LearnedRates // upload rates per TURN server
+	relays      relays               // loss per TURN server
 	rekeying    atomic.Bool
 	lastReset   atomic.Int64
 
@@ -297,7 +304,7 @@ func (e *Engine) start(ctx context.Context, mk TunFactory) error {
 	var first *session.Session
 	waited := time.Duration(0)
 	for attempt := 0; ; attempt++ {
-		first, err = e.dial(ctx, attempt*len(e.hashes))
+		first, err = e.dial(ctx, 0, attempt)
 		if err == nil {
 			break
 		}
@@ -374,11 +381,13 @@ func (e *Engine) worker(i int, s *session.Session) {
 	backoff := time.Second
 	// Only sessions that replace an earlier one count as reconnects.
 	opened := s != nil
+	fails := 0 // failed dials in a row: each tries the next TURN server
 	for e.ctx.Err() == nil {
 		if s == nil {
 			var err error
-			s, err = e.dial(e.ctx, i)
+			s, err = e.dial(e.ctx, i, fails)
 			if err != nil {
+				fails++
 				if e.ctx.Err() != nil {
 					return
 				}
@@ -393,6 +402,7 @@ func (e *Engine) worker(i int, s *session.Session) {
 				backoff = min(backoff*2, 30*time.Second)
 				continue
 			}
+			fails = 0
 			if opened {
 				e.reconnect.Add(1)
 			}
@@ -422,7 +432,8 @@ func (e *Engine) worker(i int, s *session.Session) {
 		s.Close()
 		e.rxClosed.Add(s.RxBytes.Load())
 		e.txClosed.Add(s.TxBytes.Load())
-		if time.Since(s.Started) > time.Minute {
+		healthy := time.Since(s.Started) > time.Minute
+		if healthy {
 			backoff = time.Second
 		}
 		s = nil
@@ -430,7 +441,14 @@ func (e *Engine) worker(i int, s *session.Session) {
 			return
 		}
 		e.notify()
-		if !sleep(e.ctx, jitter(backoff)) {
+		// A route that served for a while is replaced at once, unless many
+		// went down together (a network switch, a server restart): then
+		// the new allocations are spread out.
+		wait := jitter(backoff)
+		if healthy && e.cfg.Sessions-len(e.b.list()) <= max(1, e.cfg.Sessions/4) {
+			wait = 0
+		}
+		if wait > 0 && !sleep(e.ctx, wait) {
 			return
 		}
 	}
@@ -456,8 +474,9 @@ func (e *Engine) readLoop(s *session.Session) {
 }
 
 // dial opens session slot i: its VK call is i mod len(hashes), its TURN
-// server rotates through the servers VK returned.
-func (e *Engine) dial(ctx context.Context, i int) (*session.Session, error) {
+// server rotates through the servers VK returned; shift moves it on, so
+// that a slot whose TURN server stopped answering tries the next one.
+func (e *Engine) dial(ctx context.Context, i, shift int) (*session.Session, error) {
 	ctx, cancel := context.WithTimeout(ctx, setupTimeout)
 	defer cancel()
 	hs, g, creds, err := e.creds(ctx, i)
@@ -466,7 +485,10 @@ func (e *Engine) dial(ctx context.Context, i int) (*session.Session, error) {
 	}
 	server := e.cfg.TURNServer
 	if server == "" {
-		server = creds.Servers[(i/len(e.hashes))%len(creds.Servers)]
+		server = creds.Servers[(i/len(e.hashes)+shift)%len(creds.Servers)]
+		if !e.cfg.NoRelayScoring && shift == 0 {
+			server = e.relays.pick(creds.Servers, server, e.b.list())
+		}
 	}
 	mode := e.mode.Load()
 	p := session.Params{
@@ -501,6 +523,11 @@ func (e *Engine) dial(ctx context.Context, i int) (*session.Session, error) {
 		}
 	case errors.As(err, &te) && te.CredentialsRejected():
 		hs.invalidate(g, creds)
+	case errors.As(err, &te), err != nil && ctx.Err() != nil && e.ctx.Err() == nil:
+		// The TURN server did not allocate, or the route never came up.
+		if e.cfg.TURNServer == "" {
+			e.relays.failed(server, time.Now())
+		}
 	}
 	return s, err
 }
@@ -680,6 +707,13 @@ func (e *Engine) watchdog() {
 		case <-t.C:
 		}
 		list := e.b.list()
+		e.replaceSilentPaths(list)
+		if !e.cfg.NoRelayScoring && e.relays.tick(list, time.Now()) {
+			if s := e.relays.moveOne(list); s != nil {
+				e.logf("route %d: TURN server %s loses %.1f%% of the packets, moving the route to a better one", s.ID, s.Server, 100*e.relays.lossOf(s.Server))
+				s.Close()
+			}
+		}
 		if rx := e.b.rx.Load(); rx != lastRx || len(list) == 0 {
 			lastRx, rxAt, txAtRx = rx, time.Now(), e.b.tx.Load()
 			continue
@@ -713,6 +747,45 @@ func (e *Engine) watchdog() {
 			s.Close()
 		}
 		lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
+	}
+}
+
+// replaceSilentPaths closes direct paths that have not heard from the
+// server for pathReplace while others have (their workers open new ones
+// at once). A path that is merely slow keeps answering pings; one that VK
+// stopped relaying would otherwise linger until pathDead. When no path
+// answers, the server is the likely problem: the watchdog handles that.
+func (e *Engine) replaceSilentPaths(list []*session.Session) {
+	if e.mode.Load() != modeDirect || len(list) < 2 {
+		return
+	}
+	now := time.Now()
+	fresh := 0
+	for _, s := range list {
+		if s.Fresh(now) {
+			fresh++
+		}
+	}
+	if fresh == 0 {
+		return
+	}
+	total, silent := map[string]int{}, map[string]int{}
+	for _, s := range list {
+		total[s.Server]++
+		if s.Direct() && s.Silent(now) > pathReplace && time.Since(s.Started) > pathReplace {
+			silent[s.Server]++
+			e.logf("route %d (%s) silent for %s, replacing it", s.ID, s.Server, s.Silent(now).Round(time.Second))
+			s.Close()
+		}
+	}
+	// Every route through a TURN server fell silent at once: the server
+	// itself stopped relaying. New routes go elsewhere for a while instead
+	// of waiting out its allocation timeout one by one.
+	for sv, n := range silent {
+		if n == total[sv] && n >= 2 && e.cfg.TURNServer == "" {
+			e.logf("TURN server %s stopped relaying, new routes avoid it for %s", sv, relayDownFor)
+			e.relays.failed(sv, now)
+		}
 	}
 }
 
