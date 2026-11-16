@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>TurnVK</title>
+<style>
+:root {
+  --bg: #f3f5fa; --card: #ffffff; --card2: #f7f8fc; --text: #141824; --muted: #697089; --faint: #a3a9bb;
+  --line: #e4e7f0; --accent: #2e5bff; --accent2: #4a78ff; --accent-soft: #e8eeff;
+  --ok: #18a058; --ok-soft: #e3f6ec; --warn: #d88a0c; --warn-soft: #fdf2df; --err: #d93a3a; --err-soft: #fde8e8;
+  --shadow: 0 1px 2px rgba(20,24,36,.05), 0 4px 16px rgba(20,24,36,.05);
+  --down: #2e5bff; --up: #18a058;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1218; --card: #181c25; --card2: #1e232e; --text: #e9ecf3; --muted: #9aa1b5; --faint: #5d6478;
+    --line: #272c38; --accent: #5b82ff; --accent2: #7b9bff; --accent-soft: #1f2a4d;
+    --ok: #34c77b; --ok-soft: #15301f; --warn: #f0a83a; --warn-soft: #33270f; --err: #f26b6b; --err-soft: #3a1a1a;
+    --shadow: 0 1px 2px rgba(0,0,0,.3);
+    --down: #6c8fff; --up: #34c77b;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg); color: var(--text);
+  font: 14px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  display: flex; flex-direction: column; user-select: none; -webkit-font-smoothing: antialiased;
+}
+button { font: inherit; color: inherit; }
+svg { display: block; }
+
+/* Header */
+header { display: flex; align-items: center; gap: 10px; padding: 14px 18px 8px; }
+header .logo { width: 30px; height: 30px; border-radius: 8px; background: linear-gradient(#4a78ff, #2444e0); display: grid; place-items: center; }
+header .logo svg { width: 20px; height: 20px; }
+header h1 { font: 600 17px "Segoe UI Variable Display", "Segoe UI", sans-serif; margin: 0; flex: 1; letter-spacing: .1px; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 99px; font-size: 12px; font-weight: 600; background: var(--card2); color: var(--muted); }
+.pill i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.pill.ok { background: var(--ok-soft); color: var(--ok); }
+.pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.err { background: var(--err-soft); color: var(--err); }
+
+main { flex: 1; overflow-y: auto; padding: 6px 16px 16px; scrollbar-width: thin; }
+section { display: none; animation: fade .18s ease; }
+section.on { display: block; }
+@keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.card { background: var(--card); border-radius: 16px; padding: 16px; margin-bottom: 12px; box-shadow: var(--shadow); }
+.title { font-size: 12px; font-weight: 600; color: var(--muted); letter-spacing: .3px; text-transform: uppercase; margin: 0 0 10px; }
+.muted { color: var(--muted); }
+.small { font-size: 12.5px; }
+
+/* Buttons */
+.btn { border: 0; border-radius: 10px; padding: 9px 16px; font-weight: 600; cursor: pointer; transition: filter .15s, background .15s; }
+.btn:hover { filter: brightness(1.06); }
+.btn.primary { background: var(--accent); color: #fff; }
+.btn.ghost { background: var(--card2); }
+.btn.danger { background: none; color: var(--err); padding-left: 6px; padding-right: 6px; }
+.btn.wide { width: 100%; padding: 11px; }
+.btn:disabled { opacity: .45; cursor: default; filter: none; }
+
+/* Hero */
+.hero { text-align: center; padding: 26px 16px 22px; position: relative; overflow: hidden; }
+.hero::before {
+  content: ""; position: absolute; inset: -40% -20% auto; height: 260px; border-radius: 50%;
+  background: radial-gradient(closest-side, var(--glow, transparent), transparent); opacity: .55; transition: background .4s; pointer-events: none;
+}
+.hero.connected { --glow: color-mix(in srgb, var(--ok) 35%, transparent); }
+.hero.connecting { --glow: color-mix(in srgb, var(--accent) 30%, transparent); }
+.power-wrap { position: relative; width: 148px; height: 148px; margin: 0 auto; }
+.ring { position: absolute; inset: 0; border-radius: 50%; border: 3px solid transparent; }
+.connecting .ring { border-top-color: var(--accent); border-right-color: color-mix(in srgb, var(--accent) 35%, transparent); animation: spin 1s linear infinite; }
+.connected .ring { border-color: color-mix(in srgb, var(--ok) 28%, transparent); }
+@keyframes spin { to { transform: rotate(360deg); } }
+.power {
+  position: absolute; inset: 12px; border-radius: 50%; border: 0; cursor: pointer;
+  background: var(--card2); color: var(--faint); display: grid; place-items: center;
+  box-shadow: inset 0 0 0 1px var(--line); transition: background .25s, color .25s, transform .1s, box-shadow .25s;
+}
+.power:hover { color: var(--accent); }
+.power:active { transform: scale(.97); }
+.power svg { width: 50px; height: 50px; }
+.connecting .power { color: var(--accent); background: var(--accent-soft); box-shadow: none; }
+.connected .power { background: linear-gradient(160deg, #3fd38a, #14965a); color: #fff; box-shadow: 0 10px 30px color-mix(in srgb, var(--ok) 40%, transparent); }
+.failed .power { color: var(--err); }
+.state { font: 600 21px "Segoe UI Variable Display", "Segoe UI", sans-serif; margin-top: 18px; position: relative; }
+.sub { margin-top: 2px; min-height: 20px; color: var(--muted); position: relative; font-variant-numeric: tabular-nums; }
+.errbox { display: none; margin-top: 12px; text-align: left; padding: 10px 12px; border-radius: 10px; background: var(--err-soft); color: var(--err); font-size: 13px; white-space: pre-wrap; user-select: text; position: relative; }
+
+/* Server row */
+.srv { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 14px; cursor: pointer; background: var(--card); box-shadow: var(--shadow); margin-bottom: 12px; transition: background .15s; }
+.srv:hover { background: var(--card2); }
+.srv .ic { width: 38px; height: 38px; border-radius: 11px; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; flex: none; }
+.srv .ic svg { width: 20px; height: 20px; }
+.srv .grow { flex: 1; min-width: 0; }
+.srv .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.srv .host { font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.srv .chev { color: var(--faint); width: 18px; height: 18px; }
+
+/* Stats */
+.speeds { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.speed .k { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.speed .k i { width: 8px; height: 8px; border-radius: 2px; }
+.speed .v { font: 600 22px "Segoe UI Variable Display", "Segoe UI", sans-serif; font-variant-numeric: tabular-nums; }
+.speed .v small { font-size: 13px; font-weight: 500; color: var(--muted); margin-left: 3px; }
+canvas { width: 100%; height: 70px; display: block; margin: 8px 0 4px; }
+.tiles { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.tile { background: var(--card2); border-radius: 11px; padding: 9px 11px; }
+.tile .k { font-size: 11.5px; color: var(--muted); }
+.tile .v { font-weight: 600; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.paths { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 12px; }
+.paths span { width: 11px; height: 11px; border-radius: 3px; background: var(--ok); }
+.paths span.stale { background: var(--line); }
+.note { font-size: 12px; color: var(--muted); padding: 2px 4px; display: flex; gap: 8px; align-items: flex-start; }
+.note svg { width: 15px; height: 15px; flex: none; margin-top: 1px; }
+
+/* Servers */
+.list .item { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); cursor: pointer; }
+.list .item:first-child { border-top: 0; padding-top: 2px; }
+.list .item:last-child { padding-bottom: 2px; }
+.radio { width: 18px; height: 18px; border-radius: 50%; border: 2px solid var(--faint); flex: none; display: grid; place-items: center; }
+.item.cur .radio { border-color: var(--accent); }
+.item.cur .radio::after { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.item .grow { flex: 1; min-width: 0; }
+.item .name { font-weight: 600; }
+.item .host { font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.iconbtn { border: 0; background: none; color: var(--muted); padding: 6px; border-radius: 8px; cursor: pointer; }
+.iconbtn:hover { background: var(--card2); color: var(--text); }
+.iconbtn svg { width: 18px; height: 18px; }
+.empty { text-align: center; padding: 26px 12px 20px; }
+.empty .big { width: 56px; height: 56px; border-radius: 16px; background: var(--accent-soft); color: var(--accent); display: grid; place-items: center; margin: 0 auto 12px; }
+.empty .big svg { width: 28px; height: 28px; }
+label.field { display: block; margin-bottom: 12px; }
+label.field span { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 5px; }
+input[type=text], textarea {
+  width: 100%; font: inherit; color: var(--text); background: var(--card2);
+  border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px; user-select: text; outline: none; transition: border-color .15s;
+}
+input[type=text]:focus, textarea:focus { border-color: var(--accent); }
+textarea { resize: vertical; min-height: 84px; font: 12.5px/1.45 "Cascadia Mono", Consolas, monospace; word-break: break-all; }
+.row { display: flex; gap: 8px; align-items: center; justify-content: flex-end; }
+.row .left { margin-right: auto; }
+.ferr { color: var(--err); font-size: 12.5px; min-height: 18px; margin: -4px 0 6px; }
+
+/* Settings */
+.opt { padding: 14px 0; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 12px; }
+.opt:first-child { border-top: 0; padding-top: 0; }
+.opt:last-child { padding-bottom: 0; }
+.opt .grow { flex: 1; }
+.opt .lbl { font-weight: 600; }
+.opt .hint { font-size: 12.5px; color: var(--muted); }
+.slider { display: flex; align-items: center; gap: 12px; margin-top: 8px; }
+.slider b { min-width: 28px; text-align: right; font-variant-numeric: tabular-nums; }
+input[type=range] { flex: 1; accent-color: var(--accent); }
+.seg { display: flex; background: var(--card2); border-radius: 10px; padding: 3px; margin-top: 8px; }
+.seg button { flex: 1; border: 0; background: none; color: var(--muted); padding: 7px 10px; border-radius: 8px; cursor: pointer; }
+.seg button.on { background: var(--card); color: var(--text); font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+.switch { position: relative; width: 42px; height: 24px; flex: none; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch i { position: absolute; inset: 0; background: var(--line); border-radius: 12px; transition: background .15s; cursor: pointer; }
+.switch i::after { content: ""; position: absolute; left: 3px; top: 3px; width: 18px; height: 18px; border-radius: 50%; background: #fff; transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.2); }
+.switch input:checked + i { background: var(--accent); }
+.switch input:checked + i::after { transform: translateX(18px); }
+.about { display: flex; gap: 12px; align-items: center; }
+.about .logo { width: 44px; height: 44px; border-radius: 12px; background: linear-gradient(#4a78ff, #2444e0); display: grid; place-items: center; flex: none; }
+.about .logo svg { width: 28px; height: 28px; }
+
+/* Log */
+#logBox { font: 12px/1.55 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; word-break: break-all; user-select: text; max-height: none; }
+
+/* Bottom bar */
+.tabs { display: flex; background: var(--card); border-top: 1px solid var(--line); padding: 6px 8px 8px; }
+.tabs button { flex: 1; border: 0; background: none; cursor: pointer; display: flex; flex-direction: column; align-items: center; gap: 3px; padding: 4px 0; color: var(--muted); font-size: 11.5px; }
+.tabs button span { width: 54px; height: 28px; border-radius: 14px; display: grid; place-items: center; transition: background .15s; }
+.tabs button svg { width: 20px; height: 20px; }
+.tabs button.on { color: var(--text); font-weight: 600; }
+.tabs button.on span { background: var(--accent-soft); color: var(--accent); }
+/* Another VPN */
+.warn { display: none; gap: 12px; align-items: flex-start; background: var(--warn-soft); color: var(--text); border-radius: 14px; padding: 12px 14px; margin-bottom: 12px; }
+.warn .wi { width: 22px; height: 22px; color: var(--warn); flex: none; margin-top: 1px; }
+.warn b { display: block; margin-bottom: 2px; }
+.warn div { font-size: 13px; }
+.modal { position: fixed; inset: 0; background: rgba(10,12,18,.45); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 10; }
+.modal.on { display: flex; animation: fade .15s ease; }
+.dialog { background: var(--card); border-radius: 18px; padding: 20px; max-width: 360px; width: 100%; box-shadow: 0 20px 60px rgba(0,0,0,.3); }
+.dialog .wi { width: 40px; height: 40px; border-radius: 12px; background: var(--warn-soft); color: var(--warn); display: grid; place-items: center; margin-bottom: 12px; }
+.dialog .wi svg { width: 22px; height: 22px; }
+.dialog h3 { margin: 0 0 6px; font: 600 17px "Segoe UI Variable Display", "Segoe UI", sans-serif; }
+.dialog p { margin: 0 0 8px; color: var(--muted); font-size: 13.5px; }
+.dialog .row { margin-top: 16px; }
+.toast { position: fixed; left: 50%; bottom: 84px; transform: translateX(-50%) translateY(10px); background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 10px; font-size: 13px; opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; }
+.toast.on { opacity: 1; transform: translateX(-50%); }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute">
+  <symbol id="i-shield" viewBox="0 0 24 24"><path fill="currentColor" d="M12 2 4 5v6c0 5 3.4 9.7 8 11 4.6-1.3 8-6 8-11V5l-8-3Z"/></symbol>
+  <symbol id="i-logo" viewBox="0 0 108 108"><path fill="#fff" d="M54 24 28 35v17c0 16 11 29 26 34 15-5 26-18 26-34V35L54 24Z"/><circle cx="54" cy="45" r="7" fill="#3358ef"/><path fill="#3358ef" d="M42 69a12 12 0 0 1 24 0Z"/></symbol>
+  <symbol id="i-power" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 3v8"/><path d="M6.3 6.8a8 8 0 1 0 11.4 0"/></g></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6v6c0 4.6 3.2 8.6 8 9.8 4.8-1.2 8-5.2 8-9.8V6l-8-3Z"/></g></symbol>
+  <symbol id="i-server" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></g></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z"/></g></symbol>
+  <symbol id="i-log" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></g></symbol>
+  <symbol id="i-chev" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="m9 6 6 6-6 6"/></symbol>
+  <symbol id="i-edit" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M4 20h4L19 9l-4-4L4 16v4Zm9-13 4 4"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4M12 17h.01"/></g></symbol>
+  <symbol id="i-info" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></g></symbol>
+</svg>
+
+<header>
+  <div class="logo"><svg><use href="#i-logo"/></svg></div>
+  <h1>TurnVK</h1>
+  <div class="pill" id="pill"><i></i><span>Отключено</span></div>
+</header>
+
+<main>
+  <section id="home" class="on">
+    <div class="card hero" id="hero">
+      <div class="power-wrap">
+        <div class="ring"></div>
+        <button id="power" class="power" title="Подключить или отключить"><svg><use href="#i-power"/></svg></button>
+      </div>
+      <div class="state" id="state">Отключено</div>
+      <div class="sub" id="sub">Нажмите, чтобы подключиться</div>
+      <div class="errbox" id="err"></div>
+    </div>
+
+    <div class="warn" id="otherVPN">
+      <svg class="wi"><use href="#i-warn"/></svg>
+      <div><b id="otherTitle"></b><span id="otherText"></span></div>
+    </div>
+
+    <div class="srv" id="srv">
+      <div class="ic"><svg><use href="#i-server"/></svg></div>
+      <div class="grow"><div class="name" id="srvName">Добавьте сервер</div><div class="host" id="srvHost">Ссылка wdtt:// из панели сервера</div></div>
+      <svg class="chev"><use href="#i-chev"/></svg>
+    </div>
+
+    <div class="card" id="statsCard" style="display:none">
+      <div class="speeds">
+        <div class="speed"><div class="k"><i style="background:var(--down)"></i>Загрузка</div><div class="v" id="down">0<small>Мбит/с</small></div></div>
+        <div class="speed"><div class="k"><i style="background:var(--up)"></i>Отдача</div><div class="v" id="up">0<small>Мбит/с</small></div></div>
+      </div>
+      <canvas id="chart" width="720" height="140"></canvas>
+      <div class="tiles">
+        <div class="tile"><div class="k">Маршруты через VK</div><div class="v" id="routes">—</div></div>
+        <div class="tile"><div class="k">Пинг</div><div class="v" id="ping">—</div></div>
+        <div class="tile"><div class="k">Трафик</div><div class="v" id="traffic">—</div></div>
+        <div class="tile"><div class="k">Адрес в VPN</div><div class="v" id="addr">—</div></div>
+      </div>
+      <div class="paths" id="paths"></div>
+      <div class="small muted" style="margin-top:10px" id="proto"></div>
+    </div>
+
+    <div class="note"><svg><use href="#i-info"/></svg><span>Весь трафик компьютера идёт через серверы звонков VK и шифруется WireGuard.</span></div>
+  </section>
+
+  <section id="servers">
+    <div class="card" id="listCard">
+      <div class="title">Серверы</div>
+      <div class="list" id="serverList"></div>
+    </div>
+    <div class="card" id="editor" style="display:none">
+      <div class="title" id="editorTitle">Новый сервер</div>
+      <label class="field"><span>Название</span><input type="text" id="edName" placeholder="Мой сервер"></label>
+      <label class="field"><span>Ссылка wdtt://</span><textarea id="edLink" spellcheck="false" placeholder="wdtt://…"></textarea></label>
+      <div class="ferr" id="edErr"></div>
+      <div class="note" style="padding:0 0 14px"><svg><use href="#i-info"/></svg><span>В ссылке пароль подключения: делитесь ею только с теми, кому доверяете.</span></div>
+      <div class="row">
+        <button class="btn danger left" id="edDelete">Удалить</button>
+        <button class="btn ghost" id="edPaste">Вставить</button>
+        <button class="btn ghost" id="edCancel">Отмена</button>
+        <button class="btn primary" id="edSave">Сохранить</button>
+      </div>
+    </div>
+    <button class="btn primary wide" id="addServer"><span style="display:inline-flex;gap:6px;align-items:center"><svg style="width:18px;height:18px"><use href="#i-plus"/></svg>Добавить сервер</span></button>
+  </section>
+
+  <section id="settings">
+    <div class="card">
+      <div class="title">Подключение</div>
+      <div class="opt" style="display:block">
+        <div class="lbl">Маршрутов через VK</div>
+        <div class="hint">Больше маршрутов — выше скорость, но дольше подключение и больше гостей VK.</div>
+        <div class="slider"><input type="range" id="sessions" min="4" max="64" step="4"><b id="sessVal">32</b></div>
+      </div>
+      <div class="opt" style="display:block">
+        <div class="lbl">Маскировка трафика</div>
+        <div class="hint">Под какой звонок VK оформлены пакеты.</div>
+        <div class="seg" id="obfs"><button data-v="audio">Аудиозвонок</button><button data-v="video">Видеозвонок</button></div>
+      </div>
+      <div class="opt">
+        <div class="grow"><div class="lbl">Подключаться при запуске</div><div class="hint">К выбранному серверу, как только откроется TurnVK</div></div>
+        <label class="switch"><input type="checkbox" id="autoconn"><i></i></label>
+      </div>
+    </div>
+    <div class="note" style="margin-bottom:12px"><svg><use href="#i-info"/></svg><span>Изменения применятся при следующем подключении.</span></div>
+    <div class="card">
+      <div class="about">
+        <div class="logo"><svg><use href="#i-logo"/></svg></div>
+        <div>
+          <div style="font-weight:600">TurnVK <span id="ver" class="muted" style="font-weight:400"></span></div>
+          <div class="small muted">Устройство: <span id="dev" style="user-select:text"></span></div>
+        </div>
+      </div>
+      <div class="small muted" style="margin-top:12px">Сетевой адаптер «TurnVK» (Wintun) появляется только на время подключения и исчезает при отключении.</div>
+    </div>
+  </section>
+
+  <section id="log">
+    <div class="row" style="margin-bottom:12px; justify-content:flex-start">
+      <button class="btn ghost" id="logCopy">Копировать</button>
+      <button class="btn ghost" id="logClear">Очистить</button>
+    </div>
+    <div class="card"><div id="logBox"></div></div>
+  </section>
+</main>
+
+<div class="tabs">
+  <button data-tab="home" class="on"><span><svg><use href="#i-home"/></svg></span>Главная</button>
+  <button data-tab="servers"><span><svg><use href="#i-server"/></svg></span>Серверы</button>
+  <button data-tab="settings"><span><svg><use href="#i-gear"/></svg></span>Настройки</button>
+  <button data-tab="log"><span><svg><use href="#i-log"/></svg></span>Журнал</button>
+</div>
+<div class="toast" id="toast"></div>
+<div class="modal" id="vpnModal">
+  <div class="dialog">
+    <div class="wi"><svg><use href="#i-warn"/></svg></div>
+    <h3 id="mTitle">Включён другой VPN</h3>
+    <p id="mText"></p>
+    <p>Выключите его и подключите TurnVK снова.</p>
+    <div class="row">
+      <button class="btn ghost" id="mAnyway">Подключить всё равно</button>
+      <button class="btn primary" id="mOk">Понятно</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let V = null, editing = null, last = null, logLines = [], tab = 'home';
+const hist = []; // [down, up] bytes/s, one per second
+
+document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => show(b.dataset.tab));
+function show(t) {
+  tab = t;
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.toggle('on', b.dataset.tab === t));
+  document.querySelectorAll('section').forEach(s => s.classList.toggle('on', s.id === t));
+  if (t === 'log') renderLog();
+  if (t === 'home') drawChart();
+}
+function toast(text) {
+  const t = $('toast'); t.textContent = text; t.classList.add('on');
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove('on'), 1800);
+}
+
+function size(n) {
+  if (n < 1024) return n + ' Б';
+  const u = ['КБ', 'МБ', 'ГБ', 'ТБ']; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(n < 10 ? 1 : 0) + ' ' + u[i];
+}
+function mbit(bps) { const m = bps * 8 / 1e6; return m >= 100 ? m.toFixed(0) : m >= 10 ? m.toFixed(1) : m.toFixed(2); }
+function hostOf(link) { return link.replace(/^wdtt:\/\//, '').split(/[:?\/]/)[0]; }
+function dur(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor(sec / 60) % 60, s = sec % 60;
+  const p = (x) => String(x).padStart(2, '0');
+  return (h ? h + ':' : '') + p(m) + ':' + p(s);
+}
+
+// Engine errors are English; the common ones get a plain explanation.
+function humanError(e) {
+  const l = e.toLowerCase();
+  if (l.includes('dtls handshake timed out')) return 'Сервер не ответил. Проверьте, что сервер включён в панели, а ссылка актуальна (после переустановки сервера нужна новая).';
+  if (l.includes("server's key does not match")) return 'Ключ сервера не совпал со ссылкой: сервер переустановлен или это не ваш сервер. Возьмите новую ссылку в панели.';
+  if (l.includes('rejected the connection password')) return 'Сервер не принял пароль из ссылки. Возьмите новую ссылку в панели.';
+  if (l.includes('expired') && l.includes('password')) return 'Срок действия пароля истёк.';
+  if (l.includes('disabled') && l.includes('password')) return 'Пароль отключён в панели.';
+  if (l.includes('bound to another device')) return 'Этот пароль привязан к другому устройству.';
+  if (l.includes('newer connection')) return 'Это устройство подключилось заново в другом месте.';
+  if (l.includes('vk call is unavailable') || l.includes('no usable vk call')) return 'Звонок VK в ссылке больше не работает. Обновите ссылку в панели.';
+  if (l.includes('captcha')) return 'VK попросил проверку, но она не была пройдена.';
+  if (l.includes('wintun') || l.includes('network adapter')) return 'Не удалось создать сетевой адаптер TurnVK: ' + e;
+  if (l.includes('no network connection')) return 'Нет подключения к интернету.';
+  return e;
+}
+
+function current() { return V && V.settings.profiles.find(x => x.id === V.settings.current); }
+
+window.onView = function (v) {
+  V = v;
+  const s = v.status, st = s ? s.state : 'stopped';
+  const connected = v.running && st === 'connected';
+  const captcha = v.running && !connected && (st === 'captcha' || (s && s.captcha));
+  const mode = connected ? 'connected' : v.running ? 'connecting' : v.error ? 'failed' : '';
+  $('hero').className = 'card hero ' + mode;
+
+  let title = 'Отключено', sub = 'Нажмите, чтобы подключиться', pill = ['', 'Отключено'];
+  if (connected) {
+    title = 'Подключено'; sub = dur(Date.now() / 1000 - s.since); pill = ['ok', 'Защищено'];
+  } else if (captcha) {
+    title = 'Нужна проверка VK'; sub = 'Подтвердите в открывшемся окне, что вы не робот'; pill = ['warn', 'Проверка'];
+  } else if (v.running) {
+    title = 'Подключение…'; sub = s && s.target ? 'маршрутов ' + s.sessions + ' из ' + s.target : ''; pill = ['warn', 'Подключение'];
+  } else if (v.error) {
+    title = 'Не удалось подключиться'; sub = 'Нажмите, чтобы попробовать снова'; pill = ['err', 'Ошибка'];
+  } else if (!v.settings.profiles.length) sub = 'Сначала добавьте сервер';
+  $('state').textContent = title; $('sub').textContent = sub;
+  $('pill').className = 'pill ' + pill[0]; $('pill').querySelector('span').textContent = pill[1];
+  const errText = v.error || (v.running && !connected && s && s.last_error ? s.last_error : '');
+  $('err').style.display = errText ? 'block' : 'none';
+  $('err').textContent = errText ? humanError(errText) : '';
+
+  const other = v.other_vpn;
+  $('otherVPN').style.display = other ? 'flex' : 'none';
+  if (other) {
+    $('otherTitle').textContent = 'Включён другой VPN: «' + other + '»';
+    $('otherText').textContent = v.running
+      ? 'Большая часть трафика идёт через него, а не через TurnVK: Discord и другие программы могут не работать. Выключите «' + other + '».'
+      : 'Пока он работает, трафик пойдёт через него, а не через TurnVK. Выключите его перед подключением.';
+  }
+
+  const cur = current();
+  $('srvName').textContent = cur ? cur.name : 'Добавьте сервер';
+  $('srvHost').textContent = cur ? 'Сервер ' + hostOf(cur.link) + (v.settings.profiles.length > 1 ? ' · ещё ' + (v.settings.profiles.length - 1) : '') : 'Ссылка wdtt:// из панели сервера';
+
+  $('statsCard').style.display = v.running && s ? '' : 'none';
+  if (v.running && s) {
+    const now = performance.now();
+    if (last && s.rx_bytes >= last.rx && now - last.t >= 900) {
+      const dt = (now - last.t) / 1000;
+      const d = (s.rx_bytes - last.rx) / dt, u = (s.tx_bytes - last.tx) / dt;
+      hist.push([d, u]); if (hist.length > 60) hist.shift();
+      $('down').innerHTML = mbit(d) + '<small>Мбит/с</small>';
+      $('up').innerHTML = mbit(u) + '<small>Мбит/с</small>';
+      last = { t: now, rx: s.rx_bytes, tx: s.tx_bytes };
+      drawChart();
+    } else if (!last || s.rx_bytes < last.rx) last = { t: now, rx: s.rx_bytes, tx: s.tx_bytes };
+    $('routes').textContent = s.sessions + ' из ' + s.target;
+    $('ping').textContent = s.rtt_ms ? s.rtt_ms + ' мс' : '—';
+    $('traffic').textContent = '↓ ' + size(s.rx_bytes) + '  ↑ ' + size(s.tx_bytes);
+    $('addr').textContent = s.address || 'определяется…';
+    const paths = s.paths || [];
+    $('paths').innerHTML = paths.map(x => '<span class="' + (x.fresh ? '' : 'stale') + '" title="' + x.server + (x.rtt_ms ? ' · ' + x.rtt_ms + ' мс' : '') + '"></span>').join('');
+    $('proto').textContent = s.protocol === 'direct' ? 'Протокол: прямой (сервер TurnVK)' : s.protocol ? 'Протокол: DTLS (стандартный сервер WDTT)' : '';
+  } else { last = null; hist.length = 0; }
+
+  renderServers();
+  if (document.activeElement !== $('sessions')) { $('sessions').value = v.settings.sessions; $('sessVal').textContent = v.settings.sessions; }
+  document.querySelectorAll('#obfs button').forEach(b => b.classList.toggle('on', b.dataset.v === v.settings.obfs));
+  $('autoconn').checked = v.settings.connect_on_start;
+  $('ver').textContent = v.version; $('dev').textContent = v.device;
+};
+
+function drawChart() {
+  const c = $('chart'); if (!c || tab !== 'home' || c.offsetParent === null) return;
+  const r = c.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  c.width = Math.round(r.width * dpr); c.height = Math.round(r.height * dpr);
+  const g = c.getContext('2d'), W = c.width, H = c.height;
+  g.clearRect(0, 0, W, H);
+  const css = getComputedStyle(document.documentElement);
+  g.strokeStyle = css.getPropertyValue('--line'); g.lineWidth = 1;
+  for (let i = 1; i < 3; i++) { const y = Math.round(H * i / 3) + .5; g.beginPath(); g.moveTo(0, y); g.lineTo(W, y); g.stroke(); }
+  if (hist.length < 2) return;
+  const max = Math.max(1e5, ...hist.map(h => Math.max(h[0], h[1]))) * 1.15;
+  const step = W / 59, x0 = W - (hist.length - 1) * step;
+  [[0, '--down'], [1, '--up']].forEach(([k, col]) => {
+    const color = css.getPropertyValue(col).trim();
+    g.beginPath();
+    hist.forEach((h, i) => { const x = x0 + i * step, y = H - 2 - (h[k] / max) * (H - 6); i ? g.lineTo(x, y) : g.moveTo(x, y); });
+    g.strokeStyle = color; g.lineWidth = 2 * dpr; g.lineJoin = 'round'; g.stroke();
+    g.lineTo(W, H); g.lineTo(x0, H); g.closePath();
+    const grd = g.createLinearGradient(0, 0, 0, H); grd.addColorStop(0, color + '33'); grd.addColorStop(1, color + '00');
+    g.fillStyle = grd; g.fill();
+  });
+}
+window.addEventListener('resize', drawChart);
+
+$('power').onclick = async () => {
+  if (!V) return;
+  try {
+    if (V.running) await tvkDisconnect();
+    else if (!V.settings.profiles.length) { show('servers'); openEditor(null); }
+    else if (V.other_vpn) {
+      $('mTitle').textContent = 'Включён другой VPN: «' + V.other_vpn + '»';
+      $('mText').textContent = 'Два VPN сразу не уживаются: большая часть трафика пойдёт через «' + V.other_vpn + '», а не через TurnVK, и такие программы, как Discord, могут перестать работать.';
+      $('vpnModal').classList.add('on');
+    }
+    else await connect();
+  } catch (e) { showErr(e); }
+};
+function showErr(e) { $('err').style.display = 'block'; $('err').textContent = humanError(String(e && e.message || e)); }
+async function connect() { try { await tvkConnect(); } catch (e) { showErr(e); } }
+$('mOk').onclick = () => $('vpnModal').classList.remove('on');
+$('mAnyway').onclick = () => { $('vpnModal').classList.remove('on'); connect(); };
+$('srv').onclick = () => { show('servers'); if (!V.settings.profiles.length) openEditor(null); };
+
+function renderServers() {
+  if (!V) return;
+  const box = $('serverList'), ps = V.settings.profiles;
+  const key = JSON.stringify([ps, V.settings.current, V.running]);
+  if (box.dataset.k === key) return;
+  box.dataset.k = key;
+  box.innerHTML = '';
+  if (!ps.length) {
+    box.innerHTML = '<div class="empty"><div class="big"><svg><use href="#i-server"/></svg></div><div style="font-weight:600">Пока нет серверов</div><div class="small muted">Вставьте ссылку wdtt:// из панели вашего сервера.</div></div>';
+    return;
+  }
+  ps.forEach(x => {
+    const r = document.createElement('div');
+    r.className = 'item' + (x.id === V.settings.current ? ' cur' : '');
+    r.innerHTML = '<div class="radio"></div><div class="grow"><div class="name"></div><div class="host"></div></div><button class="iconbtn" title="Изменить"><svg><use href="#i-edit"/></svg></button>';
+    r.querySelector('.name').textContent = x.name;
+    r.querySelector('.host').textContent = 'Сервер ' + hostOf(x.link);
+    r.onclick = () => {
+      if (V.running && x.id !== V.settings.current) { toast('Сначала отключитесь'); return; }
+      tvkSelect(x.id);
+    };
+    r.querySelector('button').onclick = (ev) => { ev.stopPropagation(); openEditor(x); };
+    box.appendChild(r);
+  });
+}
+function openEditor(p) {
+  editing = p;
+  $('editor').style.display = ''; $('addServer').style.display = 'none';
+  $('editorTitle').textContent = p ? 'Изменить сервер' : 'Новый сервер';
+  $('edName').value = p ? p.name : ''; $('edLink').value = p ? p.link : '';
+  $('edErr').textContent = ''; $('edDelete').style.display = p ? '' : 'none';
+  $('edLink').focus();
+}
+function closeEditor() { editing = null; $('editor').style.display = 'none'; $('addServer').style.display = ''; }
+$('addServer').onclick = () => openEditor(null);
+$('edCancel').onclick = closeEditor;
+$('edPaste').onclick = async () => {
+  try { $('edLink').value = (await navigator.clipboard.readText()).trim(); }
+  catch (e) { $('edLink').focus(); document.execCommand('paste'); }
+};
+$('edSave').onclick = async () => {
+  try {
+    await tvkSaveProfile({ id: editing ? editing.id : '', name: $('edName').value, link: $('edLink').value });
+    closeEditor(); toast('Сервер сохранён');
+  } catch (e) { $('edErr').textContent = String(e && e.message || e); }
+};
+$('edDelete').onclick = async () => {
+  if (!editing) return;
+  if (!confirm('Удалить «' + editing.name + '»?\n\nСсылка удалится с компьютера. Если она понадобится снова, её придётся вставить заново.')) return;
+  await tvkDeleteProfile(editing.id); closeEditor();
+};
+
+function sendOptions() {
+  tvkSetOptions(parseInt($('sessions').value, 10), document.querySelector('#obfs button.on').dataset.v, $('autoconn').checked);
+}
+$('sessions').oninput = () => { $('sessVal').textContent = $('sessions').value; };
+$('sessions').onchange = () => { sendOptions(); $('sessions').blur(); };
+document.querySelectorAll('#obfs button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('#obfs button').forEach(x => x.classList.toggle('on', x === b)); sendOptions();
+});
+$('autoconn').onchange = sendOptions;
+
+window.onLog = function (line) {
+  logLines.push(line);
+  if (logLines.length > 1000) logLines.splice(0, 500);
+  if (tab === 'log') {
+    const box = $('logBox'), atEnd = box.parentElement && main().scrollTop + main().clientHeight >= main().scrollHeight - 30;
+    if (logLines.length === 1) box.textContent = line; else box.textContent += '\n' + line;
+    if (atEnd) main().scrollTop = main().scrollHeight;
+  }
+};
+function main() { return document.querySelector('main'); }
+function renderLog() {
+  const box = $('logBox');
+  if (!logLines.length) { box.innerHTML = '<div class="empty muted" style="font-family:inherit">Пока пусто</div>'; return; }
+  box.textContent = logLines.join('\n');
+  setTimeout(() => { main().scrollTop = main().scrollHeight; }, 0);
+}
+$('logCopy').onclick = async () => { await navigator.clipboard.writeText(logLines.join('\n')); toast('Журнал скопирован'); };
+$('logClear').onclick = async () => { await tvkClearLogs(); logLines = []; renderLog(); };
+
+(async () => {
+  logLines = await tvkLogs();
+  onView(await tvkView());
+})();
+</script>
+</body>
+</html>
