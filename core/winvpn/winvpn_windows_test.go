@@ -26,3 +26,9 @@ func TestOtherVPN(t *testing.T) {
 		t.Fatal("reported our own adapter")
 	}
 }
+
+func TestDescribe(t *testing.T) {
+	for _, l := range Describe(nil) {
+		t.Log(l)
+	}
+}

@@ -296,6 +296,13 @@ func (a *app) bind(w webview2.WebView) {
 		a.mu.Unlock()
 		a.push()
 	}))
+	must(w.Bind("tvkReport", func() { go a.report() }))
+	must(w.Bind("tvkShowFile", func(path string) {
+		// Only the reports this app saved.
+		if dir, err := os.UserCacheDir(); err == nil && filepath.Dir(path) == filepath.Join(dir, "TurnVK") {
+			go showFile(path)
+		}
+	}))
 	must(w.Bind("tvkConnect", func() error { return a.connect() }))
 	must(w.Bind("tvkDisconnect", func() { a.disconnect() }))
 }

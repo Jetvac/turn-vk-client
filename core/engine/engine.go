@@ -157,6 +157,8 @@ type Engine struct {
 	keys    session.Keys
 	mode    atomic.Int32
 	probing atomic.Bool
+
+	diag diagState // for Diag: handshakes and traffic samples
 }
 
 const (
@@ -167,7 +169,7 @@ const (
 
 // rehandshake drops WireGuard's current keys and starts a new handshake.
 func (e *Engine) rehandshake(why string) {
-	if e.dev == nil || !e.rekeying.CompareAndSwap(false, true) {
+	if e.dev == nil || e.ctx.Err() != nil || !e.rekeying.CompareAndSwap(false, true) {
 		return
 	}
 	go func() {
@@ -372,6 +374,7 @@ func (e *Engine) start(ctx context.Context, mk TunFactory) error {
 		}(i)
 	}
 	go e.watchdog()
+	go e.monitor()
 	return nil
 }
 
@@ -395,7 +398,12 @@ func (e *Engine) worker(i int, s *session.Session) {
 					e.fail(err)
 					return
 				}
-				e.noteError(fmt.Sprintf("session %d: %v", i, err))
+				// A wait for VK is logged once, where it starts (the
+				// error that caused it), not by every session that waits.
+				var we *waitError
+				if !errors.As(err, &we) {
+					e.noteError(fmt.Sprintf("session %d: %v", i, err))
+				}
 				if !sleep(e.ctx, jitter(backoff)) {
 					return
 				}

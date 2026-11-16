@@ -309,6 +309,11 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
   </section>
 
   <section id="log">
+    <div class="card" style="margin-bottom:12px">
+      <div style="font-weight:600; margin-bottom:4px">Что-то не работает?</div>
+      <div class="small muted" style="margin-bottom:10px">Соберите отчёт и отправьте его разработчику. В нём журнал, состояние подключения, сеть компьютера и проверка сайтов через VPN. Ключи и ссылка на сервер скрыты.</div>
+      <button class="btn primary wide" id="reportBtn">Собрать отчёт</button>
+    </div>
     <div class="row" style="margin-bottom:12px; justify-content:flex-start">
       <button class="btn ghost" id="logCopy">Копировать</button>
       <button class="btn ghost" id="logClear">Очистить</button>
@@ -333,6 +338,17 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
     <div class="row">
       <button class="btn ghost" id="mAnyway">Подключить всё равно</button>
       <button class="btn primary" id="mOk">Понятно</button>
+    </div>
+  </div>
+</div>
+<div class="modal" id="reportModal">
+  <div class="dialog" style="max-width:400px">
+    <h3>Отчёт для разработчика</h3>
+    <p id="rText"></p>
+    <textarea id="rBody" readonly style="width:100%; height:220px; resize:none; border:0; border-radius:10px; padding:10px; background:var(--card2); color:var(--text); font:11.5px/1.45 Consolas, monospace; white-space:pre; box-sizing:border-box"></textarea>
+    <div class="row">
+      <button class="btn ghost" id="rFile">Показать файл</button>
+      <button class="btn primary" id="rOk">Готово</button>
     </div>
   </div>
 </div>
@@ -577,6 +593,25 @@ function renderLog() {
 }
 $('logCopy').onclick = async () => { await navigator.clipboard.writeText(logLines.join('\n')); toast('Журнал скопирован'); };
 $('logClear').onclick = async () => { await tvkClearLogs(); logLines = []; renderLog(); };
+
+let reportPath = '';
+$('reportBtn').onclick = async () => {
+  $('reportBtn').disabled = true;
+  $('reportBtn').textContent = 'Проверяем сеть…';
+  await tvkReport();
+};
+window.onReport = function (r) {
+  $('reportBtn').disabled = false;
+  $('reportBtn').textContent = 'Собрать отчёт';
+  reportPath = r.path || '';
+  $('rText').textContent = (r.copied ? 'Отчёт скопирован. Вставьте его в сообщение разработчику.' : 'Не удалось скопировать (' + (r.error || 'буфер обмена занят') + '): выделите текст ниже или отправьте файл.')
+    + (r.path ? ' Он также сохранён в файл.' : '');
+  $('rBody').value = r.text;
+  $('rFile').style.display = r.path ? '' : 'none';
+  $('reportModal').classList.add('on');
+};
+$('rFile').onclick = () => { if (reportPath) tvkShowFile(reportPath); };
+$('rOk').onclick = () => $('reportModal').classList.remove('on');
 
 (async () => {
   logLines = await tvkLogs();

@@ -1114,7 +1114,58 @@ private fun LogsTab() {
     val log by TunnelState.log.collectAsState()
     val listState = rememberLazyListState()
     LaunchedEffect(log.size) { if (log.isNotEmpty()) listState.scrollToItem(log.size - 1) }
+    var collecting by remember { mutableStateOf(false) }
+    var report by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(collecting) {
+        if (collecting) {
+            report = withContext(Dispatchers.IO) { buildReport(ctx) }
+            collecting = false
+        }
+    }
+    report?.let { text ->
+        AlertDialog(
+            onDismissRequest = { report = null },
+            title = { Text("Отчёт для разработчика") },
+            text = {
+                Column {
+                    Text("Отправьте его разработчику. Ключи и ссылка на сервер скрыты.", color = pal.muted, fontSize = 13.sp)
+                    Surface(Modifier.fillMaxWidth().height(260.dp).padding(top = 10.dp), shape = RoundedCornerShape(10.dp), color = pal.card2) {
+                        SelectionContainer {
+                            Text(text, Modifier.verticalScroll(rememberScrollState()).padding(10.dp), fontFamily = FontFamily.Monospace, fontSize = 10.sp, lineHeight = 14.sp)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
+                    ctx.startActivity(Intent.createChooser(send, "Отчёт TurnVK"))
+                }) { Text("Поделиться") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    ctx.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("TurnVK", text))
+                    report = null
+                }) { Text("Копировать") }
+            },
+        )
+    }
     Column(Modifier.fillMaxSize().padding(horizontal = 16.dp, vertical = 6.dp)) {
+        Panel(Modifier.padding(bottom = 12.dp)) {
+            Column {
+                Text("Что-то не работает?", fontWeight = FontWeight.SemiBold)
+                Text(
+                    "Соберите отчёт и отправьте его разработчику: журнал, состояние подключения и проверка сети. Ключи и ссылка на сервер скрыты.",
+                    color = pal.muted, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp, bottom = 10.dp),
+                )
+                Button(
+                    onClick = { collecting = true },
+                    enabled = !collecting,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                ) { Text(if (collecting) "Проверяем сеть…" else "Собрать отчёт", fontWeight = FontWeight.SemiBold) }
+            }
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 12.dp)) {
             LogButton("Копировать") {
                 ctx.getSystemService(ClipboardManager::class.java)
