@@ -30,6 +30,7 @@ import (
 	"github.com/Jetvac/turn-vk-client/core/engine"
 	"github.com/Jetvac/turn-vk-client/core/link"
 	"github.com/Jetvac/turn-vk-client/core/netx"
+	"github.com/Jetvac/turn-vk-client/core/session"
 	"github.com/Jetvac/turn-vk-client/core/wrap"
 )
 
@@ -149,6 +150,10 @@ func main() {
 			printRoutes(e)
 		}
 		e.Stop()
+		if *stats {
+			freed, gone, failed := session.ReleaseStats()
+			fmt.Printf("RELEASED freed=%d already=%d failed=%d\n", freed, gone, failed)
+		}
 		os.Exit(code)
 	default:
 		go serveSOCKS(ctx, *socks, tnet)

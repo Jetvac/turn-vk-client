@@ -495,8 +495,8 @@ func (e *Engine) dial(ctx context.Context, i, shift int) (*session.Session, erro
 		Peer: e.peer, TURNServer: server, Username: creds.Username, Password: creds.Password,
 		AEAD: e.aead, Mode: e.cfg.Mode, Net: e.cfg.Net,
 		ConnPassword: e.cfg.Link.Password, DeviceID: e.cfg.DeviceID, Generation: e.gen, Worker: i,
-		OnReset: e.serverReset,
-		Direct:  mode != modeDTLS, Keys: &e.keys, ServerKey: e.cfg.Link.ServerKey,
+		OnReset: e.serverReset, Logf: e.logf,
+		Direct: mode != modeDTLS, Keys: &e.keys, ServerKey: e.cfg.Link.ServerKey,
 	}
 	if mode == modeUnknown {
 		p.DirectTimeout = 4 * time.Second
@@ -835,6 +835,9 @@ func (e *Engine) Stop() {
 		e.dev.Close()
 	}
 	waitTimeout(&e.workers, 5*time.Second)
+	// Free the TURN allocations before the app exits, or VK keeps counting
+	// them against the next start (error 486).
+	session.WaitReleased(3 * time.Second)
 	e.mu.Lock()
 	if e.state != StateFailed {
 		e.state = StateStopped

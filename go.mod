@@ -12,6 +12,7 @@ require (
 	github.com/jchv/go-webview2 v0.0.0-20260205173254-56598839c808
 	github.com/pion/dtls/v3 v3.1.15
 	github.com/pion/logging v0.2.4
+	github.com/pion/stun/v4 v4.0.1
 	github.com/pion/turn/v5 v5.1.3
 	golang.org/x/crypto v0.58.0
 	golang.org/x/mobile v0.0.0-20261011034528-197770444867
@@ -34,7 +35,6 @@ require (
 	github.com/jchv/go-winloader v0.0.0-20250406163304-c1995be93bd1 // indirect
 	github.com/klauspost/compress v1.18.2 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
-	github.com/pion/stun/v4 v4.0.1 // indirect
 	github.com/pion/transport/v5 v5.1.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/tam7t/hpkp v0.0.0-20160821193359-2b70b4024ed5 // indirect

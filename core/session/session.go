@@ -54,6 +54,9 @@ type Params struct {
 	// OnReset is called when the server says it no longer knows this
 	// session (it restarted): the other sessions are likely stale too.
 	OnReset func()
+	// Logf, if set, gets the session's own notes (a TURN allocation that
+	// could not be freed).
+	Logf func(format string, args ...any)
 
 	// Direct selects the direct protocol (TurnVK servers) instead of
 	// DTLS + GETCONF. Keys is the client's WireGuard key pair; ServerKey,
@@ -116,13 +119,17 @@ type Session struct {
 	Config  string // the server's answer to GETCONF ("" for NOCONF)
 	Started time.Time
 
-	udp    *net.UDPConn
-	tc     *turn.Client
-	relay  net.PacketConn
-	dtls   *dtls.Conn
-	closed atomic.Bool
-	done   chan struct{}
-	once   sync.Once
+	udp   *net.UDPConn
+	tc    *turn.Client
+	relay net.PacketConn
+	dtls  *dtls.Conn
+	// The allocation, for release on Close: TURN server and credentials.
+	turnAddr           net.Addr
+	turnUser, turnPass string
+	logf               func(format string, args ...any)
+	closed             atomic.Bool
+	done               chan struct{}
+	once               sync.Once
 
 	RxBytes, TxBytes, RxPackets, TxPackets atomic.Uint64
 	// RxLost counts the server's packets lost on this path (direct
@@ -195,6 +202,7 @@ func Dial(ctx context.Context, p Params) (*Session, error) {
 		return nil, &TURNError{fmt.Errorf("allocate: %w", err)}
 	}
 	s.Relay = s.relay.LocalAddr().String()
+	s.turnAddr, s.turnUser, s.turnPass, s.logf = turnAddr, p.Username, p.Password, p.Logf
 	if p.Direct {
 		timeout := p.DirectTimeout
 		if timeout <= 0 {
@@ -376,15 +384,39 @@ func (s *Session) Close() {
 			_ = s.dtls.Close()
 		}
 		if s.relay != nil {
-			_ = s.relay.Close()
+			_ = s.relay.Close() // also stops the readers
 		}
-		if s.tc != nil {
-			s.tc.Close()
-		}
-		if s.udp != nil {
-			_ = s.udp.Close()
-		}
+		// Free the allocation and wait for VK's answer (release.go), in the
+		// background: Close is called from the engine's loops.
+		releasing.Add(1)
+		go func() {
+			defer releasing.Done()
+			if s.tc != nil && s.turnAddr != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
+				r, err := release(ctx, pionTransactor{s.tc}, s.turnAddr, s.turnUser, s.turnPass)
+				cancel()
+				releaseCount[r].Add(1)
+				if err != nil && s.logf != nil {
+					s.logf("route %d: TURN allocation on %s not freed: %v", s.ID, s.Server, err)
+				}
+			}
+			if s.tc != nil {
+				s.tc.Close()
+			}
+			if s.udp != nil {
+				_ = s.udp.Close()
+			}
+		}()
 	})
+}
+
+// releaseCount counts the outcomes of release, by releaseResult.
+var releaseCount [4]atomic.Uint64
+
+// ReleaseStats returns how many allocations this side freed, how many
+// pion's own request had freed already, and how many were not freed.
+func ReleaseStats() (freed, gone, failed uint64) {
+	return releaseCount[released].Load(), releaseCount[releaseGone].Load(), releaseCount[releaseFailed].Load()
 }
 
 // wrapConn is the relay as DTLS sees it: datagrams to and from the server,
