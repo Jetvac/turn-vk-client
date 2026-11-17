@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/Jetvac/turn-vk-client/core/engine"
 	"github.com/Jetvac/turn-vk-client/core/link"
+	"github.com/Jetvac/turn-vk-client/core/redact"
 )
 
 // Report is everything that goes into the text.
@@ -187,22 +187,9 @@ func linkSummary(raw string) string {
 	return fmt.Sprintf("%s, port %d, WireGuard port %d, %d VK call(s), server key: %s", l.Host, l.DTLSPort, l.WGPort, len(l.Hashes), key)
 }
 
-var (
-	reLink  = regexp.MustCompile(`wdtt://\S+`)
-	reVK    = regexp.MustCompile(`(?i)(vk\.com/call/join/|join/)[A-Za-z0-9_\-]+`)
-	reToken = regexp.MustCompile(`(?i)(access_token|token|password|pass|key|sig|hash)=([^&\s"]+)`)
-	reLong  = regexp.MustCompile(`[A-Za-z0-9+/_\-]{32,}={0,2}`)
-)
-
 // Redact takes secrets out of a line: links, VK call ids, tokens and any
 // long key-like string.
-func Redact(s string) string {
-	s = reLink.ReplaceAllString(s, "wdtt://<hidden>")
-	s = reVK.ReplaceAllString(s, "${1}<hidden>")
-	s = reToken.ReplaceAllString(s, "$1=<hidden>")
-	s = reLong.ReplaceAllString(s, "<hidden>")
-	return s
-}
+func Redact(s string) string { return redact.String(s) }
 
 // Check is one network check.
 type Check struct {

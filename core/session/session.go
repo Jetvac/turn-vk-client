@@ -142,6 +142,9 @@ type Session struct {
 	LastRx atomic.Int64 // unix nanoseconds
 	// RTT is the path's last measured round trip (direct protocol), ns.
 	RTT atomic.Int64
+	// StatsAck, when set before reading starts, gets the ids of the
+	// statistics reports the server acknowledged (stats.go).
+	StatsAck func(id uint32)
 
 	// Direct protocol.
 	direct    bool

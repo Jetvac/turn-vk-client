@@ -45,6 +45,10 @@ type Config struct {
 	// (for comparisons; see relays.go).
 	NoRelayScoring bool
 	Logf           func(format string, args ...any)
+	// NoStats: send the server no statistics (stats.go). Client names the
+	// app for them, e.g. "TurnVK 0.5.0 windows".
+	NoStats bool
+	Client  string
 	// OnStatus is called (from any goroutine) when the status changes.
 	OnStatus func(Status)
 }
@@ -169,6 +173,8 @@ type Engine struct {
 	// massSilentLog: when "many routes silent" was last logged.
 	wokeAt        atomic.Int64
 	massSilentLog atomic.Int64
+
+	statsAcked atomic.Bool // the server acknowledged a statistics report
 }
 
 const (
@@ -289,6 +295,11 @@ func (e *Engine) logf(format string, args ...any) {
 	if e.cfg.Logf != nil {
 		e.cfg.Logf(format, args...)
 	}
+	if !e.cfg.NoStats {
+		if line := fmt.Sprintf(format, args...); statsLogLine(line) {
+			noteEvent(line)
+		}
+	}
 }
 
 // Start connects: it obtains the server's WireGuard config through the
@@ -385,6 +396,7 @@ func (e *Engine) start(ctx context.Context, mk TunFactory) error {
 	}
 	go e.watchdog()
 	go e.monitor()
+	go e.statsLoop()
 	return nil
 }
 
@@ -520,6 +532,11 @@ func (e *Engine) dial(ctx context.Context, i, shift int) (*session.Session, erro
 		p.DirectTimeout = 4 * time.Second
 	}
 	s, err := session.Dial(ctx, p)
+	defer func() {
+		if s != nil {
+			s.StatsAck = e.statsAck
+		}
+	}()
 	if mode == modeUnknown {
 		switch {
 		case err == nil:

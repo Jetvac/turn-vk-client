@@ -92,6 +92,13 @@ class Store(ctx: Context) {
             p.edit().putBoolean("boot_connect", v).apply()
         }
 
+    /** Send the server statistics of the connection (on by default). */
+    var serverStats: Boolean
+        get() = p.getBoolean("server_stats", true)
+        set(v) {
+            p.edit().putBoolean("server_stats", v).apply()
+        }
+
     /** Packages whose traffic goes around the tunnel. */
     var excludedApps: Set<String>
         get() = p.getStringSet("excluded_apps", emptySet())?.toSet() ?: emptySet()

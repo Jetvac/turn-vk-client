@@ -346,7 +346,7 @@ fun App(store: Store, imported: MutableState<String?>, connect: () -> Unit) {
     ) { pad ->
         Box(Modifier.fillMaxSize().padding(pad)) {
             when (tab) {
-                Tab.Home -> HomeTab(store, revision, s, live, history, now, connect, onServers = { tab = Tab.Servers })
+                Tab.Home -> HomeTab(store, revision, refresh, s, live, history, now, connect, onServers = { tab = Tab.Servers })
                 Tab.Servers -> ServersTab(store, revision, refresh, s.active)
                 Tab.Settings -> SettingsTab(store, revision, refresh, s.active, onApps = { apps = true })
                 Tab.Logs -> LogsTab()
@@ -460,6 +460,7 @@ private fun Banner(title: String, text: String, action: String? = null, error: B
 private fun HomeTab(
     store: Store,
     revision: Int,
+    refresh: () -> Unit,
     s: Status,
     live: Live,
     history: List<Pair<Long, Long>>,
@@ -529,7 +530,7 @@ private fun HomeTab(
         ProfileDialog(
             initial = Profile(Store.newId(), "", ""),
             isNew = true,
-            onSave = { store.save(it); creating = false; TunnelState.setError(null) },
+            onSave = { store.save(it); creating = false; TunnelState.setError(null); refresh() },
             onDelete = null,
             onDismiss = { creating = false },
         )
@@ -950,6 +951,7 @@ private fun SettingsTab(store: Store, revision: Int, refresh: () -> Unit, active
     var obfs by remember(revision) { mutableStateOf(store.obfs) }
     var captchaAuto by remember(revision) { mutableStateOf(store.captchaAuto) }
     var boot by remember(revision) { mutableStateOf(store.bootConnect) }
+    var srvStats by remember(revision) { mutableStateOf(store.serverStats) }
     val excluded = remember(revision) { store.excludedApps.size }
     // Re-checked whenever the screen is shown again (after the system pages).
     var resumes by remember { mutableIntStateOf(0) }
@@ -1008,6 +1010,13 @@ private fun SettingsTab(store: Store, revision: Int, refresh: () -> Unit, active
                     text = "Пытаться пройти проверку VK без вас",
                     checked = captchaAuto,
                     onChange = { captchaAuto = it; store.captchaAuto = it; refresh() },
+                )
+                HorizontalDivider(color = pal.line)
+                SwitchRow(
+                    title = "Отправлять статистику серверу",
+                    text = "Раз в минуту: скорость, маршруты, задержки, потери и ошибки — чтобы владелец сервера мог улучшать работу. Адреса сайтов и содержимое трафика не отправляются.",
+                    checked = srvStats,
+                    onChange = { srvStats = it; store.serverStats = it; refresh() },
                 )
             }
         }

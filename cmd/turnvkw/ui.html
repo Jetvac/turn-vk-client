@@ -308,6 +308,14 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
         <div class="grow"><div class="lbl">Подключаться при запуске</div><div class="hint">К выбранному серверу, как только откроется TurnVK</div></div>
         <label class="switch"><input type="checkbox" id="autoconn"><i></i></label>
       </div>
+      <div class="opt">
+        <div class="grow"><div class="lbl">Запускать вместе с Windows</div><div class="hint">TurnVK откроется свёрнутым при входе в Windows и сразу подключится к выбранному серверу</div></div>
+        <label class="switch"><input type="checkbox" id="autostart"><i></i></label>
+      </div>
+      <div class="opt">
+        <div class="grow"><div class="lbl">Отправлять статистику серверу</div><div class="hint">Раз в минуту: скорость, маршруты, задержки, потери и ошибки подключения — чтобы владелец сервера мог улучшать работу. Адреса сайтов и содержимое трафика не отправляются</div></div>
+        <label class="switch"><input type="checkbox" id="srvstats"><i></i></label>
+      </div>
     </div>
     <div class="note" style="margin-bottom:12px"><svg><use href="#i-info"/></svg><span>Изменения применятся при следующем подключении.</span></div>
     <div class="card">
@@ -491,6 +499,8 @@ window.onView = function (v) {
   if (document.activeElement !== $('sessions')) { $('sessions').value = v.settings.sessions; $('sessVal').textContent = v.settings.sessions; }
   document.querySelectorAll('#obfs button').forEach(b => b.classList.toggle('on', b.dataset.v === v.settings.obfs));
   $('autoconn').checked = v.settings.connect_on_start;
+  $('autostart').checked = v.settings.autostart;
+  $('srvstats').checked = !v.settings.no_stats;
   $('ver').textContent = v.version; $('dev').textContent = v.device;
 };
 
@@ -598,6 +608,11 @@ document.querySelectorAll('#obfs button').forEach(b => b.onclick = () => {
   document.querySelectorAll('#obfs button').forEach(x => x.classList.toggle('on', x === b)); sendOptions();
 });
 $('autoconn').onchange = sendOptions;
+$('srvstats').onchange = () => tvkSetStats($('srvstats').checked);
+$('autostart').onchange = async () => {
+  try { await tvkSetAutostart($('autostart').checked); }
+  catch (e) { alert('Не удалось изменить автозапуск: ' + (e && e.message || e)); }
+};
 
 window.onLog = function (line) {
   logLines.push(line);

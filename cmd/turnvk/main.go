@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -34,6 +35,9 @@ import (
 	"github.com/Jetvac/turn-vk-client/core/wrap"
 )
 
+// version is set at build time (-ldflags "-X main.version=...").
+var version = "dev"
+
 func main() {
 	linkS := flag.String("link", "", "wdtt:// link")
 	sessions := flag.Int("sessions", 16, "parallel sessions (TURN allocations)")
@@ -49,6 +53,7 @@ func main() {
 	pingHost := flag.String("ping", "", "with -test or -download: ICMP ping this address through the tunnel (e.g. the server's tunnel address)")
 	pings := flag.Int("pings", 50, "number of pings, 5 per second")
 	stats := flag.Bool("stats", false, "print speed and route round trips every second")
+	noStats := flag.Bool("no-server-stats", false, "send the server no statistics of the connection")
 	upload := flag.Int("upload", 0, "upload this many MB through the tunnel, print the speed and exit")
 	uploadURL := flag.String("upload-url", "https://speed.cloudflare.com/__up", "where -upload sends its data (HTTP POST)")
 	flag.Parse()
@@ -88,6 +93,8 @@ func main() {
 		VKCache: vkCacheFile(),
 		// TURNVK_SCORE=off: plain rotation over VK's TURN servers (comparisons).
 		NoRelayScoring: os.Getenv("TURNVK_SCORE") == "off",
+		NoStats:        *noStats,
+		Client:         "turnvk-cli " + version + " " + runtime.GOOS,
 		Logf: func(f string, a ...any) {
 			log.Printf(f, a...)
 		},

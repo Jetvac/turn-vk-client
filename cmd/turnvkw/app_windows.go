@@ -42,6 +42,10 @@ type settings struct {
 	Sessions       int       `json:"sessions"`
 	Obfs           string    `json:"obfs"`
 	ConnectOnStart bool      `json:"connect_on_start"`
+	// Autostart mirrors the Task Scheduler task (autostart_windows.go).
+	Autostart bool `json:"autostart"`
+	// NoStats: send the server no statistics (on by default).
+	NoStats bool `json:"no_stats"`
 }
 
 // view is what the page shows; it gets a new copy on every change.
@@ -301,6 +305,13 @@ func (a *app) bind(w webview2.WebView) {
 		a.mu.Unlock()
 		a.push()
 	}))
+	must(w.Bind("tvkSetStats", func(on bool) {
+		a.mu.Lock()
+		a.s.NoStats = !on
+		a.save()
+		a.mu.Unlock()
+		a.push()
+	}))
 	must(w.Bind("tvkSetOptions", func(sessions int, obfs string, connectOnStart bool) {
 		a.mu.Lock()
 		if sessions >= 1 && sessions <= 64 {
@@ -313,6 +324,24 @@ func (a *app) bind(w webview2.WebView) {
 		a.save()
 		a.mu.Unlock()
 		a.push()
+	}))
+	must(w.Bind("tvkSetAutostart", func(on bool) error {
+		if err := setAutostart(on); err != nil {
+			a.logf("start with Windows: %v", err)
+			a.push()
+			return fmt.Errorf("не получилось: %v", err)
+		}
+		a.mu.Lock()
+		a.s.Autostart = on
+		a.save()
+		a.mu.Unlock()
+		if on {
+			a.logf("start with Windows: on")
+		} else {
+			a.logf("start with Windows: off")
+		}
+		a.push()
+		return nil
 	}))
 	must(w.Bind("tvkReport", func() { go a.report() }))
 	must(w.Bind("tvkCheckUpdate", func() { go a.checkUpdate(true) }))
@@ -407,6 +436,8 @@ func (a *app) connect() error {
 		Captcha: a.captcha,
 		VKCache: a.vkCache,
 		Logf:    a.logf,
+		NoStats: a.s.NoStats,
+		Client:  "TurnVK " + version + " windows",
 		// Not inline: the engine may report while a.mu is held here, and
 		// push asks the engine for its status.
 		OnStatus: func(engine.Status) { go a.push() },

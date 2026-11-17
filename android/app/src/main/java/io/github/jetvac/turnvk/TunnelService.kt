@@ -91,6 +91,7 @@ class TunnelService : VpnService(), mobile.Platform {
             mobile.Mobile.setCaptchaMode(if (store.captchaAuto) "auto" else "manual")
             // VK guest tokens are kept here between runs: fewer captchas.
             mobile.Mobile.setDataDir(filesDir.absolutePath)
+            mobile.Mobile.setStats(store.serverStats, "TurnVK ${BuildConfig.VERSION_NAME} android")
             mobile.Mobile.start(profile.link, deviceId, sessions.toLong(), store.obfs, this)
             watchNetwork()
         } catch (e: Exception) {

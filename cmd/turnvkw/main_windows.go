@@ -41,6 +41,7 @@ func main() {
 	afterUpdate := len(os.Args) > 1 && os.Args[1] == "--after-update"
 	for _, arg := range os.Args[1:] {
 		debugRun = debugRun || arg == "--debug-run"
+		autostart = autostart || arg == "--autostart"
 	}
 	name, _ := windows.UTF16PtrFromString(`Global\TurnVK-app`)
 	for try := 0; ; try++ {
@@ -84,12 +85,16 @@ func main() {
 	}
 	w.SetSize(400, 600, webview2.HintMin)
 	a.w = w
+	if autostart {
+		minimize(w.Window())
+	}
 	a.bind(w)
 	w.SetHtml(page)
 
 	stop := make(chan struct{})
 	go a.tick(stop)
 	go a.checkUpdates(stop)
+	go a.refreshAutostart()
 	// "TurnVK.exe wdtt://..." adds (or selects) that server and connects.
 	fromArg := false
 	for _, arg := range os.Args[1:] {
@@ -102,7 +107,7 @@ func main() {
 		}
 	}
 	a.mu.Lock()
-	auto := (a.s.ConnectOnStart || fromArg || debugRun) && a.current() != nil
+	auto := (a.s.ConnectOnStart || fromArg || debugRun || autostart) && a.current() != nil
 	a.mu.Unlock()
 	if other := winvpn.OtherVPN(); auto && other != "" {
 		// The window explains it; connecting anyway is the user's call.
@@ -111,6 +116,10 @@ func main() {
 	}
 	if auto {
 		go func() {
+			if autostart {
+				a.logf("started with Windows")
+				a.waitForNetwork()
+			}
 			if err := a.connect(); err != nil {
 				a.logf("connect: %v", err)
 				a.mu.Lock()

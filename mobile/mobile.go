@@ -50,7 +50,18 @@ var (
 	current *engine.Engine
 	captcha = &solver{}
 	dataDir string
+	noStats bool
+	client  string
 )
+
+// SetStats says whether the engine sends the server statistics of the
+// connection, and how it names the app in them ("TurnVK 0.5.0 android").
+// Call it before Start.
+func SetStats(enabled bool, app string) {
+	mu.Lock()
+	noStats, client = !enabled, app
+	mu.Unlock()
+}
 
 // SetDataDir sets the app's private directory (Context.filesDir). The
 // engine keeps VK guest tokens there, so that restarts of the app do not
@@ -100,6 +111,8 @@ func Start(rawLink, deviceID string, sessions int, obfs string, p Platform) erro
 		},
 		Captcha:  captcha,
 		VKCache:  vkCache,
+		NoStats:  noStats,
+		Client:   client,
 		Logf:     func(f string, a ...any) { p.Log(fmt.Sprintf(f, a...)) },
 		OnStatus: func(s engine.Status) { b, _ := json.Marshal(s); p.OnStatus(string(b)) },
 	})

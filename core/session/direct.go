@@ -332,6 +332,10 @@ func (s *Session) readDirectData(b []byte) (int, error) {
 			}
 		case t == msgFeedback:
 			s.Pace.OnFeedback(b[:n], time.Now().UnixNano())
+		case t == msgStatsAck && n >= 6:
+			if f := s.StatsAck; f != nil {
+				f(binary.BigEndian.Uint32(b[2:6]))
+			}
 		case t == msgReset:
 			s.reattach()
 		case t == msgWelcome && n >= 19:

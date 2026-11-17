@@ -36,7 +36,7 @@ jobs:
           v=$(grep -o 'versionName = "[^"]*"' android/app/build.gradle.kts | cut -d'"' -f2)
           case "$GITHUB_REF" in refs/tags/v*) ;; *) v="$v-${GITHUB_SHA::7}" ;; esac
           GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -H windowsgui -X main.version=$v" -o dist/TurnVK.exe ./cmd/turnvkw
-          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/turnvk.exe ./cmd/turnvk
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w -X main.version=$v" -o dist/turnvk.exe ./cmd/turnvk
       - uses: actions/upload-artifact@v4
         with:
           name: turnvk-windows-amd64
