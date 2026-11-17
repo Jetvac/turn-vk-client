@@ -39,6 +39,9 @@ func main() {
 	// One copy at a time: both would want the same network adapter.
 	// After an update the old copy may still be closing: wait for it.
 	afterUpdate := len(os.Args) > 1 && os.Args[1] == "--after-update"
+	for _, arg := range os.Args[1:] {
+		debugRun = debugRun || arg == "--debug-run"
+	}
 	name, _ := windows.UTF16PtrFromString(`Global\TurnVK-app`)
 	for try := 0; ; try++ {
 		h, err := windows.CreateMutex(nil, false, name)
@@ -99,7 +102,7 @@ func main() {
 		}
 	}
 	a.mu.Lock()
-	auto := (a.s.ConnectOnStart || fromArg) && a.current() != nil
+	auto := (a.s.ConnectOnStart || fromArg || debugRun) && a.current() != nil
 	a.mu.Unlock()
 	if other := winvpn.OtherVPN(); auto && other != "" {
 		// The window explains it; connecting anyway is the user's call.

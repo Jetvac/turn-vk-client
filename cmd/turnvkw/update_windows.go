@@ -143,9 +143,24 @@ func (a *app) selfCheck(e *engine.Engine, server string) {
 	if len(dns) == 0 {
 		dns = []string{"1.1.1.1"}
 	}
+	a.mu.Lock()
+	v := a.vpn
+	a.mu.Unlock()
+	if debugRun {
+		if v != nil {
+			for _, l := range v.AdapterState() {
+				a.logf("debug: adapter state: %s", l)
+			}
+		}
+		a.startDrops()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	checks := diag.RunChecks(ctx, diag.CheckOptions{Tunnel: true, DNS: dns, Server: server})
 	cancel()
+	if debugRun {
+		a.stopDrops(v)
+		defer a.finishDebugRun()
+	}
 	var failed []string
 	for _, c := range checks {
 		mark := "ok"

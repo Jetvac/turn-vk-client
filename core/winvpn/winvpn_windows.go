@@ -55,7 +55,15 @@ type VPN struct {
 	mu    sync.Mutex
 	timer *time.Timer
 	cb    *winipcfg.RouteChangeCallback
+
+	// Debug: log the adapter's packets (see Debug); dev is the adapter.
+	Debug bool
+	dev   tun.Device
+	addr4 string // the tunnel's IPv4 address
 }
+
+// Device returns the adapter Open created (nil before).
+func (v *VPN) Device() tun.Device { return v.dev }
 
 // New finds the physical network. changed is called (after the routes
 // settle) when the computer switches to another network, so that the engine
@@ -205,11 +213,17 @@ func (v *VPN) Open(c *engine.WGConfig) (tun.Device, error) {
 	}
 	luid := winipcfg.LUID(nt.LUID())
 	v.luid.Store(uint64(luid))
+	v.addr4 = c.Address.Addr().String()
 	if err := configure(luid, c); err != nil {
 		dev.Close()
 		return nil, err
 	}
-	return dev, nil
+	var out tun.Device = dev
+	if v.Debug {
+		out = Debug(dev, v.logf)
+	}
+	v.dev = out
+	return out, nil
 }
 
 func configure(luid winipcfg.LUID, c *engine.WGConfig) error {
@@ -217,10 +231,6 @@ func configure(luid winipcfg.LUID, c *engine.WGConfig) error {
 	if c.Address.Addr().Is4() {
 		addrs = append(addrs, ula)
 	}
-	if err := luid.SetIPAddresses(addrs); err != nil {
-		return fmt.Errorf("setting the address: %w", err)
-	}
-
 	allowed := c.AllowedIPs
 	if len(allowed) == 0 {
 		allowed = []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")}
@@ -253,8 +263,15 @@ func configure(luid winipcfg.LUID, c *engine.WGConfig) error {
 		add(netip.MustParsePrefix("::/1"))
 		add(netip.MustParsePrefix("8000::/1"))
 	}
+	// Routes first, addresses second: setting routes flushes every route of
+	// the adapter, including the local host route Windows adds with an
+	// address. Without that route Windows drops every reply to the tunnel's
+	// address as "not locally destined": connected, but nothing works.
 	if err := luid.SetRoutes(routes); err != nil {
 		return fmt.Errorf("setting routes: %w", err)
+	}
+	if err := luid.SetIPAddresses(addrs); err != nil {
+		return fmt.Errorf("setting the address: %w", err)
 	}
 
 	for _, fam := range []winipcfg.AddressFamily{windows.AF_INET, windows.AF_INET6} {

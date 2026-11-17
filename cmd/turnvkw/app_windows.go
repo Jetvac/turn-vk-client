@@ -400,6 +400,7 @@ func (a *app) connect() error {
 	if err != nil {
 		return err
 	}
+	v.Debug = debugRun
 	e, err = engine.New(engine.Config{
 		Link: l, DeviceID: a.devID, Sessions: a.s.Sessions, Mode: wrap.ParseMode(a.s.Obfs),
 		Net:     &netx.Net{DNS: netx.DefaultDNS, Protect: v.Protect},
