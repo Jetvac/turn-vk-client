@@ -392,12 +392,18 @@ func (s *Session) reattach() {
 func (s *Session) pingLoop() {
 	t := time.NewTicker(pingInterval)
 	defer t.Stop()
+	// Wall clock: it runs on while the device sleeps, the ticker does not.
+	lastTick, woke := time.Now().UnixNano(), int64(0)
 	for {
 		select {
 		case <-s.done:
 			return
 		case <-t.C:
 		}
+		if wall := time.Now().UnixNano(); wall-lastTick > int64(3*pingInterval) {
+			woke = wall // the device slept: the silence is not the path's
+		}
+		lastTick = time.Now().UnixNano()
 		s.mu.Lock()
 		resetAt, pending := s.resetAt, s.pending != nil
 		s.mu.Unlock()
@@ -413,7 +419,7 @@ func (s *Session) pingLoop() {
 			s.reattach()
 			continue
 		}
-		if time.Since(time.Unix(0, s.LastRx.Load())) > pathDead {
+		if time.Now().UnixNano()-max(s.LastRx.Load(), woke) > int64(pathDead) {
 			// The allocation died without telling (VK dropped it, the
 			// network changed): the engine opens a new one.
 			s.Close()

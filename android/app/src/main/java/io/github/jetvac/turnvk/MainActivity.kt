@@ -3,6 +3,7 @@ package io.github.jetvac.turnvk
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
@@ -31,7 +32,12 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        handleLink(intent)
+        // Only a fresh start: after a rotation, or when Android reopens the
+        // app from Recents with the intent that first opened it, the link
+        // was already handled.
+        if (savedInstanceState == null && intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY == 0) {
+            handleLink(intent)
+        }
         if (Build.VERSION.SDK_INT >= 33 &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -49,10 +55,24 @@ class MainActivity : ComponentActivity() {
         handleLink(intent)
     }
 
-    /** A wdtt:// link opened from outside: offer to save it. */
+    /**
+     * A wdtt:// link opened from outside: select the saved server with it,
+     * or offer to save it. The link is then taken off the intent, so that
+     * the app does not ask again each time it is opened.
+     */
     private fun handleLink(intent: Intent?) {
-        val data = intent?.dataString ?: return
-        if (data.startsWith("wdtt://", ignoreCase = true)) imported.value = data
+        val raw = intent?.dataString ?: return
+        if (!raw.startsWith("wdtt://", ignoreCase = true)) return
+        // Messengers and browsers may percent-encode parts of the link.
+        val link = Uri.decode(raw).trim()
+        intent.data = null
+        setIntent(intent)
+        val existing = store.profiles.firstOrNull { Uri.decode(it.link).trim() == link }
+        if (existing != null) {
+            store.currentId = existing.id
+        } else {
+            imported.value = link
+        }
     }
 
     /** Connects to the selected profile, asking for the VPN permission first. */

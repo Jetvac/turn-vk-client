@@ -114,6 +114,11 @@ const (
 	// pathReplace: a direct path silent this long while others answer is
 	// replaced (three missed pings).
 	pathReplace = 6 * time.Second
+	// wakeGrace: after the device slept, routes get this long to answer
+	// before any is replaced; sleepGap: a gap between the watchdog's ticks
+	// (wall clock) this long means the device slept.
+	wakeGrace = 15 * time.Second
+	sleepGap  = 4 * time.Second
 )
 
 // Engine is one running connection.
@@ -159,6 +164,11 @@ type Engine struct {
 	probing atomic.Bool
 
 	diag diagState // for Diag: handshakes and traffic samples
+
+	// wokeAt: when the device last woke from sleep (unix ns, wall clock);
+	// massSilentLog: when "many routes silent" was last logged.
+	wokeAt        atomic.Int64
+	massSilentLog atomic.Int64
 }
 
 const (
@@ -708,6 +718,7 @@ func (e *Engine) watchdog() {
 	defer t.Stop()
 	lastRx, rxAt := e.b.rx.Load(), time.Now()
 	txAtRx := e.b.tx.Load()
+	lastTick := time.Now().UnixNano() // wall clock: it runs on while the device sleeps
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -715,6 +726,21 @@ func (e *Engine) watchdog() {
 		case <-t.C:
 		}
 		list := e.b.list()
+		if wall := time.Now().UnixNano(); wall-lastTick > int64(sleepGap) {
+			// The device slept (Android in the background): timers stopped
+			// and every route missed its pings. Ask each route now and
+			// give them time before judging any.
+			e.wokeAt.Store(wall)
+			e.logf("the device was asleep for %s, checking the routes", time.Duration(wall-lastTick).Round(time.Second))
+			for _, s := range list {
+				go s.Probe()
+			}
+			lastTick = wall
+			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
+			continue
+		} else {
+			lastTick = wall
+		}
 		e.replaceSilentPaths(list)
 		if !e.cfg.NoRelayScoring && e.relays.tick(list, time.Now()) {
 			if s := e.relays.moveOne(list); s != nil {
@@ -768,6 +794,11 @@ func (e *Engine) replaceSilentPaths(list []*session.Session) {
 		return
 	}
 	now := time.Now()
+	// Just after the device slept (the phone in the background), every
+	// route looks silent until its next ping comes back: wait for them.
+	if now.UnixNano()-e.wokeAt.Load() < int64(wakeGrace) {
+		return
+	}
 	fresh := 0
 	for _, s := range list {
 		if s.Fresh(now) {
@@ -777,23 +808,58 @@ func (e *Engine) replaceSilentPaths(list []*session.Session) {
 	if fresh == 0 {
 		return
 	}
-	total, silent := map[string]int{}, map[string]int{}
+	total, freshBy := map[string]int{}, map[string]int{}
+	var cands []*session.Session
 	for _, s := range list {
 		total[s.Server]++
+		if s.Fresh(now) {
+			freshBy[s.Server]++
+		}
 		if s.Direct() && s.Silent(now) > pathReplace && time.Since(s.Started) > pathReplace {
-			silent[s.Server]++
-			e.logf("route %d (%s) silent for %s, replacing it", s.ID, s.Server, s.Silent(now).Round(time.Second))
-			s.Close()
+			cands = append(cands, s)
 		}
 	}
-	// Every route through a TURN server fell silent at once: the server
-	// itself stopped relaying. New routes go elsewhere for a while instead
-	// of waiting out its allocation timeout one by one.
+	if len(cands) == 0 {
+		return
+	}
+	silent := map[string]int{}
+	for _, s := range cands {
+		silent[s.Server]++
+	}
+	// Every route through a TURN server fell silent while routes through
+	// another answer: that server stopped relaying. New routes go elsewhere
+	// for a while instead of waiting out its allocation timeout.
+	down := map[string]bool{}
 	for sv, n := range silent {
-		if n == total[sv] && n >= 2 && e.cfg.TURNServer == "" {
+		if n == total[sv] && n >= 2 && fresh-freshBy[sv] >= 2 && e.cfg.TURNServer == "" {
+			down[sv] = true
 			e.logf("TURN server %s stopped relaying, new routes avoid it for %s", sv, relayDownFor)
 			e.relays.failed(sv, now)
 		}
+	}
+	// Many routes silent at once (not on one dead TURN server) is the
+	// network or the device pausing, not the routes: new allocations would
+	// not help and every one costs VK's limits. Probe them; a route that
+	// stays silent is closed by its own pathDead.
+	limit := max(2, len(list)/4)
+	if len(cands) > limit {
+		n := 0
+		for _, s := range cands {
+			if down[s.Server] {
+				s.Close()
+				n++
+			} else {
+				s.Probe()
+			}
+		}
+		if last := e.massSilentLog.Load(); now.UnixNano()-last > int64(time.Minute) && e.massSilentLog.CompareAndSwap(last, now.UnixNano()) {
+			e.logf("%d of %d routes silent at once: checking them instead of replacing", len(cands)-n, len(list))
+		}
+		return
+	}
+	for _, s := range cands {
+		e.logf("route %d (%s) silent for %s, replacing it", s.ID, s.Server, s.Silent(now).Round(time.Second))
+		s.Close()
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"syscall"
+	"time"
 
 	webview2 "github.com/jchv/go-webview2"
 	"golang.org/x/sys/windows"
@@ -36,11 +37,22 @@ func main() {
 		return
 	}
 	// One copy at a time: both would want the same network adapter.
+	// After an update the old copy may still be closing: wait for it.
+	afterUpdate := len(os.Args) > 1 && os.Args[1] == "--after-update"
 	name, _ := windows.UTF16PtrFromString(`Global\TurnVK-app`)
-	if _, err := windows.CreateMutex(nil, false, name); err == windows.ERROR_ALREADY_EXISTS {
-		message("TurnVK уже запущен.", windows.MB_ICONINFORMATION)
-		return
+	for try := 0; ; try++ {
+		h, err := windows.CreateMutex(nil, false, name)
+		if err != windows.ERROR_ALREADY_EXISTS {
+			break
+		}
+		windows.CloseHandle(h)
+		if !afterUpdate || try >= 50 {
+			message("TurnVK уже запущен.", windows.MB_ICONINFORMATION)
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
+	cleanupUpdate()
 	if err := installWintun(); err != nil {
 		message("Не удалось подготовить драйвер Wintun: "+err.Error(), windows.MB_ICONERROR)
 		return
@@ -74,6 +86,7 @@ func main() {
 
 	stop := make(chan struct{})
 	go a.tick(stop)
+	go a.checkUpdates(stop)
 	// "TurnVK.exe wdtt://..." adds (or selects) that server and connects.
 	fromArg := false
 	for _, arg := range os.Args[1:] {

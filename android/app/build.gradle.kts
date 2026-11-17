@@ -12,15 +12,30 @@ android {
         applicationId = "io.github.jetvac.turnvk"
         minSdk = 24
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.3.1"
+        versionCode = 5
+        versionName = "0.4.0"
+    }
+
+    // The release key comes from the environment (CI: repository secrets).
+    // Every release must be signed with the same key, or Android refuses
+    // to install it over the previous version. Without it (local builds)
+    // the debug key is used.
+    val releaseKey = System.getenv("TURNVK_KEYSTORE")?.takeIf { file(it).exists() }
+    signingConfigs {
+        if (releaseKey != null) {
+            create("release") {
+                storeFile = file(releaseKey)
+                storePassword = System.getenv("TURNVK_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("TURNVK_KEY_ALIAS") ?: "turnvk"
+                keyPassword = System.getenv("TURNVK_KEY_PASSWORD") ?: System.getenv("TURNVK_KEYSTORE_PASSWORD")
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
-            // Signed with the debug key until a release key is set up.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 

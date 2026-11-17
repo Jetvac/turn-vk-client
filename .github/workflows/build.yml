@@ -86,7 +86,22 @@ jobs:
           # -checklinkname=0: github.com/wlynxg/anet (used by pion on Android)
           # links to net internals, which newer Go refuses by default.
       - name: Build the app
-        run: gradle -p android assembleRelease --no-daemon
+        env:
+          KEYSTORE_B64: ${{ secrets.TURNVK_KEYSTORE_B64 }}
+          TURNVK_KEYSTORE_PASSWORD: ${{ secrets.TURNVK_KEYSTORE_PASSWORD }}
+        run: |
+          set -e
+          # The release key (repository secrets): every release is signed
+          # with it, so a new APK installs over the previous one. A tag
+          # without the key fails rather than publish an APK that cannot
+          # update the installed app.
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/turnvk.jks"
+            export TURNVK_KEYSTORE="$RUNNER_TEMP/turnvk.jks"
+          elif [ "${GITHUB_REF#refs/tags/v}" != "$GITHUB_REF" ]; then
+            echo "::error::TURNVK_KEYSTORE_B64 secret is not set"; exit 1
+          fi
+          gradle -p android assembleRelease --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: turnvk-android
@@ -122,6 +137,6 @@ jobs:
           - TurnVK-….apk — приложение для Android.
           - turnvk-cli-…-windows-amd64.exe — консольный клиент (SOCKS5-прокси, проверки).
 
-          APK подписан ключом сборки: перед установкой удалите предыдущую версию.
+          Начиная с 0.4.0 APK подписан постоянным ключом: следующие версии ставятся поверх и обновляются из приложения. Чтобы перейти на 0.4.0 с более ранней версии, удалите старую один раз.
           Если на компьютере работает другой VPN (например, v2RayTun), выключите его: два VPN вместе не работают.
           NOTES

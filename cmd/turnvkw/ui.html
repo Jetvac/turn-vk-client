@@ -180,6 +180,9 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
 .warn .wi { width: 22px; height: 22px; color: var(--warn); flex: none; margin-top: 1px; }
 .warn b { display: block; margin-bottom: 2px; }
 .warn div { font-size: 13px; }
+.warn.upd { background: var(--accent-soft); align-items: center; }
+.warn.upd .wi { color: var(--accent); }
+.warn.upd .btn { flex: none; }
 .modal { position: fixed; inset: 0; background: rgba(10,12,18,.45); display: none; align-items: center; justify-content: center; padding: 20px; z-index: 10; }
 .modal.on { display: flex; animation: fade .15s ease; }
 .dialog { background: var(--card); border-radius: 18px; padding: 20px; max-width: 360px; width: 100%; box-shadow: 0 20px 60px rgba(0,0,0,.3); }
@@ -229,6 +232,17 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
     <div class="warn" id="otherVPN">
       <svg class="wi"><use href="#i-warn"/></svg>
       <div><b id="otherTitle"></b><span id="otherText"></span></div>
+    </div>
+
+    <div class="warn upd" id="update">
+      <svg class="wi"><use href="#i-info"/></svg>
+      <div style="flex:1"><b id="updTitle"></b><span id="updText">Обновление скачается с GitHub, TurnVK перезапустится сам.</span></div>
+      <button class="btn primary" id="updBtn">Обновить</button>
+    </div>
+
+    <div class="warn" id="health">
+      <svg class="wi"><use href="#i-warn"/></svg>
+      <div><b>Подключено, но интернет через VPN не работает</b><span id="healthText"></span> Соберите отчёт на вкладке «Журнал», не отключаясь, и отправьте его разработчику.</div>
     </div>
 
     <div class="srv" id="srv">
@@ -305,6 +319,10 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
         </div>
       </div>
       <div class="small muted" style="margin-top:12px">Сетевой адаптер «TurnVK» (Wintun) появляется только на время подключения и исчезает при отключении.</div>
+      <div class="row" style="margin-top:12px; justify-content:flex-start; align-items:center; gap:10px">
+        <button class="btn ghost" id="updCheck">Проверить обновления</button>
+        <span class="small muted" id="updStatus"></span>
+      </div>
     </div>
   </section>
 
@@ -428,6 +446,12 @@ window.onView = function (v) {
   const errText = v.error || (v.running && !connected && s && s.last_error ? s.last_error : '');
   $('err').style.display = errText ? 'block' : 'none';
   $('err').textContent = errText ? humanError(errText) : '';
+
+  $('update').style.display = v.update ? 'flex' : 'none';
+  if (v.update && !updating) $('updTitle').textContent = 'Доступна версия ' + v.update.version;
+  if (v.update && !updating) $('updStatus').textContent = 'Доступна версия ' + v.update.version;
+  $('health').style.display = connected && v.health ? 'flex' : 'none';
+  $('healthText').textContent = v.health ? v.health + '.' : '';
 
   const other = v.other_vpn;
   $('otherVPN').style.display = other ? 'flex' : 'none';
@@ -593,6 +617,33 @@ function renderLog() {
 }
 $('logCopy').onclick = async () => { await navigator.clipboard.writeText(logLines.join('\n')); toast('Журнал скопирован'); };
 $('logClear').onclick = async () => { await tvkClearLogs(); logLines = []; renderLog(); };
+
+let updating = false;
+$('updBtn').onclick = async () => {
+  updating = true;
+  $('updBtn').disabled = true;
+  $('updTitle').textContent = 'Скачиваем обновление…';
+  await tvkInstallUpdate();
+};
+$('updCheck').onclick = async () => {
+  $('updStatus').textContent = 'Проверяем…';
+  await tvkCheckUpdate();
+};
+window.onUpdateState = function (u) {
+  if (u.error) {
+    updating = false;
+    $('updBtn').disabled = false;
+    $('updTitle').textContent = V && V.update ? 'Доступна версия ' + V.update.version : '';
+    $('updStatus').textContent = u.error;
+    toast(u.error);
+  } else if (u.latest) {
+    $('updStatus').textContent = 'У вас последняя версия';
+  } else if (u.restarting) {
+    $('updTitle').textContent = 'Перезапускаем TurnVK…';
+  } else if (u.total) {
+    $('updTitle').textContent = 'Скачиваем обновление… ' + Math.floor(100 * u.done / u.total) + '%';
+  }
+};
 
 let reportPath = '';
 $('reportBtn').onclick = async () => {

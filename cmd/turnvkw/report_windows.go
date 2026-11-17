@@ -45,6 +45,10 @@ func (a *app) report() {
 	if p := a.current(); p != nil {
 		r.Link = p.Link
 	}
+	last := a.last
+	if a.health != "" {
+		r.Settings = append(r.Settings, "check after connecting: "+a.health)
+	}
 	a.mu.Unlock()
 
 	r.System = append([]string{
@@ -67,6 +71,11 @@ func (a *app) report() {
 				opts.DNS = []string{"1.1.1.1"}
 			}
 		}
+	}
+	if e == nil && last != nil {
+		// Not connected now: the report shows the connection that ended.
+		r.Settings = append(r.Settings, "not connected now; connection below ended at "+last.Ended.Format("15:04:05"))
+		r.Status, r.Diag = &last.Status, &last.Diag
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	r.Checks = diag.RunChecks(ctx, opts)

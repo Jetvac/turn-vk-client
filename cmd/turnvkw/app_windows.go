@@ -54,6 +54,11 @@ type view struct {
 	Version  string         `json:"version"`
 	// OtherVPN names another VPN adapter that takes the internet traffic.
 	OtherVPN string `json:"other_vpn"`
+	// Health: the check after connecting found that the internet does
+	// not work through the tunnel ("" when it does or before the check).
+	Health string `json:"health"`
+	// Update: a newer release on GitHub ("" when this one is the latest).
+	Update *release `json:"update"`
 }
 
 type app struct {
@@ -73,6 +78,19 @@ type app struct {
 	logFile *os.File
 	crash   *os.File
 	stopped chan struct{} // closed when the last connection has been taken down
+	health  string
+	// last is the previous connection's state, for a report made after
+	// disconnecting.
+	last   *lastConn
+	update *release
+}
+
+// lastConn is what a report shows of a connection that has ended.
+type lastConn struct {
+	eng    *engine.Engine
+	Ended  time.Time
+	Status engine.Status
+	Diag   engine.Diag
 }
 
 const maxLogs = 1000
@@ -183,7 +201,7 @@ func (a *app) eval(fn string, args ...any) {
 
 // snapshot builds the page's view; a.mu is held.
 func (a *app) snapshot() view {
-	v := view{Settings: a.s, Running: a.eng != nil, Error: a.lastErr, Device: a.devID, Version: version, OtherVPN: winvpn.OtherVPN()}
+	v := view{Settings: a.s, Running: a.eng != nil, Error: a.lastErr, Device: a.devID, Version: version, OtherVPN: winvpn.OtherVPN(), Health: a.health, Update: a.update}
 	v.Settings.Profiles = append([]profile(nil), a.s.Profiles...)
 	if p := a.current(); p != nil {
 		v.Settings.Current = p.ID
@@ -297,6 +315,8 @@ func (a *app) bind(w webview2.WebView) {
 		a.push()
 	}))
 	must(w.Bind("tvkReport", func() { go a.report() }))
+	must(w.Bind("tvkCheckUpdate", func() { go a.checkUpdate(true) }))
+	must(w.Bind("tvkInstallUpdate", func() { go a.installUpdate() }))
 	must(w.Bind("tvkShowFile", func(path string) {
 		// Only the reports this app saved.
 		if dir, err := os.UserCacheDir(); err == nil && filepath.Dir(path) == filepath.Join(dir, "TurnVK") {
@@ -399,13 +419,16 @@ func (a *app) connect() error {
 	a.stopped = make(chan struct{})
 	stopped := a.stopped
 	note = fmt.Sprintf("connecting to %s (%s), %d routes", p.Name, l.Host, a.s.Sessions)
+	a.health = ""
 	go func() {
 		err := e.Start(ctx, v.Open)
 		if err == nil {
+			go a.selfCheck(e, l.Host)
 			<-e.Done()
 			err = e.Err()
 		}
 		a.mu.Lock()
+		a.remember(e)
 		mine := a.eng == e
 		if mine {
 			a.eng, a.vpn, a.cancel = nil, nil, nil
@@ -434,7 +457,8 @@ func (a *app) connect() error {
 func (a *app) disconnect() (done <-chan struct{}) {
 	a.mu.Lock()
 	e, v, cancel, stopped := a.eng, a.vpn, a.cancel, a.stopped
-	a.eng, a.vpn, a.cancel, a.lastErr = nil, nil, nil, ""
+	a.remember(e)
+	a.eng, a.vpn, a.cancel, a.lastErr, a.health = nil, nil, nil, "", ""
 	a.mu.Unlock()
 	if e == nil {
 		return stopped
@@ -468,4 +492,16 @@ func (a *app) tick(stop <-chan struct{}) {
 			}
 		}
 	}
+}
+
+// remember keeps a connection's state for later reports; a.mu is held.
+func (a *app) remember(e *engine.Engine) {
+	if e == nil || (a.last != nil && a.last.eng == e) {
+		return
+	}
+	st, d := e.Status(), e.Diag()
+	if d.Connected.IsZero() {
+		return
+	}
+	a.last = &lastConn{eng: e, Ended: time.Now(), Status: st, Diag: d}
 }

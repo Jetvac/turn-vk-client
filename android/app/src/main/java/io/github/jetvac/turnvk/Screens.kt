@@ -103,6 +103,7 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
@@ -134,6 +135,7 @@ import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 // ---------------------------------------------------------------- theme
@@ -471,6 +473,10 @@ private fun HomeTab(
     val profiles = remember(revision) { store.profiles }
     val current = remember(revision) { store.current }
     var creating by remember { mutableStateOf(false) }
+    val update by Updater.available.collectAsState()
+    val updState by Updater.state.collectAsState()
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(Unit) { Updater.check() }
 
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 6.dp),
@@ -497,6 +503,17 @@ private fun HomeTab(
                 text = if (s.state == "connected") "VPN работает. Пройдите проверку, чтобы он и дальше переподключался без перебоев." else "Подключение ждёт, пока вы подтвердите, что вы не робот.",
                 action = if (captcha != null) "Пройти" else null,
                 onAction = { ctx.startActivity(Intent(ctx, CaptchaActivity::class.java)) },
+            )
+        }
+
+        update?.let { u ->
+            val downloading = updState == Updater.State.Downloading
+            Banner(
+                title = if (downloading) "Скачиваем версию ${u.version}…" else "Доступна версия ${u.version}",
+                text = (updState as? Updater.State.Failed)?.message
+                    ?: "Скачается с GitHub; Android попросит подтвердить установку. Настройки и серверы сохранятся.",
+                action = if (downloading) null else "Обновить",
+                onAction = { scope.launch { Updater.install(ctx) } },
             )
         }
 
@@ -1074,6 +1091,7 @@ private fun SettingsTab(store: Store, revision: Int, refresh: () -> Unit, active
                 }
             }
         }
+        UpdatePanel()
         Spacer(Modifier.height(8.dp))
     }
 }
@@ -1186,6 +1204,39 @@ private fun LogsTab() {
                 SelectionContainer {
                     LazyColumn(Modifier.fillMaxSize(), state = listState, contentPadding = PaddingValues(12.dp)) {
                         items(log) { Text(it, fontFamily = FontFamily.Monospace, fontSize = 11.sp, lineHeight = 16.sp) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Settings: the update check and, when there is one, the update. */
+@Composable
+private fun UpdatePanel() {
+    val ctx = LocalContext.current
+    val update by Updater.available.collectAsState()
+    val st by Updater.state.collectAsState()
+    val scope = rememberCoroutineScope()
+    Panel {
+        Column {
+            Text("Обновления", fontWeight = FontWeight.SemiBold)
+            Text(
+                when {
+                    st == Updater.State.Checking -> "Проверяем…"
+                    st == Updater.State.Downloading -> "Скачиваем версию ${update?.version}…"
+                    st is Updater.State.Failed -> (st as Updater.State.Failed).message
+                    update != null -> "Доступна версия ${update?.version}"
+                    st == Updater.State.Latest -> "У вас последняя версия"
+                    else -> "Новые версии выходят на GitHub; приложение проверяет их само."
+                },
+                fontSize = 13.sp, color = pal.muted, modifier = Modifier.padding(top = 2.dp, bottom = 10.dp),
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                LogButton("Проверить") { scope.launch { Updater.check(manual = true) } }
+                if (update != null && st != Updater.State.Downloading) {
+                    Button(onClick = { scope.launch { Updater.install(ctx) } }, shape = RoundedCornerShape(10.dp)) {
+                        Text("Обновить", fontWeight = FontWeight.SemiBold, fontSize = 13.sp)
                     }
                 }
             }
