@@ -382,3 +382,39 @@ func TestSniffQUIC(t *testing.T) {
 	}
 	_ = netip.Addr{}
 }
+
+// TurnVK's own connection through the VPN (Android: the lists).
+func TestDialVPN(t *testing.T) {
+	g := newRig(t, Rules{}, func(o *Options) { o.Addr = me })
+	const port = 4445
+	farServer(t, g, port)
+	g.r.UsePump()
+	// The pump starts on the next adapter read: the computer sends
+	// something now and then, as phones do.
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(50 * time.Millisecond):
+				g.ft.out <- udpPackets(netip.AddrPortFrom(me, 5000), netip.MustParseAddrPort("10.66.67.1:9"), []byte("x"), 1280, 0, 1)[0]
+			}
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := g.r.DialVPN(ctx, netip.AddrPortFrom(testFar, port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	msg := bytes.Repeat([]byte("lists "), 50000)
+	go c.Write(msg)
+	got := make([]byte, len(msg))
+	c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	if n, err := io.ReadFull(c, got); err != nil || !bytes.Equal(got, msg) {
+		t.Fatalf("echo: %d of %d, %v", n, len(msg), err)
+	}
+}

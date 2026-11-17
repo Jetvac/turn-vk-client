@@ -98,7 +98,6 @@ func (r *Router) settle(f *flow, host string, d Decision) {
 // its first bytes read, and it is opened where its name says.
 func (t *tcpDirect) acceptSniffing(req *tcp.ForwarderRequest, f *flow, src, dst netip.AddrPort) {
 	r := t.r
-	prelim := r.m.Load().decide(dst.Addr(), "", f.proc)
 	var wq waiter.Queue
 	ep, e := req.CreateEndpoint(&wq)
 	if e != nil {
@@ -113,24 +112,16 @@ func (t *tcpDirect) acceptSniffing(req *tcp.ForwarderRequest, f *flow, src, dst 
 		_ = in.SetReadDeadline(time.Now().Add(sniffWait))
 		head, host := readHello(in)
 		_ = in.SetReadDeadline(time.Time{})
-		d := r.decideSniffed(f, host, prelim)
-		r.settle(f, host, d)
-		var out net.Conn
-		var err error
-		if d.Route == Direct {
-			dl := net.Dialer{Timeout: 10 * time.Second, Control: r.control, KeepAlive: 30 * time.Second}
-			out, err = r.dialTCP(&dl, dst)
-		} else {
-			out, err = r.relayDial(f, src, dst)
-		}
+		out, first, err := r.openSniffed(f, src, dst, host, head)
 		if err != nil {
 			ep.Abort() // the program gets a reset, as from a refusing server
 			in.Close()
 			f.closed.Store(true)
 			return
 		}
-		if len(head) > 0 {
-			if _, err := out.Write(head); err != nil {
+		if len(first) > 0 {
+			f.down.Add(uint64(len(first)))
+			if _, err := in.Write(first); err != nil {
 				ep.Abort()
 				in.Close()
 				out.Close()

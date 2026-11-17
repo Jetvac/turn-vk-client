@@ -72,6 +72,8 @@ type view struct {
 	Update *release `json:"update"`
 	// Lists: the country and site lists of split tunneling.
 	Lists listsView `json:"lists"`
+	// Mode: the split tunneling mode the rules are in (split.ModeOf).
+	Mode string `json:"mode"`
 }
 
 type app struct {
@@ -223,6 +225,7 @@ func (a *app) snapshot() view {
 	v := view{Settings: a.s, Running: a.eng != nil, Error: a.lastErr, Device: a.devID, Version: version, OtherVPN: winvpn.OtherVPN(), Health: a.health, Update: a.update}
 	v.Settings.Profiles = append([]profile(nil), a.s.Profiles...)
 	v.Lists = a.listsView()
+	v.Mode = split.ModeOf(a.s.Split)
 	if p := a.current(); p != nil {
 		v.Settings.Current = p.ID
 	}
@@ -359,30 +362,32 @@ func (a *app) bind(w webview2.WebView) {
 		a.push()
 		return nil
 	}))
-	must(w.Bind("tvkSetSplit", func(r split.Rules) {
-		r.Normalize()
+	must(w.Bind("tvkSetSplit", a.setSplit))
+	must(w.Bind("tvkApplyMode", func(mode string) {
 		a.mu.Lock()
-		old := a.s.Split
-		a.s.Split = r
-		a.save()
-		rt, e := a.router, a.eng
+		r := split.ApplyMode(a.s.Split, mode)
+		a.mu.Unlock()
+		a.setSplit(r)
+	}))
+	must(w.Bind("tvkExplain", func(target, app string) (split.Explanation, error) {
+		return a.explain(target, app)
+	}))
+	must(w.Bind("tvkFailures", func() []split.Failure {
+		a.mu.Lock()
+		rt := a.router
+		a.mu.Unlock()
+		if rt == nil {
+			return nil
+		}
+		return rt.Failures()
+	}))
+	must(w.Bind("tvkForgetFailures", func() {
+		a.mu.Lock()
+		rt := a.router
 		a.mu.Unlock()
 		if rt != nil {
-			rt.SetRules(r)
-			// New answers for names the rules now treat differently.
-			byName := len(r.Domains) > 0 || len(old.Domains) > 0 || len(r.Lists) > 0 || len(old.Lists) > 0
-			if old.On != r.On && byName || !sameDomains(old, r) || !slices.Equal(old.Lists, r.Lists) {
-				split.FlushDNS()
-			}
+			rt.ForgetFailures()
 		}
-		if !sameLists(old, r) {
-			go func() {
-				a.loadLists()
-				a.updateLists(e) // a list from a file not downloaded yet
-			}()
-		}
-		a.logf("split tunneling: %s", describeSplit(r))
-		a.push()
 	}))
 	must(w.Bind("tvkNormDomain", func(s string) (string, error) {
 		d, err := split.NormalizeDomain(s)
@@ -407,7 +412,7 @@ func (a *app) bind(w webview2.WebView) {
 		if e == nil {
 			return errors.New("списки скачиваются через VPN: сначала подключитесь")
 		}
-		go a.updateLists(e)
+		go a.updateLists(e, true)
 		return nil
 	}))
 	must(w.Bind("tvkConns", func() []split.Conn {
@@ -462,6 +467,33 @@ func (a *app) addLink(raw string) error {
 	a.s.Current = p.ID
 	a.save()
 	return nil
+}
+
+// setSplit saves new split tunneling rules and applies them at once.
+func (a *app) setSplit(r split.Rules) {
+	r.Normalize()
+	a.mu.Lock()
+	old := a.s.Split
+	a.s.Split = r
+	a.save()
+	rt, e := a.router, a.eng
+	a.mu.Unlock()
+	if rt != nil {
+		rt.SetRules(r)
+		// New answers for names the rules now treat differently.
+		byName := len(r.Domains) > 0 || len(old.Domains) > 0 || len(r.Lists) > 0 || len(old.Lists) > 0
+		if old.On != r.On && byName || !sameDomains(old, r) || !slices.Equal(old.Lists, r.Lists) {
+			split.FlushDNS()
+		}
+	}
+	if !sameLists(old, r) {
+		go func() {
+			a.loadLists()
+			a.updateLists(e, false) // a list from a file not downloaded yet
+		}()
+	}
+	a.logf("split tunneling: %s", describeSplit(r))
+	a.push()
 }
 
 // describeSplit sums the rules up for the log (program names, not paths:
@@ -624,6 +656,7 @@ func (a *app) connect() error {
 			// resolves VK's names.
 			Resolver: (&netx.Net{DNS: netx.DefaultDNS, Protect: v.Protect}).Resolver(),
 			Lists:    lists,
+			Addr:     c.Address.Addr(),
 			Logf:     a.logf,
 		}, rules)
 		a.mu.Lock()

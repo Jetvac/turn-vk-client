@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"golang.org/x/net/dns/dnsmessage"
@@ -226,7 +227,7 @@ func TestUpdateLists(t *testing.T) {
 	ListSources = []string{srv.URL + "/missing/", srv.URL + "/"}
 	defer func() { ListSources = old }()
 	dir := t.TempDir()
-	changed, err := UpdateLists(context.Background(), srv.Client(), dir, []string{GeoIPFile, GeoSiteFile})
+	changed, err := UpdateLists(context.Background(), dir, []string{GeoIPFile, GeoSiteFile}, true, ListClient{C: srv.Client()})
 	if !slices.Equal(changed, []string{GeoIPFile}) || err == nil {
 		t.Fatalf("changed %v, err %v", changed, err)
 	}
@@ -238,9 +239,19 @@ func TestUpdateLists(t *testing.T) {
 	}
 	// The same checksum again: nothing is downloaded.
 	n := hits["/geoip.dat"]
-	changed, err = UpdateLists(context.Background(), srv.Client(), dir, []string{GeoIPFile})
+	changed, err = UpdateLists(context.Background(), dir, []string{GeoIPFile}, true, ListClient{C: srv.Client()})
 	if len(changed) != 0 || err != nil || hits["/geoip.dat"] != n {
 		t.Fatalf("again: %v %v %d", changed, err, hits["/geoip.dat"]-n)
+	}
+	// A fresh file is not even checked without force.
+	sums := hits["/geoip.dat.sha256sum"]
+	if changed, err = UpdateLists(context.Background(), dir, []string{GeoIPFile}, false, ListClient{C: srv.Client()}); len(changed) != 0 || err != nil || hits["/geoip.dat.sha256sum"] != sums {
+		t.Fatalf("fresh: %v %v", changed, err)
+	}
+	// Errors name each way and source, shortly.
+	_, err = UpdateLists(context.Background(), t.TempDir(), []string{GeoSiteFile}, false, ListClient{Via: "через VPN", C: srv.Client()})
+	if err == nil || !strings.Contains(err.Error(), "через VPN, 127.0.0.1") || !strings.Contains(err.Error(), "HTTP 404") {
+		t.Fatalf("error: %v", err)
 	}
 	if fs := ListFiles(dir); len(fs) != 1 || fs[0].Size != int64(len(body)) {
 		t.Fatalf("files %+v", fs)

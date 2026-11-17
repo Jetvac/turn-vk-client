@@ -220,6 +220,25 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
 .conn { display: flex; gap: 8px; align-items: baseline; font-size: 12.5px; padding: 3px 0; }
 .conn .dst { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
 .conn.closed { opacity: .5; }
+.mode { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); cursor: pointer; }
+.mode:first-of-type { border-top: 0; }
+.mode .grow { flex: 1; min-width: 0; }
+.mode .lbl { font-weight: 600; }
+.mode .hint { font-size: 12.5px; color: var(--muted); }
+.mode.cur .radio { border-color: var(--accent); }
+.mode.cur .radio::after { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.explain { margin-top: 10px; font-size: 13px; display: none; }
+.explain.on { display: block; }
+.explain .head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.explain .host { font-weight: 600; }
+.explain .note { padding: 4px 0 0; }
+select { font: inherit; color: var(--text); background: var(--card2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; outline: none; max-width: 100%; }
+.fail { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid var(--line); }
+.fail:first-child { border-top: 0; padding-top: 0; }
+.fail .grow { flex: 1; min-width: 0; }
+.fail .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fail .meta { font-size: 12px; color: var(--muted); }
+#spHome .switch { margin-left: 4px; }
 .toast { position: fixed; left: 50%; bottom: 84px; transform: translateX(-50%) translateY(10px); background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 10px; font-size: 13px; opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; }
 .toast.on { opacity: 1; transform: translateX(-50%); }
 </style>
@@ -284,6 +303,12 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
       <svg class="chev"><use href="#i-chev"/></svg>
     </div>
 
+    <div class="srv" id="spHome">
+      <div class="ic"><svg><use href="#i-split"/></svg></div>
+      <div class="grow"><div class="name">Раздельное туннелирование</div><div class="host" id="spHomeText"></div></div>
+      <label class="switch" title="Включить или выключить" id="spHomeSw"><input type="checkbox" id="spHomeOn"><i></i></label>
+    </div>
+
     <div class="card" id="statsCard" style="display:none">
       <div class="speeds">
         <div class="speed"><div class="k"><i style="background:var(--down)"></i>Загрузка</div><div class="v" id="down">0<small>Мбит/с</small></div></div>
@@ -326,10 +351,36 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
 
   <section id="split">
     <div class="card">
-      <div class="opt">
-        <div class="grow"><div class="lbl">Раздельное туннелирование</div><div class="hint">Выбранные программы идут напрямую или через VPN. Путь выбирается для каждого нового соединения, поэтому игра со всеми её серверами и вспомогательными программами идёт одним путём.</div></div>
-        <label class="switch"><input type="checkbox" id="spOn"><i></i></label>
+      <div class="title">Режим</div>
+      <div id="spModes">
+        <div class="mode" data-m="vpn"><div class="radio"></div><div class="grow"><div class="lbl">Всё через VPN</div><div class="hint">Раздельное туннелирование выключено</div></div></div>
+        <div class="mode" data-m="blocked"><div class="radio"></div><div class="grow"><div class="lbl">Только заблокированное через VPN</div><div class="hint">Сайты и адреса, заблокированные в России, — через VPN, остальное напрямую. Российские сайты и игры работают с обычной скоростью</div></div></div>
+        <div class="mode" data-m="russia"><div class="radio"></div><div class="grow"><div class="lbl">Российское напрямую</div><div class="hint">Российские сайты и адреса (.ru, .su, .рф) — напрямую, остальное через VPN</div></div></div>
+        <div class="mode" data-m="custom"><div class="radio"></div><div class="grow"><div class="lbl">Свои правила</div><div class="hint">Программы, сайты и списки ниже — как вы настроите</div></div></div>
       </div>
+      <div class="small muted" style="margin-top:8px">Режим добавляет нужные списки и не трогает ваши правила для программ и сайтов. Путь выбирается для каждого нового соединения, поэтому игра со всеми её серверами и вспомогательными программами идёт одним путём.</div>
+    </div>
+    <div class="card">
+      <div class="title">Куда пойдёт сайт?</div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap">
+        <input type="text" id="exTarget" placeholder="Сайт, ссылка или адрес" spellcheck="false" style="flex:1; min-width:180px">
+        <select id="exApp"><option value="">Любая программа</option></select>
+        <button class="btn primary" id="exGo">Проверить</button>
+      </div>
+      <div class="ferr" id="exErr" style="margin:6px 0 0"></div>
+      <div class="explain" id="exOut">
+        <div class="head"><span class="host" id="exHost"></span><span class="chip" id="exRoute"></span></div>
+        <div class="muted" id="exWhy" style="margin-top:2px"></div>
+        <div class="note" id="exNote"></div>
+      </div>
+    </div>
+    <div class="card" id="spFailCard" style="display:none">
+      <div class="title">Не открылись напрямую</div>
+      <div class="small muted" style="margin:-4px 0 10px">Эти сайты не ответили напрямую — TurnVK открыл их через VPN. Добавьте правило, чтобы они сразу шли через VPN.</div>
+      <div id="spFails"></div>
+      <div class="row" style="justify-content:flex-start; margin-top:10px"><button class="btn ghost" id="spFailClear" style="padding:4px 10px">Очистить список</button></div>
+    </div>
+    <div class="card">
       <div class="opt" style="display:block">
         <div class="lbl">Остальные программы</div>
         <div class="hint">Куда идут программы, для которых нет правила</div>
@@ -338,6 +389,10 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
       <div class="opt">
         <div class="grow"><div class="lbl">Локальная сеть напрямую</div><div class="hint">Роутер, принтеры и другие устройства дома (192.168.x.x, 10.x.x.x)</div></div>
         <label class="switch"><input type="checkbox" id="spLAN"><i></i></label>
+      </div>
+      <div class="opt">
+        <div class="grow"><div class="lbl">Не открылся напрямую — через VPN</div><div class="hint">Если сайт, который идёт напрямую, не отвечает или обрывает соединение (так обычно выглядит блокировка), TurnVK откроет его через VPN и предложит правило</div></div>
+        <label class="switch"><input type="checkbox" id="spRetry"><i></i></label>
       </div>
     </div>
     <div class="card">
@@ -754,15 +809,64 @@ function addRule(path, folder, route) {
 window.onPicked = (p) => addRule(p.path, p.folder);
 $('spAddApp').onclick = () => tvkPick(false);
 $('spAddDir').onclick = () => tvkPick(true);
-$('spOn').onchange = () => { const r = spRules(); r.on = $('spOn').checked; saveSplit(r); };
+$('spRetry').onchange = () => { const r = spRules(); r.noRetry = !$('spRetry').checked; saveSplit(r); };
+document.querySelectorAll('#spModes .mode').forEach(el => el.onclick = () => {
+  const m = el.dataset.m;
+  V.mode = m;
+  renderModes();
+  tvkApplyMode(m);
+  toast(el.querySelector('.lbl').textContent);
+});
+$('spHomeSw').onclick = (e) => e.stopPropagation();
+$('spHomeOn').onchange = () => {
+  const on = $('spHomeOn').checked;
+  if (on && !hasRules()) { $('spHomeOn').checked = false; show('split'); toast('Выберите режим'); return; }
+  const r = spRules(); r.on = on; saveSplit(r);
+  toast(on ? 'Раздельное туннелирование включено' : 'Всё через VPN');
+};
+$('spHome').onclick = () => show('split');
+function hasRules() { const r = V.settings.split || {}; return (r.apps || []).length + (r.domains || []).length + (r.lists || []).length > 0 || r.default === 'direct'; }
+function plural(n, one, few, many) { const a = n % 10, b = n % 100; return n + ' ' + (a === 1 && b !== 11 ? one : a >= 2 && a <= 4 && (b < 12 || b > 14) ? few : many); }
+const modeNames = { vpn: 'Всё через VPN', blocked: 'Только заблокированное через VPN', russia: 'Российское напрямую', custom: 'Свои правила' };
+// The same as split.ModeOf, for the page's own changes before Go answers.
+function localMode(r) {
+  if (!r.on) return 'vpn';
+  const has = (n, rt) => (r.lists || []).some(l => l.list === n && l.route === rt && !l.off);
+  const def = r.default || 'vpn';
+  if (def === 'direct' && has('geosite:ru-blocked', 'vpn')) return 'blocked';
+  if (def === 'vpn' && has('geoip:ru', 'direct')) return 'russia';
+  return 'custom';
+}
+function renderModes() {
+  document.querySelectorAll('#spModes .mode').forEach(el => el.classList.toggle('cur', el.dataset.m === V.mode));
+}
+function renderSplitHome() {
+  const r = V.settings.split || {};
+  $('spHomeOn').checked = !!r.on;
+  let t = modeNames[V.mode] || '';
+  if (r.on) {
+    const on = (xs) => (xs || []).filter(x => !x.off).length;
+    const parts = [];
+    if (on(r.apps)) parts.push(plural(on(r.apps), 'программа', 'программы', 'программ'));
+    if (on(r.domains)) parts.push(plural(on(r.domains), 'сайт', 'сайта', 'сайтов'));
+    if (on(r.lists)) parts.push(plural(on(r.lists), 'список', 'списка', 'списков'));
+    if (V.mode === 'custom') t = 'Своё: остальное ' + (r.default === 'direct' ? 'напрямую' : 'через VPN');
+    if (parts.length) t += ' · ' + parts.join(', ');
+  }
+  $('spHomeText').textContent = t;
+}
 $('spLAN').onchange = () => { const r = spRules(); r.lan = $('spLAN').checked; saveSplit(r); };
 document.querySelectorAll('#spDefault button').forEach(b => b.onclick = () => { const r = spRules(); r.default = b.dataset.v; saveSplit(r); });
 
 function renderSplit() {
   if (!V) return;
   const r = V.settings.split || {}, apps = r.apps || [];
-  $('spOn').checked = !!r.on;
+  V.mode = localMode(r);
+  renderModes();
+  renderSplitHome();
+  renderExApps(apps);
   $('spLAN').checked = !!r.lan;
+  $('spRetry').checked = !r.noRetry;
   document.querySelectorAll('#spDefault button').forEach(b => b.classList.toggle('on', b.dataset.v === (r.default || 'vpn')));
   renderDomains();
   renderLists();
@@ -991,13 +1095,77 @@ function renderLists() {
   });
 }
 
+// --- Where would a site go? ---
+function renderExApps(apps) {
+  const sel = $('exApp'), key = JSON.stringify(apps.map(a => a.path));
+  if (sel.dataset.k === key) return;
+  sel.dataset.k = key;
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">Любая программа</option>';
+  apps.forEach(a => {
+    const o = document.createElement('option');
+    // A folder's rule: any program inside it.
+    o.value = a.folder ? a.path.replace(/[\\\/]+$/, '') + '\\program.exe' : a.path;
+    o.textContent = a.folder ? 'Программа из папки ' + baseName(a.path) : baseName(a.path);
+    sel.appendChild(o);
+  });
+  sel.value = [...sel.options].some(o => o.value === cur) ? cur : '';
+}
+async function explain() {
+  $('exErr').textContent = '';
+  const t = $('exTarget').value.trim();
+  if (!t) return;
+  let e;
+  try { e = await tvkExplain(t, $('exApp').value); }
+  catch (err) { $('exErr').textContent = String(err && err.message || err); $('exOut').classList.remove('on'); return; }
+  $('exHost').textContent = (e.host || e.addr) + (e.host && e.addr ? ' (' + e.addr + ')' : '');
+  $('exRoute').className = 'chip ' + e.route;
+  $('exRoute').textContent = e.route === 'direct' ? 'напрямую' : 'через VPN';
+  $('exWhy').textContent = 'Почему: ' + e.why;
+  $('exNote').textContent = e.note || '';
+  $('exNote').style.display = e.note ? '' : 'none';
+  $('exOut').classList.add('on');
+}
+$('exGo').onclick = explain;
+$('exTarget').onkeydown = (e) => { if (e.key === 'Enter') explain(); };
+$('exApp').onchange = () => { if ($('exOut').classList.contains('on')) explain(); };
+
+// --- Sites that did not open direct ---
+let fails = [];
+function renderFails() {
+  const box = $('spFails');
+  $('spFailCard').style.display = fails.length ? '' : 'none';
+  const key = JSON.stringify(fails.map(f => [f.host, f.addr, f.count, f.ok]));
+  if (box.dataset.k === key) return;
+  box.dataset.k = key;
+  box.innerHTML = '';
+  fails.forEach(f => {
+    const el = document.createElement('div');
+    el.className = 'fail';
+    el.innerHTML = '<div class="grow"><div class="name"></div><div class="meta"></div></div>';
+    el.querySelector('.name').textContent = f.host || f.addr;
+    el.querySelector('.meta').textContent = f.why + (f.ok ? ', открыт через VPN' : ', через VPN тоже не открылся') + (f.count > 1 ? ' · ' + plural(f.count, 'раз', 'раза', 'раз') : '') + (f.app ? ' · ' + f.app : '');
+    if (f.rule && f.ok) {
+      const b = document.createElement('button');
+      b.className = 'btn ghost'; b.style.cssText = 'padding:4px 10px; flex:none';
+      b.textContent = f.rule + ' — через VPN';
+      b.onclick = () => addDomain(f.rule, 'vpn');
+      el.appendChild(b);
+    }
+    box.appendChild(el);
+  });
+}
+$('spFailClear').onclick = () => { tvkForgetFailures(); fails = []; renderFails(); };
+
 const openGroups = new Set();
 let conns = [];
 async function pollConns() {
   clearTimeout(pollConns.h);
   if (tab !== 'split') return;
   try { conns = V && V.running ? (await tvkConns()) || [] : []; } catch (e) { conns = []; }
+  try { fails = V && V.running ? (await tvkFailures()) || [] : []; } catch (e) { fails = []; }
   renderConns();
+  renderFails();
   pollConns.h = setTimeout(pollConns, 2000);
 }
 $('spFilter').oninput = renderConns;

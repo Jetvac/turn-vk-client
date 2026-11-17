@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -105,7 +107,7 @@ func sameLists(a, b split.Rules) bool {
 
 // updateLists downloads the list files that changed at the source (a
 // small checksum is fetched first). It runs only while e is connected.
-func (a *app) updateLists(e *engine.Engine) {
+func (a *app) updateLists(e *engine.Engine, force bool) {
 	a.mu.Lock()
 	if a.lists.busy || a.eng != e || e == nil {
 		a.mu.Unlock()
@@ -131,7 +133,7 @@ func (a *app) updateLists(e *engine.Engine) {
 	}()
 	// A plain client: with the tunnel up, it goes through the VPN.
 	c := &http.Client{Timeout: 10 * time.Minute}
-	changed, err := split.UpdateLists(ctx, c, dir, files)
+	changed, err := split.UpdateLists(ctx, dir, files, force, split.ListClient{C: c})
 	cancel()
 
 	a.mu.Lock()
@@ -165,7 +167,7 @@ func (a *app) keepListsFresh(e *engine.Engine) {
 			return
 		case <-t.C:
 		}
-		a.updateLists(e)
+		a.updateLists(e, false)
 		t.Reset(listsEvery)
 	}
 }
@@ -193,4 +195,21 @@ func (a *app) listNames(file string) []string {
 	a.lists.names[file] = n
 	a.mu.Unlock()
 	return n
+}
+
+// explain tells where a site (or address) would go from a program ("" for
+// any) under the current rules.
+func (a *app) explain(target, app string) (split.Explanation, error) {
+	a.mu.Lock()
+	rules, lists := a.s.Split, a.lists.loaded
+	a.mu.Unlock()
+	var addrs []netip.Addr
+	if h, err := split.NormalizeDomain(target); err == nil && strings.Contains(h, ".") {
+		if _, err := netip.ParseAddr(h); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			addrs, _ = net.DefaultResolver.LookupNetIP(ctx, "ip4", h)
+			cancel()
+		}
+	}
+	return split.Explain(rules, lists, target, app, addrs)
 }

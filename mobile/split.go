@@ -67,7 +67,7 @@ func SetSplit(rulesJSON string) (string, error) {
 	}
 	if !sameListNames(old, r) {
 		go loadLists()
-		go updateLists(currentEngine())
+		go updateLists(currentEngine(), false)
 	}
 	b, err := json.Marshal(r)
 	return string(b), err
@@ -137,6 +137,7 @@ func wrapTun(dev tun.Device, c *engine.WGConfig, p Platform, protect func(uintpt
 		}
 	}
 	owner := &split.UIDOwner{
+		Logf: func(f string, a ...any) { p.Log(fmt.Sprintf(f, a...)) },
 		UID: func(proto uint8, l, r netip.AddrPort) int {
 			return p.OwnerUID(int(proto), l.Addr().String(), int(l.Port()), r.Addr().String(), int(r.Port()))
 		},
@@ -154,7 +155,7 @@ func wrapTun(dev tun.Device, c *engine.WGConfig, p Platform, protect func(uintpt
 	rules, lists := sp.rules, sp.lists
 	sp.mu.Unlock()
 	rt := split.New(dev, split.Options{
-		Protect: protect, Owner: owner, AlwaysVPN: always, DNS: dns, Fake: sp.fake,
+		Protect: protect, Owner: owner, AlwaysVPN: always, DNS: dns, Fake: sp.fake, Addr: c.Address.Addr(),
 		// Sites sent direct are resolved past the tunnel, as VK's names.
 		Resolver: (&netx.Net{DNS: netx.DefaultDNS, Protect: protect}).Resolver(),
 		Self:     uint32(os.Getuid()),
@@ -166,6 +167,9 @@ func wrapTun(dev tun.Device, c *engine.WGConfig, p Platform, protect func(uintpt
 	rules = sp.rules // changed meanwhile
 	sp.mu.Unlock()
 	rt.SetRules(rules)
+	if len(split.NeededFiles(rules.Lists)) > 0 {
+		rt.UsePump() // the lists come through the tunnel (DialVPN)
+	}
 	return rt
 }
 
@@ -273,7 +277,7 @@ func UpdateLists() error {
 	if e == nil {
 		return errors.New("списки скачиваются, пока VPN подключён")
 	}
-	go updateLists(e)
+	go updateLists(e, true)
 	return nil
 }
 
@@ -283,7 +287,7 @@ func currentEngine() *engine.Engine {
 	return current
 }
 
-func updateLists(e *engine.Engine) {
+func updateLists(e *engine.Engine, force bool) {
 	if e == nil {
 		return
 	}
@@ -305,7 +309,20 @@ func updateLists(e *engine.Engine) {
 		case <-ctx.Done():
 		}
 	}()
-	changed, err := split.UpdateLists(ctx, &http.Client{Timeout: 10 * time.Minute}, dir, files)
+	// Through the tunnel first: GitHub is often blocked or slowed on
+	// Russian networks, where the app's own sockets go. Then directly.
+	var clients []split.ListClient
+	sp.mu.Lock()
+	rt := sp.router
+	sp.mu.Unlock()
+	if rt != nil {
+		clients = append(clients, split.ListClient{Via: "через VPN", C: &http.Client{
+			Timeout:   10 * time.Minute,
+			Transport: &http.Transport{DialContext: rt.VPNDialContext, TLSHandshakeTimeout: 20 * time.Second},
+		}})
+	}
+	clients = append(clients, split.ListClient{Via: "напрямую", C: &http.Client{Timeout: 10 * time.Minute}})
+	changed, err := split.UpdateLists(ctx, dir, files, force, clients...)
 	cancel()
 
 	sp.mu.Lock()
@@ -337,7 +354,85 @@ func keepListsFresh(e *engine.Engine) {
 			return
 		case <-t.C:
 		}
-		updateLists(e)
+		updateLists(e, false)
 		t.Reset(listsEvery)
+	}
+}
+
+// ModeOf tells the mode the rules (JSON) are in: "vpn", "blocked",
+// "russia" or "custom".
+func ModeOf(rulesJSON string) string {
+	r := split.DefaultRules()
+	_ = json.Unmarshal([]byte(rulesJSON), &r)
+	return split.ModeOf(r)
+}
+
+// ApplyMode returns the rules (JSON) put into a mode, without applying
+// them (SetSplit does).
+func ApplyMode(rulesJSON, mode string) (string, error) {
+	r := split.DefaultRules()
+	if strings.TrimSpace(rulesJSON) != "" {
+		if err := json.Unmarshal([]byte(rulesJSON), &r); err != nil {
+			return "", err
+		}
+	}
+	b, err := json.Marshal(split.ApplyMode(r, mode))
+	return string(b), err
+}
+
+// Explain tells, as JSON (split.Explanation), where a site or address
+// would go from an app (its package; "" for any) under the current rules.
+// While connected, the site's addresses are found through the VPN.
+func Explain(target, app string) (string, error) {
+	sp.mu.Lock()
+	r, l, rt := sp.rules, sp.lists, sp.router
+	sp.mu.Unlock()
+	if l == nil && len(r.Lists) > 0 {
+		loadLists()
+		sp.mu.Lock()
+		l = sp.lists
+		sp.mu.Unlock()
+	}
+	var addrs []netip.Addr
+	if rt != nil {
+		if h, err := split.NormalizeDomain(target); err == nil && strings.Contains(h, ".") {
+			if _, err := netip.ParseAddr(h); err != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+				addrs, _ = rt.VPNResolver().LookupNetIP(ctx, "ip4", h)
+				cancel()
+			}
+		}
+	}
+	e, err := split.Explain(r, l, target, app, addrs)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(e)
+	return string(b), err
+}
+
+// Failures returns, as JSON, the sites that did not open direct lately
+// and were opened through the VPN (split.Failure), while connected.
+func Failures() string {
+	sp.mu.Lock()
+	rt := sp.router
+	sp.mu.Unlock()
+	if rt == nil {
+		return "[]"
+	}
+	b, _ := json.Marshal(rt.Failures())
+	if string(b) == "null" {
+		return "[]"
+	}
+	return string(b)
+}
+
+// ForgetFailures clears that list.
+func ForgetFailures() {
+	sp.mu.Lock()
+	rt := sp.router
+	sp.mu.Unlock()
+	if rt != nil {
+		rt.ForgetFailures()
 	}
 }

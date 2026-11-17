@@ -350,7 +350,8 @@ fun App(store: Store, imported: MutableState<String?>, connect: () -> Unit) {
     ) { pad ->
         Box(Modifier.fillMaxSize().padding(pad)) {
             when (tab) {
-                Tab.Home -> HomeTab(store, revision, refresh, s, live, history, now, connect, onServers = { tab = Tab.Servers })
+                Tab.Home -> HomeTab(store, revision, refresh, s, live, history, now, connect, onServers = { tab = Tab.Servers },
+                    rules = rules, updateRules = updateRules, onRoutes = { tab = Tab.Routes })
                 Tab.Servers -> ServersTab(store, revision, refresh, s.active)
                 Tab.Routes -> RoutesTab(store, rules, updateRules, s.active, onAddApp = { apps = true })
                 Tab.Settings -> SettingsTab(store, revision, refresh, s.active)
@@ -472,6 +473,9 @@ private fun HomeTab(
     now: Long,
     connect: () -> Unit,
     onServers: () -> Unit,
+    rules: SplitRules,
+    updateRules: (SplitRules) -> Unit,
+    onRoutes: () -> Unit,
 ) {
     val ctx = LocalContext.current
     val error by TunnelState.error.collectAsState()
@@ -524,6 +528,21 @@ private fun HomeTab(
         }
 
         ServerRow(current, profiles.size, onClick = { if (current == null) creating = true else onServers() })
+
+        SplitRow(rules, onClick = onRoutes) { on ->
+            // Turning on rules that send nothing anywhere: choose a mode first.
+            if (on && rules.mode() == "vpn" && rules.apps.isEmpty() && rules.domains.isEmpty() && rules.lists.isEmpty() && rules.default != "direct") onRoutes()
+            else updateRules(rules.copy(on = on))
+        }
+        val applied by TunnelState.plan.collectAsState()
+        val planNow = remember(rules) { runCatching { mobile.Mobile.appPlan() }.getOrDefault("") }
+        if (s.active && applied != null && planNow.isNotEmpty() && planNow != applied) {
+            Banner(
+                "Нужно переподключиться",
+                "Какие приложения Android пускает в VPN, меняется только при подключении.",
+                action = "Переподключить",
+            ) { TunnelService.restart(ctx) }
+        }
 
         if (s.active) Stats(s, live, history)
 
@@ -634,6 +653,24 @@ private fun PowerButton(connected: Boolean, busy: Boolean, failed: Boolean, onCl
                     else -> p.faint
                 },
             )
+        }
+    }
+}
+
+@Composable
+private fun SplitRow(rules: SplitRules, onClick: () -> Unit, onToggle: (Boolean) -> Unit) {
+    Surface(onClick = onClick, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(14.dp), color = pal.card, shadowElevation = 1.dp) {
+        Row(Modifier.padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(40.dp).clip(RoundedCornerShape(11.dp)).background(pal.accentSoft), contentAlignment = Alignment.Center) {
+                Icon(painterResource(R.drawable.ic_routes), null, Modifier.size(20.dp), tint = pal.accent)
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Раздельное туннелирование", fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(remember(rules) { splitSummary(rules) }, fontSize = 12.5.sp, color = pal.muted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
+            Spacer(Modifier.width(8.dp))
+            Switch(checked = rules.on, onCheckedChange = onToggle)
         }
     }
 }

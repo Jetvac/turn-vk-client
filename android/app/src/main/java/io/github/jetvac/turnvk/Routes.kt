@@ -2,6 +2,7 @@ package io.github.jetvac.turnvk
 
 import android.content.Context
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -32,6 +33,7 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -40,6 +42,7 @@ import androidx.compose.material3.ListItemDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
@@ -93,12 +96,14 @@ data class SplitRules(
     val apps: List<AppRoute> = emptyList(),
     val domains: List<SiteRoute> = emptyList(),
     val lists: List<ListRoute> = emptyList(),
+    /** A site sent direct that does not open is not tried through the VPN. */
+    val noRetry: Boolean = false,
 ) {
     /** The route a new rule gets: the opposite of the others'. */
     val other: String get() = if (default == "direct") "vpn" else "direct"
 
     fun toJson(): String {
-        val o = JSONObject().put("on", on).put("default", default).put("lan", lan)
+        val o = JSONObject().put("on", on).put("default", default).put("lan", lan).put("noRetry", noRetry)
         o.put("apps", JSONArray().apply { apps.forEach { put(JSONObject().put("path", it.path).put("route", it.route).put("off", it.off)) } })
         o.put("domains", JSONArray().apply { domains.forEach { put(JSONObject().put("domain", it.domain).put("route", it.route).put("off", it.off)) } })
         o.put("lists", JSONArray().apply { lists.forEach { put(JSONObject().put("list", it.list).put("route", it.route).put("off", it.off)) } })
@@ -120,6 +125,7 @@ data class SplitRules(
                 apps = arr("apps") { AppRoute(it.optString("path"), it.optString("route", "direct"), it.optBoolean("off")) },
                 domains = arr("domains") { SiteRoute(it.optString("domain"), it.optString("route", "direct"), it.optBoolean("off")) },
                 lists = arr("lists") { ListRoute(it.optString("list"), it.optString("route", "direct"), it.optBoolean("off")) },
+                noRetry = o.optBoolean("noRetry"),
             )
         }.getOrDefault(SplitRules())
     }
@@ -130,6 +136,51 @@ fun applyRules(store: Store, r: SplitRules): SplitRules {
     val js = runCatching { mobile.Mobile.setSplit(r.toJson()) }.getOrElse { r.toJson() }
     store.split = js
     return SplitRules.parse(js)
+}
+
+/** The mode the rules are in: "vpn", "blocked", "russia" or "custom". */
+fun SplitRules.mode(): String = runCatching { mobile.Mobile.modeOf(toJson()) }.getOrDefault("custom")
+
+/** The rules put into a mode (the engine adds the lists it needs). */
+fun SplitRules.withMode(mode: String): SplitRules =
+    runCatching { SplitRules.parse(mobile.Mobile.applyMode(toJson(), mode)) }.getOrDefault(this)
+
+internal val modeTitles = mapOf(
+    "vpn" to "Всё через VPN",
+    "blocked" to "Только заблокированное через VPN",
+    "russia" to "Российское напрямую",
+    "custom" to "Свои правила",
+)
+
+private val modeTexts = mapOf(
+    "vpn" to "Раздельное туннелирование выключено",
+    "blocked" to "Сайты и адреса, заблокированные в России, — через VPN, остальное напрямую. Российские сайты и игры работают с обычной скоростью",
+    "russia" to "Российские сайты и адреса (.ru, .su, .рф) — напрямую, остальное через VPN",
+    "custom" to "Приложения, сайты и списки ниже — как вы настроите",
+)
+
+private fun plural(n: Int, one: String, few: String, many: String): String {
+    val a = n % 10
+    val b = n % 100
+    return "$n " + when {
+        a == 1 && b != 11 -> one
+        a in 2..4 && (b < 12 || b > 14) -> few
+        else -> many
+    }
+}
+
+/** One line about the rules for the home screen. */
+fun splitSummary(r: SplitRules): String {
+    val mode = r.mode()
+    if (!r.on) return modeTitles.getValue("vpn")
+    var t = if (mode == "custom") "Своё: остальное " + routeName(r.default) else modeTitles[mode] ?: ""
+    val parts = buildList {
+        r.apps.count { !it.off }.takeIf { it > 0 }?.let { add(plural(it, "приложение", "приложения", "приложений")) }
+        r.domains.count { !it.off }.takeIf { it > 0 }?.let { add(plural(it, "сайт", "сайта", "сайтов")) }
+        r.lists.count { !it.off }.takeIf { it > 0 }?.let { add(plural(it, "список", "списка", "списков")) }
+    }
+    if (parts.isNotEmpty()) t += " · " + parts.joinToString(", ")
+    return t
 }
 
 /** Adds (or changes) the rule for an app. */
@@ -148,7 +199,7 @@ fun describeSplit(r: SplitRules): String {
         r.lists.filter { !it.off }.joinToString(" ") { it.list + "=" + it.route }
 }
 
-private fun routeName(r: String) = if (r == "direct") "напрямую" else "через VPN"
+internal fun routeName(r: String) = if (r == "direct") "напрямую" else "через VPN"
 
 // ---------------------------------------------------------------- lists
 
@@ -269,12 +320,16 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
     val applied by TunnelState.plan.collectAsState()
     var info by remember { mutableStateOf(ListsInfo()) }
     var conns by remember { mutableStateOf<List<JSONObject>>(emptyList()) }
+    var fails by remember { mutableStateOf<List<JSONObject>>(emptyList()) }
     // The lists' state, and the connections while connected.
     LaunchedEffect(active, rules) {
         while (true) {
             info = ListsInfo.parse(withContext(Dispatchers.IO) { runCatching { mobile.Mobile.listsInfo() }.getOrDefault("") })
             conns = if (active) withContext(Dispatchers.IO) {
                 runCatching { JSONArray(mobile.Mobile.conns()) }.getOrDefault(JSONArray()).let { a -> (0 until a.length()).map { a.getJSONObject(it) } }
+            } else emptyList()
+            fails = if (active) withContext(Dispatchers.IO) {
+                runCatching { JSONArray(mobile.Mobile.failures()) }.getOrDefault(JSONArray()).let { a -> (0 until a.length()).map { a.getJSONObject(it) } }
             } else emptyList()
             delay(2000)
         }
@@ -287,13 +342,47 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
     ) {
         Panel {
             Column {
-                SwitchRow(
-                    title = "Раздельное туннелирование",
-                    text = "Выбранные приложения, сайты и страны идут напрямую или через VPN. Путь выбирается для каждого нового соединения.",
-                    checked = rules.on,
-                    onChange = { update(rules.copy(on = it)) },
+                SectionTitle("Режим", Modifier.padding(bottom = 2.dp))
+                val mode = remember(rules) { rules.mode() }
+                modeTitles.forEach { (id, title) ->
+                    Row(
+                        Modifier.fillMaxWidth().clickable { update(rules.withMode(id)) }.padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(selected = mode == id, onClick = { update(rules.withMode(id)) })
+                        Spacer(Modifier.width(6.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(title, fontWeight = FontWeight.SemiBold)
+                            Text(modeTexts[id] ?: "", fontSize = 12.5.sp, color = pal.muted, lineHeight = 17.sp)
+                        }
+                    }
+                }
+                Text(
+                    "Режим добавляет нужные списки и не трогает ваши правила для приложений и сайтов. Путь выбирается для каждого нового соединения.",
+                    fontSize = 12.5.sp, color = pal.muted, lineHeight = 17.sp, modifier = Modifier.padding(top = 4.dp),
                 )
-                HorizontalDivider(color = pal.line, modifier = Modifier.padding(vertical = 6.dp))
+            }
+        }
+
+        if (active && applied != null && planNow.isNotEmpty() && planNow != applied) {
+            Banner(
+                "Нужно переподключиться",
+                "Какие приложения Android пускает в VPN, меняется только при подключении.",
+                action = "Переподключить",
+            ) { TunnelService.restart(ctx) }
+        }
+
+        ExplainPanel(rules, labels)
+
+        if (fails.isNotEmpty()) FailuresPanel(fails, rules, update) {
+            scope.launch {
+                withContext(Dispatchers.IO) { runCatching { mobile.Mobile.forgetFailures() } }
+                fails = emptyList()
+            }
+        }
+
+        Panel {
+            Column {
                 Text("Остальные приложения", fontWeight = FontWeight.SemiBold)
                 Text("Куда идут приложения, для которых нет правила", fontSize = 12.5.sp, color = pal.muted)
                 Spacer(Modifier.height(8.dp))
@@ -305,15 +394,14 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
                     checked = rules.lan,
                     onChange = { update(rules.copy(lan = it)) },
                 )
+                HorizontalDivider(color = pal.line, modifier = Modifier.padding(vertical = 2.dp))
+                SwitchRow(
+                    title = "Не открылся напрямую — через VPN",
+                    text = "Если сайт, который идёт напрямую, не отвечает или обрывает соединение (так обычно выглядит блокировка), TurnVK откроет его через VPN и предложит правило",
+                    checked = !rules.noRetry,
+                    onChange = { update(rules.copy(noRetry = !it)) },
+                )
             }
-        }
-
-        if (active && applied != null && planNow.isNotEmpty() && planNow != applied) {
-            Banner(
-                "Нужно переподключиться",
-                "Какие приложения Android пускает в VPN, меняется только при подключении.",
-                action = "Переподключить",
-            ) { TunnelService.restart(ctx) }
         }
 
         // ---- apps
@@ -483,7 +571,9 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
             Panel {
                 Column {
                     SectionTitle("Соединения сейчас", Modifier.padding(bottom = 8.dp))
-                    val groups = conns.groupBy { it.optString("path") }.entries
+                    // Connections without an app's package: Android's own
+                    // (DNS from the system resolver, system services), by UID.
+                    val groups = conns.groupBy { c -> c.optString("path").ifEmpty { c.optLong("pid").let { if (it > 0) "uid:$it" else "" } } }.entries
                         .sortedByDescending { e -> e.value.maxOf { it.optLong("last") } }
                     if (groups.isEmpty()) {
                         Text("Соединений пока нет: список заполняется, пока открыта эта вкладка.", fontSize = 12.5.sp, color = pal.muted)
@@ -497,6 +587,113 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
         }
         Note("Правила действуют сразу для новых соединений; открытые соединения сохраняют свой путь, пока приложение их не переоткроет.")
         Spacer(Modifier.height(8.dp))
+    }
+}
+
+/** "Where would this site go?": the rules' answer, with the reason. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ExplainPanel(rules: SplitRules, labels: AppLabels) {
+    val scope = rememberCoroutineScope()
+    var text by remember { mutableStateOf("") }
+    var app by remember { mutableStateOf("") }
+    var res by remember { mutableStateOf<JSONObject?>(null) }
+    var err by remember { mutableStateOf("") }
+    val go = {
+        val t = text
+        val a = app
+        if (t.isNotBlank()) scope.launch {
+            withContext(Dispatchers.IO) { runCatching { JSONObject(mobile.Mobile.explain(t, a)) } }
+                .onSuccess { res = it; err = "" }
+                .onFailure { res = null; err = it.message ?: it.toString() }
+        }
+        Unit
+    }
+    LaunchedEffect(app, rules) { if (res != null) go() }
+    Panel {
+        Column {
+            SectionTitle("Куда пойдёт сайт?", Modifier.padding(bottom = 8.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = text, onValueChange = { text = it; err = "" },
+                    placeholder = { Text("Сайт или адрес") },
+                    singleLine = true, shape = RoundedCornerShape(12.dp),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = { go() }),
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(8.dp))
+                Button(onClick = go) { Text("Проверить") }
+            }
+            val apps = rules.apps.map { it.path }.distinct()
+            if (apps.isNotEmpty()) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 6.dp)) {
+                    FilterChip(selected = app.isEmpty(), onClick = { app = "" }, label = { Text("Любое приложение", fontSize = 13.sp) })
+                    apps.forEach { p ->
+                        FilterChip(selected = app == p, onClick = { app = p }, label = { Text(labels.get(p).first, fontSize = 13.sp, maxLines = 1) })
+                    }
+                }
+            }
+            if (err.isNotEmpty()) Text(err, color = pal.err, fontSize = 12.5.sp, modifier = Modifier.padding(top = 4.dp))
+            res?.let { e ->
+                val host = e.optString("host")
+                val addr = e.optString("addr")
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        host.ifEmpty { addr } + if (host.isNotEmpty() && addr.isNotEmpty()) " ($addr)" else "",
+                        fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f, fill = false),
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    val direct = e.optString("route") == "direct"
+                    Text(
+                        if (direct) "напрямую" else "через VPN",
+                        fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+                        color = if (direct) pal.ok else pal.accent,
+                        modifier = Modifier.background(if (direct) pal.okSoft else pal.accentSoft, RoundedCornerShape(99.dp)).padding(horizontal = 8.dp, vertical = 2.dp),
+                    )
+                }
+                Text("Почему: " + e.optString("why"), fontSize = 13.sp, color = pal.muted, lineHeight = 18.sp, modifier = Modifier.padding(top = 2.dp))
+                e.optString("note").takeIf { it.isNotEmpty() }?.let {
+                    Text(it, fontSize = 12.5.sp, color = pal.muted, lineHeight = 17.sp, modifier = Modifier.padding(top = 4.dp))
+                }
+            }
+        }
+    }
+}
+
+/** Sites that did not open direct and were opened through the VPN, with a rule to add. */
+@Composable
+private fun FailuresPanel(fails: List<JSONObject>, rules: SplitRules, update: (SplitRules) -> Unit, onClear: () -> Unit) {
+    Panel {
+        Column {
+            SectionTitle("Не открылись напрямую", Modifier.padding(bottom = 4.dp))
+            Text(
+                "Эти сайты не ответили напрямую — TurnVK открыл их через VPN. Добавьте правило, чтобы они сразу шли через VPN.",
+                fontSize = 12.5.sp, color = pal.muted, lineHeight = 17.sp, modifier = Modifier.padding(bottom = 6.dp),
+            )
+            fails.forEachIndexed { i, f ->
+                if (i > 0) HorizontalDivider(color = pal.line, modifier = Modifier.padding(vertical = 4.dp))
+                val ok = f.optBoolean("ok")
+                val rule = f.optString("rule")
+                val count = f.optInt("count")
+                Text(f.optString("host").ifEmpty { f.optString("addr") }, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    f.optString("why") + (if (ok) ", открыт через VPN" else ", через VPN тоже не открылся") +
+                        (if (count > 1) " · " + plural(count, "раз", "раза", "раз") else ""),
+                    fontSize = 12.sp, color = pal.muted,
+                )
+                if (ok && rule.isNotEmpty()) {
+                    OutlinedButton(
+                        onClick = { update(rules.copy(on = true, domains = rules.domains.filter { it.domain != rule } + SiteRoute(rule, "vpn"))) },
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                        modifier = Modifier.padding(top = 4.dp).height(34.dp),
+                    ) { Text("$rule — через VPN", fontSize = 13.sp, maxLines = 1) }
+                }
+            }
+            TextButton(onClick = onClear, modifier = Modifier.padding(top = 4.dp)) { Text("Очистить список") }
+        }
     }
 }
 
@@ -570,7 +767,15 @@ private fun RuleRow(
 @Composable
 private fun ConnGroup(pkg: String, list: List<JSONObject>, labels: AppLabels, rules: SplitRules, update: (SplitRules) -> Unit) {
     var open by remember(pkg) { mutableStateOf(false) }
-    val (label, icon) = if (pkg.isEmpty()) "Неизвестное приложение" to null else labels.get(pkg)
+    val dns = list.all { it.optString("dst").substringAfterLast(':') in setOf("53", "853") }
+    val uid = pkg.removePrefix("uid:").toLongOrNull()
+    val (label, icon) = when {
+        dns && (pkg.isEmpty() || pkg.startsWith("uid:")) -> "Запросы DNS (Android)" to null
+        pkg.startsWith("uid:") && uid != null && uid < 10000 -> "Система Android (UID $uid)" to null
+        pkg.startsWith("uid:") -> "Приложение без пакета (UID $uid)" to null
+        pkg.isEmpty() -> "Не определено" to null
+        else -> labels.get(pkg)
+    }
     val direct = list.count { it.optString("route") == "direct" }
     Column(Modifier.fillMaxWidth().clickable { open = !open }.padding(vertical = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -599,7 +804,7 @@ private fun ConnGroup(pkg: String, list: List<JSONObject>, labels: AppLabels, ru
                     modifier = Modifier.padding(start = 38.dp, top = 4.dp),
                 )
             }
-            if (pkg.isNotEmpty()) {
+            if (pkg.isNotEmpty() && !pkg.startsWith("uid:")) {
                 Row(Modifier.padding(start = 38.dp, top = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = { update(rules.withApp(pkg, "direct")) }) { Text("Напрямую") }
                     OutlinedButton(onClick = { update(rules.withApp(pkg, "vpn")) }) { Text("Через VPN") }

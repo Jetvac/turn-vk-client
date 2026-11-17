@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,6 +23,9 @@ type UIDOwner struct {
 	UID func(proto uint8, local, remote netip.AddrPort) int
 	// Names returns the packages with a UID.
 	Names func(uid int) []string
+	// Logf notes the first lookups that fail (nil: none).
+	Logf   func(string, ...any)
+	missed atomic.Int32
 
 	mu    sync.Mutex
 	names map[int]uidNames
@@ -43,6 +47,13 @@ func (o *UIDOwner) Lookup(proto uint8, local, remote netip.AddrPort, _ bool) *Pr
 		uid = procNetUID(proto, local, remote)
 	}
 	if uid < 0 {
+		if o.Logf != nil && o.missed.Add(1) <= 3 {
+			name := "TCP"
+			if proto == protoUDP {
+				name = "UDP"
+			}
+			o.Logf("split: Android did not say whose %s %s -> %s is", name, local, remote)
+		}
 		return nil
 	}
 	p := &Proc{PID: uint32(uid)}

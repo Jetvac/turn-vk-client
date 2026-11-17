@@ -32,6 +32,8 @@ type Options struct {
 	Resolver interface {
 		LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error)
 	}
+	// Addr is the tunnel's address (for DialVPN).
+	Addr netip.Addr
 	// Self is TurnVK's own ID as Owner reports it (0: this process's ID);
 	// its connections go through the VPN.
 	Self uint32
@@ -103,6 +105,9 @@ type Router struct {
 	relay    *vpnRelay
 	relayMu  sync.Mutex
 	relayN   atomic.Int32 // open relayed connections
+
+	fmu    sync.Mutex
+	failed map[string]*Failure // sites that did not open direct (retry.go)
 }
 
 type flow struct {
@@ -128,6 +133,15 @@ type flow struct {
 	quic     *quicSniff
 	relayed  atomic.Bool // TCP relayed into the VPN by the router
 	proc     *Proc
+	// prelim: the route before the name is read.
+	prelim Decision
+	// retry: sent direct, it is tried through the VPN when it does not
+	// open; viaVPN: it did not open direct lately, so it goes through the
+	// VPN at once (a placeholder: through the router).
+	retry  bool
+	viaVPN bool
+	// hidden: the router's own half of another connection (not listed).
+	hidden bool
 }
 
 func (f *flow) touch(now int64) { f.last.Store(now) }
@@ -405,11 +419,27 @@ func (r *Router) newFlow(p *pkt, m *matcher, now int64) *flow {
 			if p.key.proto == protoUDP {
 				f.quic = &quicSniff{prelim: d}
 			}
-			// Relaying into the VPN needs the pump: start it now, while
-			// the computer still sends (the next Read starts it).
-			r.wantPump.Store(true)
 		}
 	}
+	// A site sent direct is accepted here, to be tried through the VPN if
+	// it does not open (not the local network).
+	f.retry = m.retry && p.key.proto == protoTCP && sniffPort(protoTCP, p.key.dst.Port()) && !p.frag && (!fixed || fake)
+	if f.retry && d.Route == Direct {
+		f.sniffing = true
+		if r.failedBefore(f.host, dst) {
+			f.viaVPN = true
+			if !fake {
+				d = Decision{VPN, whyFailed}
+				f.sniffing = f.host == "" && m.sniffable(VPN)
+			}
+		}
+	}
+	if f.sniffing {
+		// Relaying into the VPN needs the pump: start it now, while the
+		// computer still sends (the next Read starts it).
+		r.wantPump.Store(true)
+	}
+	f.prelim = d
 	f.route, f.why = d.Route, d.Why
 	f.proc = proc
 	f.local.Store(d.Route == Direct || f.sniffing)
@@ -560,6 +590,9 @@ func (r *Router) Conns(limit int) []Conn {
 	r.mu.Lock()
 	out := make([]Conn, 0, len(r.flows))
 	for k, f := range r.flows {
+		if f.hidden {
+			continue
+		}
 		c := Conn{Proto: "TCP", Src: k.src.String(), Dst: k.dst.String(), PID: f.pid, Path: f.path, Route: f.route, Why: f.why,
 			Host: f.host, Up: f.up.Load(), Down: f.down.Load(), Start: f.start.UnixMilli(), Last: f.last.Load() / 1e6, Closed: f.closed.Load()}
 		if k.proto == protoUDP {

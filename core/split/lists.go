@@ -8,10 +8,14 @@ package split
 // Russia, sites that open only from inside).
 
 import (
+	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -178,16 +182,12 @@ func LoadLists(dir string, rules []ListRule) (*Lists, error) {
 	l := &Lists{IP: map[string]*IPSet{}, Site: map[string]*SiteSet{}}
 	var errs []error
 	if len(ip) > 0 {
-		if b, err := os.ReadFile(dir + string(os.PathSeparator) + GeoIPFile); err != nil {
-			errs = append(errs, err)
-		} else if err := readGeoIP(b, ip, l.IP); err != nil {
+		if err := readGeoIP(filepath.Join(dir, GeoIPFile), ip, l.IP); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", GeoIPFile, err))
 		}
 	}
 	if len(site) > 0 {
-		if b, err := os.ReadFile(dir + string(os.PathSeparator) + GeoSiteFile); err != nil {
-			errs = append(errs, err)
-		} else if err := readGeoSite(b, site, l.Site); err != nil {
+		if err := readGeoSite(filepath.Join(dir, GeoSiteFile), site, l.Site); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", GeoSiteFile, err))
 		}
 	}
@@ -196,15 +196,11 @@ func LoadLists(dir string, rules []ListRule) (*Lists, error) {
 
 // ListNames returns the names of all lists in a file ("ru", "youtube"...).
 func ListNames(path string) ([]string, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
 	var out []string
-	err = eachEntry(b, func(code string, _ []byte) error {
+	err := scanDat(path, func(code string) bool {
 		out = append(out, code)
-		return nil
-	})
+		return false
+	}, nil)
 	sort.Strings(out)
 	return out, err
 }
@@ -278,32 +274,73 @@ func fields(b []byte, f func(num int, v uint64, data []byte) error) error {
 	return nil
 }
 
-// eachEntry calls f for every list in a file with its (lower-case) name
-// and body.
-func eachEntry(b []byte, f func(code string, entry []byte) error) error {
-	return fields(b, func(num int, _ uint64, entry []byte) error {
-		if num != 1 || entry == nil {
-			return nil
-		}
-		var code string
-		fields(entry, func(num int, _ uint64, d []byte) error {
-			if num == 1 && d != nil {
-				code = strings.ToLower(string(d))
-				return errStop
-			}
-			return nil
-		})
-		if code == "" {
-			return nil
-		}
-		return f(code, entry)
-	})
-}
-
 var errStop = errors.New("stop")
 
-func readGeoIP(b []byte, want map[string]bool, out map[string]*IPSet) error {
-	return eachEntry(b, func(code string, entry []byte) error {
+// scanDat reads a .dat file list by list without holding it all (the
+// site file is near 90 MB): want sees each list's name, and only the
+// lists it wants are read whole and given to f.
+func scanDat(path string, want func(code string) bool, f func(code string, entry []byte) error) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	br := bufio.NewReaderSize(file, 64<<10)
+	for {
+		tag, err := binary.ReadUvarint(br)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return errBad
+		}
+		switch tag & 7 {
+		case 0:
+			if _, err := binary.ReadUvarint(br); err != nil {
+				return errBad
+			}
+			continue
+		case 2:
+		default:
+			return errBad
+		}
+		l, err := binary.ReadUvarint(br)
+		if err != nil || l > 1<<30 {
+			return errBad
+		}
+		if tag>>3 != 1 {
+			if _, err := br.Discard(int(l)); err != nil {
+				return errBad
+			}
+			continue
+		}
+		// The list's name is its first field: peek at it.
+		head, _ := br.Peek(int(min(l, 256)))
+		var code string
+		fields(head, func(num int, _ uint64, d []byte) error {
+			if num == 1 && d != nil {
+				code = strings.ToLower(string(d))
+			}
+			return errStop
+		})
+		if code == "" || !want(code) || f == nil {
+			if _, err := br.Discard(int(l)); err != nil {
+				return errBad
+			}
+			continue
+		}
+		entry := make([]byte, l)
+		if _, err := io.ReadFull(br, entry); err != nil {
+			return errBad
+		}
+		if err := f(code, entry); err != nil {
+			return err
+		}
+	}
+}
+
+func readGeoIP(path string, want map[string]bool, out map[string]*IPSet) error {
+	return scanDat(path, func(c string) bool { return want[c] }, func(code string, entry []byte) error {
 		if !want[code] {
 			return nil
 		}
@@ -349,8 +386,8 @@ func readGeoIP(b []byte, want map[string]bool, out map[string]*IPSet) error {
 	})
 }
 
-func readGeoSite(b []byte, want map[string]bool, out map[string]*SiteSet) error {
-	return eachEntry(b, func(code string, entry []byte) error {
+func readGeoSite(path string, want map[string]bool, out map[string]*SiteSet) error {
+	return scanDat(path, func(c string) bool { return want[c] }, func(code string, entry []byte) error {
 		if !want[code] {
 			return nil
 		}

@@ -15,10 +15,13 @@ package split
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"sync"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -214,4 +217,103 @@ func (v *vpnRelay) close() {
 	})
 	v.ep.Close()
 	v.s.Close()
+}
+
+// UsePump makes the router ready to send packets of its own (DialVPN)
+// from the next adapter read on.
+func (r *Router) UsePump() { r.wantPump.Store(true) }
+
+// DialVPN opens a TCP connection of TurnVK's own through the VPN, from the
+// tunnel's address (Options.Addr): for an app whose own sockets go around
+// the tunnel (Android), to reach what the physical network blocks.
+func (r *Router) DialVPN(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+	return r.dialVPN(ctx, dst, &flow{route: VPN, why: "TurnVK через VPN", path: "TurnVK", start: time.Now()})
+}
+
+// dialVPN opens a connection of the router's own through the VPN, from a
+// free port of the tunnel's address (Options.Addr); f describes it.
+func (r *Router) dialVPN(ctx context.Context, dst netip.AddrPort, f *flow) (net.Conn, error) {
+	if !r.o.Addr.Is4() || !dst.Addr().Is4() {
+		return nil, errors.New("no tunnel address")
+	}
+	rl, err := r.startRelay()
+	if err != nil {
+		return nil, err
+	}
+	r.wantPump.Store(true)
+	// A free port: no connection of the computer's uses it to dst.
+	var key flowKey
+	r.mu.Lock()
+	for i := 0; ; i++ {
+		key = flowKey{protoTCP, netip.AddrPortFrom(r.o.Addr, uint16(61000+rand.IntN(4000))), dst}
+		if r.flows[key] == nil || i > 50 {
+			break
+		}
+	}
+	f.key = key
+	f.touch(time.Now().UnixNano())
+	f.relayed.Store(true)
+	r.flows[key] = f
+	r.mu.Unlock()
+	r.relayN.Add(1)
+	c, err := rl.dial(ctx, key.src, dst)
+	if err != nil {
+		f.relayed.Store(false)
+		f.closed.Store(true)
+		r.relayN.Add(-1)
+		return nil, err
+	}
+	return &relayConn{Conn: c, done: func() {
+		f.closed.Store(true)
+		if f.relayed.CompareAndSwap(true, false) {
+			r.relayN.Add(-1)
+		}
+	}}, nil
+}
+
+// VPNResolver resolves names through the tunnel's DNS servers, over TCP
+// connections of DialVPN.
+func (r *Router) VPNResolver() *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var last error = errors.New("no DNS servers in the tunnel")
+			for _, d := range r.o.DNS {
+				c, err := r.DialVPN(ctx, netip.AddrPortFrom(d, 53))
+				if err == nil {
+					return c, nil
+				}
+				last = err
+			}
+			return nil, last
+		},
+	}
+}
+
+// VPNDialContext dials "host:port" through the VPN (for http.Transport).
+func (r *Router) VPNDialContext(ctx context.Context, _, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	p, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := r.VPNResolver().LookupNetIP(ctx, "ip4", host)
+	if err != nil {
+		return nil, err
+	}
+	var last error
+	for i, a := range addrs {
+		if i == 3 {
+			break
+		}
+		c, err := r.DialVPN(ctx, netip.AddrPortFrom(a.Unmap(), uint16(p)))
+		if err == nil {
+			return c, nil
+		}
+		last = err
+	}
+	return nil, last
 }

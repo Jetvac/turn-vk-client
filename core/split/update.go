@@ -8,9 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -20,10 +23,16 @@ import (
 // rebuilt every 6 hours.
 var ListSources = []string{
 	"https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release/",
+	"https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/",
 	"https://cdn.jsdelivr.net/gh/runetfreedom/russia-v2ray-rules-dat@release/",
 }
 
-const maxListFile = 200 << 20
+const maxListFile = 300 << 20
+
+// ListMinAge: a file this fresh is not checked again unless asked (the
+// lists are rebuilt every 6 hours, and the site file is near 90 MB: not
+// to download it twice a day over mobile data).
+var ListMinAge = 3 * 24 * time.Hour
 
 // NeededFiles: the files the rules' lists are in.
 func NeededFiles(rules []ListRule) []string {
@@ -63,35 +72,88 @@ func ListFiles(dir string) []ListFile {
 	return out
 }
 
-// UpdateLists downloads the files that changed at the source; changed
-// lists the files replaced. A file is replaced only once it is whole and
-// matches its checksum.
-func UpdateLists(ctx context.Context, c *http.Client, dir string, files []string) (changed []string, err error) {
+// ListClient is a way to the sources: Via names it in errors ("через VPN").
+type ListClient struct {
+	Via string
+	C   *http.Client
+}
+
+// UpdateLists downloads the files that changed at the source, trying each
+// client with each source in turn; changed lists the files replaced. A file
+// is replaced only once it is whole and matches its checksum. Without
+// force, files younger than ListMinAge are left alone.
+func UpdateLists(ctx context.Context, dir string, files []string, force bool, clients ...ListClient) (changed []string, err error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
 	var errs []error
 	for _, f := range files {
-		var ferr error
-		for _, src := range ListSources {
-			var ok bool
-			ok, ferr = updateFile(ctx, c, src, dir, f)
-			if ferr == nil {
-				if ok {
-					changed = append(changed, f)
+		if st, err := os.Stat(filepath.Join(dir, f)); err == nil && !force && time.Since(st.ModTime()) < ListMinAge {
+			continue
+		}
+		var tries []string
+		done := false
+		for _, c := range clients {
+			for _, src := range ListSources {
+				ok, ferr := updateFile(ctx, c.C, src, dir, f)
+				if ferr == nil {
+					if ok {
+						changed = append(changed, f)
+					}
+					done = true
+					break
 				}
+				if ctx.Err() != nil {
+					return changed, ctx.Err()
+				}
+				t := hostOfURL(src) + " — " + shortErr(ferr)
+				if c.Via != "" {
+					t = c.Via + ", " + t
+				}
+				tries = append(tries, t)
+			}
+			if done {
 				break
 			}
-			if ctx.Err() != nil {
-				return changed, ctx.Err()
-			}
 		}
-		if ferr != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", f, ferr))
+		if !done {
+			errs = append(errs, fmt.Errorf("%s не скачался (%s)", f, strings.Join(tries, "; ")))
 		}
 	}
 	return changed, errors.Join(errs...)
 }
+
+func hostOfURL(s string) string {
+	if u, err := url.Parse(s); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return s
+}
+
+// shortErr says what went wrong in a few words.
+func shortErr(err error) string {
+	var se statusError
+	if errors.As(err, &se) {
+		return "HTTP " + strconv.Itoa(int(se))
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return "нет ответа"
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		err = ue.Err
+	}
+	s := err.Error()
+	if len(s) > 80 {
+		s = s[:80] + "…"
+	}
+	return s
+}
+
+type statusError int
+
+func (e statusError) Error() string { return "HTTP " + strconv.Itoa(int(e)) }
 
 func get(ctx context.Context, c *http.Client, url string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -104,7 +166,7 @@ func get(ctx context.Context, c *http.Client, url string) (*http.Response, error
 	}
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, fmt.Errorf("%s: %s", url, resp.Status)
+		return nil, statusError(resp.StatusCode)
 	}
 	return resp, nil
 }

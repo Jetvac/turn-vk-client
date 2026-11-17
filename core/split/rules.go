@@ -59,6 +59,9 @@ type Rules struct {
 	// addresses of a country or a service (after the rules for programs:
 	// they refine "the other programs").
 	Lists []ListRule `json:"lists"`
+	// NoRetry: a site sent direct that does not open is not tried again
+	// through the VPN.
+	NoRetry bool `json:"noRetry,omitempty"`
 }
 
 // DefaultRules: off; when turned on, everything goes through the VPN except
@@ -194,6 +197,8 @@ type matcher struct {
 	// anyDirect: something goes direct beside programs (TurnVK's own
 	// connections have to be told apart).
 	anyDirect bool
+	// retry: sites sent direct that do not open are tried through the VPN.
+	retry bool
 }
 
 type siteList struct {
@@ -218,6 +223,7 @@ func newMatcher(r Rules, alwaysVPN []netip.Prefix, lists *Lists) *matcher {
 	r.Normalize()
 	m := &matcher{rules: r, exact: map[string]*AppRule{}, norm: map[*AppRule]string{}, vpn: alwaysVPN}
 	if r.On {
+		m.retry = !r.NoRetry
 		m.dom = newDomains(r.Domains)
 		m.directSites = m.dom.hasDirect()
 		for _, d := range m.dom {
