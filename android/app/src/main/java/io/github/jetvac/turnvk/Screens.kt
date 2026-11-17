@@ -144,7 +144,7 @@ import kotlinx.coroutines.withContext
 // pale background (dark: deep blue-grey), green for a working connection.
 
 /** Colours Material's scheme has no slot for. */
-private data class Palette(
+internal data class Palette(
     val card: Color,
     val card2: Color,
     val line: Color,
@@ -218,11 +218,11 @@ fun TurnVKTheme(content: @Composable () -> Unit) {
     }
 }
 
-private val pal: Palette @Composable get() = LocalPalette.current
+internal val pal: Palette @Composable get() = LocalPalette.current
 
 // ---------------------------------------------------------------- app
 
-private enum class Tab(val label: String) { Home("Главная"), Servers("Серверы"), Settings("Настройки"), Logs("Журнал") }
+private enum class Tab(val label: String) { Home("Главная"), Servers("Серверы"), Routes("Маршруты"), Settings("Настройки"), Logs("Журнал") }
 
 /** Live numbers polled from the engine once a second while connected. */
 private data class Live(val status: Status = Status(), val rxRate: Long = 0, val txRate: Long = 0)
@@ -231,6 +231,9 @@ private data class Live(val status: Status = Status(), val rxRate: Long = 0, val
 fun App(store: Store, imported: MutableState<String?>, connect: () -> Unit) {
     var tab by remember { mutableStateOf(Tab.Home) }
     var apps by remember { mutableStateOf(false) }
+    // The split tunneling rules, saved and given to the engine on change.
+    var rules by remember { mutableStateOf(applyRules(store, SplitRules.parse(store.split))) }
+    val updateRules: (SplitRules) -> Unit = { rules = applyRules(store, it) }
     // Bumped when the store changes, so that screens re-read it.
     var revision by remember { mutableIntStateOf(0) }
     val refresh: () -> Unit = { revision++ }
@@ -302,7 +305,7 @@ fun App(store: Store, imported: MutableState<String?>, connect: () -> Unit) {
     }
 
     if (apps) {
-        AppsScreen(store, refresh, onBack = { apps = false })
+        AppsScreen(rules, onPick = { pkg -> updateRules(rules.withApp(pkg, rules.other)); apps = false }, onBack = { apps = false })
         return
     }
 
@@ -327,6 +330,7 @@ fun App(store: Store, imported: MutableState<String?>, connect: () -> Unit) {
                             when (t) {
                                 Tab.Home -> Icon(painterResource(R.drawable.ic_shield_outline), null, Modifier.size(22.dp))
                                 Tab.Servers -> Icon(painterResource(R.drawable.ic_server), null, Modifier.size(22.dp))
+                                Tab.Routes -> Icon(painterResource(R.drawable.ic_routes), null, Modifier.size(22.dp))
                                 Tab.Settings -> Icon(Icons.Filled.Settings, null)
                                 Tab.Logs -> Icon(Icons.AutoMirrored.Filled.List, null)
                             }
@@ -348,7 +352,8 @@ fun App(store: Store, imported: MutableState<String?>, connect: () -> Unit) {
             when (tab) {
                 Tab.Home -> HomeTab(store, revision, refresh, s, live, history, now, connect, onServers = { tab = Tab.Servers })
                 Tab.Servers -> ServersTab(store, revision, refresh, s.active)
-                Tab.Settings -> SettingsTab(store, revision, refresh, s.active, onApps = { apps = true })
+                Tab.Routes -> RoutesTab(store, rules, updateRules, s.active, onAddApp = { apps = true })
+                Tab.Settings -> SettingsTab(store, revision, refresh, s.active)
                 Tab.Logs -> LogsTab()
             }
         }
@@ -408,14 +413,14 @@ private fun Header(s: Status, captcha: Boolean) {
 
 /** A white rounded card, as on the Windows app. */
 @Composable
-private fun Panel(modifier: Modifier = Modifier, padding: Dp = 16.dp, content: @Composable () -> Unit) {
+internal fun Panel(modifier: Modifier = Modifier, padding: Dp = 16.dp, content: @Composable () -> Unit) {
     Surface(modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), color = pal.card, shadowElevation = 1.dp) {
         Box(Modifier.padding(padding)) { content() }
     }
 }
 
 @Composable
-private fun SectionTitle(text: String, modifier: Modifier = Modifier) {
+internal fun SectionTitle(text: String, modifier: Modifier = Modifier) {
     Text(
         text.uppercase(),
         fontSize = 12.sp,
@@ -427,7 +432,7 @@ private fun SectionTitle(text: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun Note(text: String, modifier: Modifier = Modifier) {
+internal fun Note(text: String, modifier: Modifier = Modifier) {
     Row(modifier.padding(horizontal = 4.dp), verticalAlignment = Alignment.Top) {
         Icon(Icons.Filled.Info, null, Modifier.size(16.dp).padding(top = 1.dp), tint = pal.muted)
         Spacer(Modifier.width(8.dp))
@@ -436,7 +441,7 @@ private fun Note(text: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun Banner(title: String, text: String, action: String? = null, error: Boolean = false, onAction: () -> Unit = {}) {
+internal fun Banner(title: String, text: String, action: String? = null, error: Boolean = false, onAction: () -> Unit = {}) {
     Row(
         Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(if (error) pal.errSoft else pal.warnSoft).padding(14.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -945,14 +950,13 @@ private fun ProfileDialog(
 // ---------------------------------------------------------------- settings
 
 @Composable
-private fun SettingsTab(store: Store, revision: Int, refresh: () -> Unit, active: Boolean, onApps: () -> Unit) {
+private fun SettingsTab(store: Store, revision: Int, refresh: () -> Unit, active: Boolean) {
     val ctx = LocalContext.current
     var sessions by remember(revision) { mutableFloatStateOf(store.sessions.toFloat().coerceIn(8f, 64f)) }
     var obfs by remember(revision) { mutableStateOf(store.obfs) }
     var captchaAuto by remember(revision) { mutableStateOf(store.captchaAuto) }
     var boot by remember(revision) { mutableStateOf(store.bootConnect) }
     var srvStats by remember(revision) { mutableStateOf(store.serverStats) }
-    val excluded = remember(revision) { store.excludedApps.size }
     // Re-checked whenever the screen is shown again (after the system pages).
     var resumes by remember { mutableIntStateOf(0) }
     LifecycleResumeEffect(Unit) {
@@ -1017,17 +1021,6 @@ private fun SettingsTab(store: Store, revision: Int, refresh: () -> Unit, active
                     text = "Раз в минуту: скорость, маршруты, задержки, потери и ошибки — чтобы владелец сервера мог улучшать работу. Адреса сайтов и содержимое трафика не отправляются.",
                     checked = srvStats,
                     onChange = { srvStats = it; store.serverStats = it; refresh() },
-                )
-            }
-        }
-
-        Panel(padding = 0.dp) {
-            Column {
-                SectionTitle("Приложения", Modifier.padding(start = 16.dp, top = 16.dp))
-                ClickRow(
-                    title = "Приложения в обход VPN",
-                    text = (if (excluded > 0) "Выбрано: $excluded. " else "") + "Приложения VK всегда идут в обход, чтобы звонки работали.",
-                    onClick = onApps,
                 )
             }
         }
@@ -1107,7 +1100,7 @@ private fun SettingsTab(store: Store, revision: Int, refresh: () -> Unit, active
 
 /** A setting with a switch; [inset] adds the side padding of a list row. */
 @Composable
-private fun SwitchRow(title: String, text: String, checked: Boolean, onChange: (Boolean) -> Unit, inset: Boolean = false) {
+internal fun SwitchRow(title: String, text: String, checked: Boolean, onChange: (Boolean) -> Unit, inset: Boolean = false) {
     Row(
         Modifier.fillMaxWidth().clickable { onChange(!checked) }
             .padding(horizontal = if (inset) 16.dp else 0.dp, vertical = 10.dp),
@@ -1265,75 +1258,9 @@ private fun LogButton(text: String, onClick: () -> Unit) {
 
 // ---------------------------------------------------------------- apps
 
-private class AppEntry(val pkg: String, val label: String, val icon: androidx.compose.ui.graphics.ImageBitmap?)
+internal class AppEntry(val pkg: String, val label: String, val icon: androidx.compose.ui.graphics.ImageBitmap?)
 
-@Composable
-private fun AppsScreen(store: Store, refresh: () -> Unit, onBack: () -> Unit) {
-    val ctx = LocalContext.current
-    var apps by remember { mutableStateOf<List<AppEntry>?>(null) }
-    var selected by remember { mutableStateOf(store.excludedApps) }
-    var query by remember { mutableStateOf("") }
-    LaunchedEffect(Unit) { apps = withContext(Dispatchers.IO) { loadApps(ctx) } }
-    val save = { set: Set<String> ->
-        selected = set
-        store.excludedApps = set
-        refresh()
-    }
-
-    Scaffold(
-        containerColor = MaterialTheme.colorScheme.background,
-        topBar = {
-            TopAppBar(
-                title = { Text("В обход VPN", fontWeight = FontWeight.SemiBold) },
-                navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Назад") } },
-                actions = { if (selected.isNotEmpty()) TextButton(onClick = { save(emptySet()) }) { Text("Сбросить") } },
-            )
-        },
-    ) { pad ->
-        Column(Modifier.fillMaxSize().padding(pad)) {
-            Note(
-                "Отмеченные приложения ходят в интернет напрямую, без VPN: например, банки или сервисы, которым нужен ваш обычный адрес.",
-                Modifier.padding(horizontal = 12.dp),
-            )
-            OutlinedTextField(
-                value = query,
-                onValueChange = { query = it },
-                leadingIcon = { Icon(Icons.Filled.Search, null) },
-                placeholder = { Text("Поиск") },
-                singleLine = true,
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.fillMaxWidth().padding(16.dp),
-            )
-            val list = apps
-            if (list == null) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
-            } else {
-                val shown = list.filter { query.isBlank() || it.label.contains(query, true) || it.pkg.contains(query, true) }
-                    .sortedWith(compareByDescending<AppEntry> { it.pkg in selected }.thenBy { it.label.lowercase() })
-                LazyColumn(Modifier.fillMaxSize()) {
-                    items(shown, key = { it.pkg }) { a ->
-                        val forced = a.pkg in TunnelService.BYPASS
-                        val on = forced || a.pkg in selected
-                        ListItem(
-                            headlineContent = { Text(a.label) },
-                            supportingContent = { Text(if (forced) "всегда в обход" else a.pkg, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                            leadingContent = {
-                                if (a.icon != null) Image(a.icon, null, Modifier.size(36.dp)) else Spacer(Modifier.size(36.dp))
-                            },
-                            trailingContent = {
-                                Checkbox(checked = on, enabled = !forced, onCheckedChange = { c -> save(if (c) selected + a.pkg else selected - a.pkg) })
-                            },
-                            colors = ListItemDefaults.colors(containerColor = Color.Transparent),
-                            modifier = Modifier.clickable(enabled = !forced) { save(if (on) selected - a.pkg else selected + a.pkg) },
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-private fun loadApps(ctx: Context): List<AppEntry> {
+internal fun loadApps(ctx: Context): List<AppEntry> {
     val pm = ctx.packageManager
     val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
     val infos = if (Build.VERSION.SDK_INT >= 33) {

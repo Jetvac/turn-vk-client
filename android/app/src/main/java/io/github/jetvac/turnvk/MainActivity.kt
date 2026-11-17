@@ -43,6 +43,12 @@ class MainActivity : ComponentActivity() {
         ) {
             notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
+        // The engine gets the rules and lists before anything connects.
+        Thread {
+            mobile.Mobile.setDataDir(filesDir.absolutePath)
+            runCatching { mobile.Mobile.setSplit(store.split) }
+            mobile.Mobile.loadLists()
+        }.start()
         setContent {
             TurnVKTheme {
                 App(store = store, imported = imported, connect = ::connect)

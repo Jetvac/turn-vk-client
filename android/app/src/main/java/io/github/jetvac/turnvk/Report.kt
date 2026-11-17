@@ -50,7 +50,7 @@ fun buildReport(ctx: Context): String {
 
     val settings = listOf(
         "routes: ${store.sessions}, disguise: ${store.obfs}, auto captcha: ${store.captchaAuto}, connect at boot: ${store.bootConnect}",
-        "apps bypassing the VPN: ${store.excludedApps.size}, saved servers: ${store.profiles.size}",
+        "split tunneling: ${describeSplit(SplitRules.parse(store.split))}, saved servers: ${store.profiles.size}",
     )
     return mobile.Mobile.report(
         "TurnVK Android ${BuildConfig.VERSION_NAME}",

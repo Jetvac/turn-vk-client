@@ -38,6 +38,7 @@ func (a *app) report() {
 		Settings: []string{
 			fmt.Sprintf("routes: %d, disguise: %s, connect at start: %v", a.s.Sessions, a.s.Obfs, a.s.ConnectOnStart),
 			fmt.Sprintf("saved servers: %d", len(a.s.Profiles)),
+			"split tunneling: " + describeSplit(a.s.Split),
 		},
 		Error: a.lastErr,
 		Log:   append([]string(nil), a.logs...),

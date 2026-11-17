@@ -86,6 +86,15 @@ object TunnelState {
     private val _log = MutableStateFlow<List<String>>(emptyList())
     val log: StateFlow<List<String>> = _log.asStateFlow()
 
+    /**
+     * Which apps Android lets into the VPN (mobile.AppPlan) as set when the
+     * VPN interface was created; null while not connected.
+     */
+    private val _plan = MutableStateFlow<String?>(null)
+    val plan: StateFlow<String?> = _plan.asStateFlow()
+
+    fun setPlan(p: String?) { _plan.value = p }
+
     fun setStatus(s: Status) { _status.value = s }
     fun setCaptcha(url: String?) { _captcha.value = url }
     fun setError(e: String?) { _error.value = e }

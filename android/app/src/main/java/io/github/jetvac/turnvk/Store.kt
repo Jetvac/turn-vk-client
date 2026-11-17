@@ -99,11 +99,22 @@ class Store(ctx: Context) {
             p.edit().putBoolean("server_stats", v).apply()
         }
 
-    /** Packages whose traffic goes around the tunnel. */
-    var excludedApps: Set<String>
-        get() = p.getStringSet("excluded_apps", emptySet())?.toSet() ?: emptySet()
+    /**
+     * Split tunneling rules (JSON, as the engine keeps them; see
+     * SplitRules). The apps an older version let around the tunnel become
+     * rules sending them direct.
+     */
+    var split: String
+        get() {
+            p.getString("split", null)?.let { return it }
+            val old = p.getStringSet("excluded_apps", emptySet()).orEmpty()
+            if (old.isEmpty()) return ""
+            val r = SplitRules(on = true, apps = old.sorted().map { AppRoute(it, "direct") }).toJson()
+            p.edit().putString("split", r).remove("excluded_apps").apply()
+            return r
+        }
         set(v) {
-            p.edit().putStringSet("excluded_apps", v).apply()
+            p.edit().putString("split", v).apply()
         }
 
     companion object {

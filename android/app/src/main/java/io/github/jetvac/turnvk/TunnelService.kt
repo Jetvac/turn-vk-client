@@ -16,6 +16,9 @@ import android.net.VpnService
 import android.os.Build
 import android.provider.Settings
 import android.service.quicksettings.TileService
+import org.json.JSONObject
+import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.util.concurrent.Executors
 
 /**
@@ -30,6 +33,7 @@ class TunnelService : VpnService(), mobile.Platform {
     companion object {
         const val ACTION_CONNECT = "connect"
         const val ACTION_DISCONNECT = "disconnect"
+        const val ACTION_RESTART = "restart"
 
         private const val CHANNEL = "tunnel"
         private const val CHANNEL_CAPTCHA = "captcha"
@@ -41,6 +45,12 @@ class TunnelService : VpnService(), mobile.Platform {
 
         fun connect(ctx: Context) {
             val i = Intent(ctx, TunnelService::class.java).setAction(ACTION_CONNECT)
+            if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
+        }
+
+        /** Reconnects, so that a new list of apps let into the VPN applies. */
+        fun restart(ctx: Context) {
+            val i = Intent(ctx, TunnelService::class.java).setAction(ACTION_RESTART)
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
         }
 
@@ -67,6 +77,15 @@ class TunnelService : VpnService(), mobile.Platform {
             }
             // The app, the tile and the boot receiver send ACTION_CONNECT;
             // always-on VPN starts the service with SERVICE_INTERFACE.
+            ACTION_RESTART -> {
+                startForegroundCompat(note("Переподключение…"))
+                worker.execute {
+                    log("переподключение: изменились правила для приложений")
+                    mobile.Mobile.stop()
+                    TunnelState.setPlan(null)
+                    run()
+                }
+            }
             ACTION_CONNECT, SERVICE_INTERFACE, null -> {
                 startForegroundCompat(note("Подключение…"))
                 worker.execute { run() }
@@ -91,6 +110,9 @@ class TunnelService : VpnService(), mobile.Platform {
             mobile.Mobile.setCaptchaMode(if (store.captchaAuto) "auto" else "manual")
             // VK guest tokens are kept here between runs: fewer captchas.
             mobile.Mobile.setDataDir(filesDir.absolutePath)
+            // The rules the user set (the service may start without the app).
+            runCatching { mobile.Mobile.setSplit(store.split) }
+            mobile.Mobile.loadLists()
             mobile.Mobile.setStats(store.serverStats, "TurnVK ${BuildConfig.VERSION_NAME} android")
             mobile.Mobile.start(profile.link, deviceId, sessions.toLong(), store.obfs, this)
             watchNetwork()
@@ -110,6 +132,7 @@ class TunnelService : VpnService(), mobile.Platform {
         unwatchNetwork()
         worker.execute {
             mobile.Mobile.stop()
+            TunnelState.setPlan(null)
             clearCaptcha(this)
             val s = TunnelState.status.value
             if (s.state != "failed") TunnelState.setStatus(Status(state = "stopped"))
@@ -144,15 +167,36 @@ class TunnelService : VpnService(), mobile.Platform {
         // does not leak around the VPN.
         runCatching { b.addAddress("fd00:7475:726e::1", 128).addRoute("::", 0) }
         dns.split(",").map { it.trim() }.filter { it.isNotEmpty() }.forEach { runCatching { b.addDnsServer(it) } }
-        // The app's own sockets (TURN, VK API), VK apps and the apps the
-        // user excluded go around the tunnel.
-        runCatching { b.addDisallowedApplication(packageName) }
-        (BYPASS + store.excludedApps).toSet().forEach { p ->
-            try {
-                b.addDisallowedApplication(p)
-            } catch (_: PackageManager.NameNotFoundException) {
+        // Which apps enter the tunnel (split tunneling, mobile.AppPlan).
+        val planJson = runCatching { mobile.Mobile.appPlan() }.getOrDefault("")
+        val plan = runCatching { JSONObject(planJson) }.getOrNull()
+        val planApps = plan?.optJSONArray("apps")?.let { a -> (0 until a.length()).map { a.getString(it) } }.orEmpty()
+        if (plan?.optString("mode") == "allow") {
+            // Only the apps sent through the VPN. With none (or none
+            // installed), the app itself, so that the list is not empty:
+            // an empty list lets every app in.
+            var added = 0
+            planApps.filter { it != packageName && it !in BYPASS }.forEach { p ->
+                try {
+                    b.addAllowedApplication(p)
+                    added++
+                } catch (_: PackageManager.NameNotFoundException) {
+                }
+            }
+            if (added == 0) b.addAllowedApplication(packageName)
+        } else {
+            // The app's own sockets (TURN, VK API, captcha), VK apps and the
+            // apps sent direct that no rule can bring back go around the
+            // tunnel.
+            runCatching { b.addDisallowedApplication(packageName) }
+            (BYPASS + planApps).toSet().forEach { p ->
+                try {
+                    b.addDisallowedApplication(p)
+                } catch (_: PackageManager.NameNotFoundException) {
+                }
             }
         }
+        TunnelState.setPlan(planJson)
         if (Build.VERSION.SDK_INT >= 29) b.setMetered(false)
         b.setConfigureIntent(
             PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
@@ -222,6 +266,22 @@ class TunnelService : VpnService(), mobile.Platform {
     override fun onCaptchaDone() = clearCaptcha(this)
 
     override fun log(line: String) = TunnelState.log(line)
+
+    /** The app behind a connection in the tunnel (Android 10+; -1: unknown). */
+    override fun ownerUID(proto: Long, srcIP: String, srcPort: Long, dstIP: String, dstPort: Long): Long {
+        if (Build.VERSION.SDK_INT < 29) return -1
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return -1
+        return runCatching {
+            cm.getConnectionOwnerUid(
+                proto.toInt(),
+                InetSocketAddress(InetAddress.getByName(srcIP), srcPort.toInt()),
+                InetSocketAddress(InetAddress.getByName(dstIP), dstPort.toInt()),
+            ).toLong()
+        }.getOrDefault(-1L)
+    }
+
+    override fun packagesForUID(uid: Long): String =
+        runCatching { packageManager.getPackagesForUid(uid.toInt())?.joinToString(",") }.getOrNull().orEmpty()
 
     // --- quick settings tile ---
 

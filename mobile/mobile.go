@@ -43,6 +43,12 @@ type Platform interface {
 	OnCaptchaDone()
 	// Log receives one log line.
 	Log(line string)
+	// OwnerUID returns the user ID of the app that owns a connection
+	// (ConnectivityManager.getConnectionOwnerUid, Android 10+), or -1.
+	// proto is 6 (TCP) or 17 (UDP).
+	OwnerUID(proto int, srcIP string, srcPort int, dstIP string, dstPort int) int
+	// PackagesForUID returns the packages with a user ID, comma-separated.
+	PackagesForUID(uid int) string
 }
 
 var (
@@ -98,16 +104,18 @@ func Start(rawLink, deviceID string, sessions int, obfs string, p Platform) erro
 	if dataDir != "" {
 		vkCache = filepath.Join(dataDir, "vk-guests.json")
 	}
+	protect := func(fd uintptr) error {
+		if !p.Protect(int(fd)) {
+			return errors.New("VpnService.protect failed")
+		}
+		return nil
+	}
+	splitLog = func(s string) { p.Log(s) }
 	e, err := engine.New(engine.Config{
 		Link: l, DeviceID: deviceID, Sessions: sessions, Mode: wrap.ParseMode(obfs),
 		Net: &netx.Net{
-			DNS: netx.DefaultDNS,
-			Protect: func(fd uintptr) error {
-				if !p.Protect(int(fd)) {
-					return errors.New("VpnService.protect failed")
-				}
-				return nil
-			},
+			DNS:     netx.DefaultDNS,
+			Protect: protect,
 		},
 		Captcha:  captcha,
 		VKCache:  vkCache,
@@ -136,7 +144,10 @@ func Start(rawLink, deviceID string, sessions int, obfs string, p Platform) erro
 			return nil, errors.New("the VPN interface could not be created")
 		}
 		dev, _, err := tun.CreateUnmonitoredTUNFromFD(fd)
-		return dev, err
+		if err != nil {
+			return nil, err
+		}
+		return wrapTun(dev, c, p, protect), nil
 	})
 	if err != nil {
 		mu.Lock()
@@ -144,8 +155,10 @@ func Start(rawLink, deviceID string, sessions int, obfs string, p Platform) erro
 		mu.Unlock()
 		return err
 	}
+	go keepListsFresh(e)
 	go func() {
 		<-e.Done()
+		dropRouter()
 		mu.Lock()
 		if current == e {
 			current = nil

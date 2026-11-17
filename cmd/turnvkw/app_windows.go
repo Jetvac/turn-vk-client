@@ -10,17 +10,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
 	webview2 "github.com/jchv/go-webview2"
+	"golang.zx2c4.com/wireguard/tun"
 
 	"github.com/Jetvac/turn-vk-client/core/engine"
 	"github.com/Jetvac/turn-vk-client/core/link"
 	"github.com/Jetvac/turn-vk-client/core/netx"
+	"github.com/Jetvac/turn-vk-client/core/split"
 	"github.com/Jetvac/turn-vk-client/core/vkcreds"
 	"github.com/Jetvac/turn-vk-client/core/webcaptcha"
 	"github.com/Jetvac/turn-vk-client/core/winvpn"
@@ -35,7 +39,8 @@ type profile struct {
 }
 
 // settings are the same as the Android app's, minus what Windows has no
-// counterpart for (per-app bypass, the quick settings tile).
+// counterpart for (the quick settings tile), plus split tunneling by
+// program.
 type settings struct {
 	Profiles       []profile `json:"profiles"`
 	Current        string    `json:"current"`
@@ -46,6 +51,8 @@ type settings struct {
 	Autostart bool `json:"autostart"`
 	// NoStats: send the server no statistics (on by default).
 	NoStats bool `json:"no_stats"`
+	// Split: which programs go through the VPN (split tunneling).
+	Split split.Rules `json:"split"`
 }
 
 // view is what the page shows; it gets a new copy on every change.
@@ -63,6 +70,8 @@ type view struct {
 	Health string `json:"health"`
 	// Update: a newer release on GitHub ("" when this one is the latest).
 	Update *release `json:"update"`
+	// Lists: the country and site lists of split tunneling.
+	Lists listsView `json:"lists"`
 }
 
 type app struct {
@@ -76,6 +85,8 @@ type app struct {
 	s       settings
 	eng     *engine.Engine
 	vpn     *winvpn.VPN
+	router  *split.Router // between the adapter and WireGuard, while connected
+	fake    *split.Fake   // placeholder addresses of sites sent direct, kept across connections
 	cancel  context.CancelFunc
 	lastErr string
 	logs    []string
@@ -87,6 +98,7 @@ type app struct {
 	// disconnecting.
 	last   *lastConn
 	update *release
+	lists  listsState
 }
 
 // lastConn is what a report shows of a connection that has ended.
@@ -126,12 +138,14 @@ func newApp() *app {
 	sum := sha256.Sum256([]byte("turnvk|" + h))
 	a.devID = "pc-" + hex.EncodeToString(sum[:8])
 	a.captcha = webcaptcha.New(a.logf)
+	a.fake = split.NewFake()
 	a.load()
+	a.loadLists() // before the window: nothing to show yet
 	return a
 }
 
 func (a *app) load() {
-	a.s = settings{Sessions: 32, Obfs: "audio"}
+	a.s = settings{Sessions: 32, Obfs: "audio", Split: split.DefaultRules()}
 	if a.path == "" {
 		return
 	}
@@ -148,6 +162,7 @@ func (a *app) load() {
 	if a.s.Obfs != "video" {
 		a.s.Obfs = "audio"
 	}
+	a.s.Split.Normalize()
 }
 
 // save writes the settings; a.mu is held.
@@ -207,6 +222,7 @@ func (a *app) eval(fn string, args ...any) {
 func (a *app) snapshot() view {
 	v := view{Settings: a.s, Running: a.eng != nil, Error: a.lastErr, Device: a.devID, Version: version, OtherVPN: winvpn.OtherVPN(), Health: a.health, Update: a.update}
 	v.Settings.Profiles = append([]profile(nil), a.s.Profiles...)
+	v.Lists = a.listsView()
 	if p := a.current(); p != nil {
 		v.Settings.Current = p.ID
 	}
@@ -343,6 +359,75 @@ func (a *app) bind(w webview2.WebView) {
 		a.push()
 		return nil
 	}))
+	must(w.Bind("tvkSetSplit", func(r split.Rules) {
+		r.Normalize()
+		a.mu.Lock()
+		old := a.s.Split
+		a.s.Split = r
+		a.save()
+		rt, e := a.router, a.eng
+		a.mu.Unlock()
+		if rt != nil {
+			rt.SetRules(r)
+			// New answers for names the rules now treat differently.
+			byName := len(r.Domains) > 0 || len(old.Domains) > 0 || len(r.Lists) > 0 || len(old.Lists) > 0
+			if old.On != r.On && byName || !sameDomains(old, r) || !slices.Equal(old.Lists, r.Lists) {
+				split.FlushDNS()
+			}
+		}
+		if !sameLists(old, r) {
+			go func() {
+				a.loadLists()
+				a.updateLists(e) // a list from a file not downloaded yet
+			}()
+		}
+		a.logf("split tunneling: %s", describeSplit(r))
+		a.push()
+	}))
+	must(w.Bind("tvkNormDomain", func(s string) (string, error) {
+		d, err := split.NormalizeDomain(s)
+		if err != nil {
+			return "", fmt.Errorf("«%s» — не имя сайта: %v", strings.TrimSpace(s), err)
+		}
+		return d, nil
+	}))
+	must(w.Bind("tvkNormList", func(s string) (string, error) {
+		return split.NormalizeList(s)
+	}))
+	must(w.Bind("tvkListNames", func(kind string) []string {
+		if kind == "geoip" {
+			return a.listNames(split.GeoIPFile)
+		}
+		return a.listNames(split.GeoSiteFile)
+	}))
+	must(w.Bind("tvkUpdateLists", func() error {
+		a.mu.Lock()
+		e := a.eng
+		a.mu.Unlock()
+		if e == nil {
+			return errors.New("списки скачиваются через VPN: сначала подключитесь")
+		}
+		go a.updateLists(e)
+		return nil
+	}))
+	must(w.Bind("tvkConns", func() []split.Conn {
+		a.mu.Lock()
+		rt := a.router
+		a.mu.Unlock()
+		if rt == nil {
+			return nil
+		}
+		rt.Watch()
+		return rt.Conns(400)
+	}))
+	must(w.Bind("tvkPick", func(folder bool) {
+		go func() {
+			path := pickPath(w.Window(), folder)
+			if path != "" {
+				a.eval("onPicked", map[string]any{"path": path, "folder": folder})
+			}
+		}()
+	}))
 	must(w.Bind("tvkReport", func() { go a.report() }))
 	must(w.Bind("tvkCheckUpdate", func() { go a.checkUpdate(true) }))
 	must(w.Bind("tvkInstallUpdate", func() { go a.installUpdate() }))
@@ -377,6 +462,66 @@ func (a *app) addLink(raw string) error {
 	a.s.Current = p.ID
 	a.save()
 	return nil
+}
+
+// describeSplit sums the rules up for the log (program names, not paths:
+// paths hold the user's name).
+func describeSplit(r split.Rules) string {
+	if !r.On {
+		return "off"
+	}
+	var direct, vpn []string
+	for _, x := range r.Apps {
+		if x.Off {
+			continue
+		}
+		n := filepath.Base(x.Path)
+		if x.Folder {
+			n += `\`
+		}
+		if x.Children {
+			n += "+"
+		}
+		if x.Route == split.Direct {
+			direct = append(direct, n)
+		} else {
+			vpn = append(vpn, n)
+		}
+	}
+	for _, d := range r.Domains {
+		if d.Off {
+			continue
+		}
+		if d.Route == split.Direct {
+			direct = append(direct, "site "+d.Domain)
+		} else {
+			vpn = append(vpn, "site "+d.Domain)
+		}
+	}
+	for _, l := range r.Lists {
+		if l.Off {
+			continue
+		}
+		if l.Route == split.Direct {
+			direct = append(direct, l.List)
+		} else {
+			vpn = append(vpn, l.List)
+		}
+	}
+	return fmt.Sprintf("on, others %s, LAN direct %v, direct: %v, VPN: %v", r.Default, r.LAN, direct, vpn)
+}
+
+// sameDomains: the rules by name are the same (on, off, routes).
+func sameDomains(a, b split.Rules) bool {
+	if len(a.Domains) != len(b.Domains) {
+		return false
+	}
+	for i := range a.Domains {
+		if a.Domains[i] != b.Domains[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // autoName names a server the user did not name.
@@ -452,10 +597,57 @@ func (a *app) connect() error {
 	stopped := a.stopped
 	note = fmt.Sprintf("connecting to %s (%s), %d routes", p.Name, l.Host, a.s.Sessions)
 	a.health = ""
+	rules := a.s.Split
+	open := func(c *engine.WGConfig) (tun.Device, error) {
+		dev, err := v.Open(c)
+		if err != nil {
+			return nil, err
+		}
+		always := []netip.Prefix{c.Address.Masked()}
+		for _, d := range c.DNS {
+			if d.Is4() {
+				always = append(always, netip.PrefixFrom(d, 32))
+			}
+		}
+		var dns []netip.Addr
+		for _, d := range c.DNS {
+			if d.Is4() {
+				dns = append(dns, d)
+			}
+		}
+		a.mu.Lock()
+		lists := a.lists.loaded
+		a.mu.Unlock()
+		rt := split.New(dev, split.Options{
+			Protect: v.Protect, Owner: split.NewOwner(), AlwaysVPN: always, DNS: dns, Fake: a.fake,
+			// Sites sent direct are resolved past the tunnel, as TurnVK
+			// resolves VK's names.
+			Resolver: (&netx.Net{DNS: netx.DefaultDNS, Protect: v.Protect}).Resolver(),
+			Lists:    lists,
+			Logf:     a.logf,
+		}, rules)
+		a.mu.Lock()
+		if a.eng == e {
+			a.router = rt
+			// Rules changed while connecting.
+			rules = a.s.Split
+		}
+		a.mu.Unlock()
+		rt.SetRules(rules)
+		if rules.On {
+			a.logf("split tunneling: %s", describeSplit(rules))
+			if len(rules.Domains) > 0 || len(rules.Lists) > 0 {
+				// Answers cached before connecting would bypass the rules.
+				split.FlushDNS()
+			}
+		}
+		return rt, nil
+	}
 	go func() {
-		err := e.Start(ctx, v.Open)
+		err := e.Start(ctx, open)
 		if err == nil {
 			go a.selfCheck(e, l.Host)
+			go a.keepListsFresh(e)
 			<-e.Done()
 			err = e.Err()
 		}
@@ -463,7 +655,7 @@ func (a *app) connect() error {
 		a.remember(e)
 		mine := a.eng == e
 		if mine {
-			a.eng, a.vpn, a.cancel = nil, nil, nil
+			a.eng, a.vpn, a.cancel, a.router = nil, nil, nil, nil
 			if err != nil {
 				a.lastErr = err.Error()
 			}
@@ -476,6 +668,7 @@ func (a *app) connect() error {
 			cancel()
 			e.Stop()
 			v.Close()
+			split.FlushDNS() // placeholders mean nothing without TurnVK
 			close(stopped)
 		}
 		a.push()
@@ -490,7 +683,7 @@ func (a *app) disconnect() (done <-chan struct{}) {
 	a.mu.Lock()
 	e, v, cancel, stopped := a.eng, a.vpn, a.cancel, a.stopped
 	a.remember(e)
-	a.eng, a.vpn, a.cancel, a.lastErr, a.health = nil, nil, nil, "", ""
+	a.eng, a.vpn, a.cancel, a.lastErr, a.health, a.router = nil, nil, nil, "", "", nil
 	a.mu.Unlock()
 	if e == nil {
 		return stopped
@@ -500,6 +693,7 @@ func (a *app) disconnect() (done <-chan struct{}) {
 		cancel()
 		e.Stop()
 		v.Close()
+		split.FlushDNS() // placeholders mean nothing without TurnVK
 		close(stopped)
 		a.push()
 	}()
