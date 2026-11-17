@@ -79,10 +79,7 @@ func (r *Router) settle(f *flow, host string, d Decision) {
 	if d.Route == Direct {
 		name := "?"
 		if f.path != "" {
-			name = f.path
-			if i := strings.LastIndexAny(name, `\/`); i >= 0 {
-				name = name[i+1:]
-			}
+			name = baseName(f.path)
 		}
 		r.mu.Lock()
 		lk := name + "|" + d.Why

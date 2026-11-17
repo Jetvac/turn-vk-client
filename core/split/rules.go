@@ -137,6 +137,16 @@ func normPath(p string) string {
 	return strings.ToLower(p)
 }
 
+// baseName is the last element of a path, Windows' or not, on any system
+// (filepath.Base keeps backslashes outside Windows).
+func baseName(p string) string {
+	p = strings.TrimRight(p, `\/`)
+	if i := strings.LastIndexAny(p, `\/`); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
 // Proc is the program behind a connection.
 type Proc struct {
 	PID  uint32
@@ -154,7 +164,7 @@ func (p *Proc) Name() string {
 	if p == nil || p.Path == "" {
 		return ""
 	}
-	return filepath.Base(p.Path)
+	return baseName(p.Path)
 }
 
 // Decision is the route of a connection and why.
@@ -302,7 +312,7 @@ func (m *matcher) decide(dst netip.Addr, host string, p *Proc) Decision {
 		}
 		for _, parent := range p.Parents {
 			if a := m.app(normPath(parent)); a != nil && a.Children {
-				return Decision{a.Route, m.why(a, filepath.Base(parent))}
+				return Decision{a.Route, m.why(a, baseName(parent))}
 			}
 		}
 	}
@@ -369,9 +379,9 @@ func (m *matcher) app(n string) *AppRule {
 }
 
 func (m *matcher) why(a *AppRule, parent string) string {
-	s := "правило для " + filepath.Base(a.Path)
+	s := "правило для " + baseName(a.Path)
 	if a.Folder {
-		s = "правило для папки " + filepath.Base(a.Path)
+		s = "правило для папки " + baseName(a.Path)
 	}
 	if parent != "" {
 		s += " (запущена из " + parent + ")"

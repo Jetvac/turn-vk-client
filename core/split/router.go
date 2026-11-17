@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/netip"
 	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -438,7 +437,7 @@ func (r *Router) newFlow(p *pkt, m *matcher, now int64) *flow {
 		r.direct.Add(1)
 	}
 	if f.route == Direct && !f.sniffing {
-		name := filepath.Base(f.path)
+		name := baseName(f.path)
 		if f.path == "" {
 			name = "?"
 		}
@@ -567,7 +566,7 @@ func (r *Router) Conns(limit int) []Conn {
 			c.Proto = "UDP"
 		}
 		if f.path != "" {
-			c.Name = filepath.Base(f.path)
+			c.Name = baseName(f.path)
 		}
 		out = append(out, c)
 	}
