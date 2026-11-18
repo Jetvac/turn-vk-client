@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -22,12 +23,26 @@ const (
 	relayBadRatio = 2.0  // …and this many times the best relay's loss
 	relayKeep     = 2    // routes left on a worse relay
 	relayDownFor  = time.Minute
+	// relayLinkLoss: when even the best relay loses this much, the loss is
+	// the device's own link (a mobile network), not the relays: moving
+	// routes would only cost new allocations.
+	relayLinkLoss = 0.02
+	// A relay is slow when its routes' round trip is above relaySlowRatio
+	// times the best relay's plus relaySlowExtra (after a reconnect routes
+	// may land on a relay far slower than the others).
+	relaySlowRatio = 2.0
+	relaySlowExtra = 50 * time.Millisecond
 )
 
 type relayStat struct {
 	loss     float64 // smoothed loss fraction
 	windows  int     // windows judged
 	rx, lost uint64  // the current window
+	// rtt: the routes' smoothed round trip; rttSum/rttN: the current window.
+	rtt        time.Duration
+	rttWindows int
+	rttSum     time.Duration
+	rttN       int
 }
 
 type relays struct {
@@ -75,6 +90,10 @@ func (r *relays) tick(list []*session.Session, now time.Time) bool {
 			st.rx += rx - p[0]
 			st.lost += lost - p[1]
 		}
+		if d := time.Duration(s.RTT.Load()); d > 0 && s.Fresh(now) {
+			st.rttSum += d
+			st.rttN++
+		}
 	}
 	for s := range r.prev {
 		if !seen[s] {
@@ -96,40 +115,82 @@ func (r *relays) tick(list []*session.Session, now time.Time) bool {
 			st.windows++
 		}
 		st.rx, st.lost = 0, 0
+		if st.rttN > 0 {
+			w := st.rttSum / time.Duration(st.rttN)
+			if st.rttWindows == 0 {
+				st.rtt = w
+			} else {
+				st.rtt = (7*st.rtt + 3*w) / 10
+			}
+			st.rttWindows++
+		}
+		st.rttSum, st.rttN = 0, 0
 	}
 	return true
 }
 
-// bad lists the relays clearly worse than the best one.
+// bad lists the relays clearly worse than the best one: losing more
+// packets, or much slower. Loss is not judged when every relay loses
+// (the device's own link does).
 func (r *relays) bad() map[string]float64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	best, known := 1.0, 0
+	bestRTT, knownRTT := time.Duration(0), 0
 	for _, st := range r.stats {
 		if st.windows >= 2 {
 			best = min(best, st.loss)
 			known++
 		}
-	}
-	if known < 2 {
-		return nil
+		if st.rttWindows >= 2 {
+			if knownRTT == 0 || st.rtt < bestRTT {
+				bestRTT = st.rtt
+			}
+			knownRTT++
+		}
 	}
 	out := map[string]float64{}
-	for k, st := range r.stats {
-		if st.windows >= 2 && st.loss > relayBadLoss && st.loss > relayBadRatio*best+0.01 {
-			out[k] = st.loss
+	if known >= 2 && best < relayLinkLoss {
+		for k, st := range r.stats {
+			if st.windows >= 2 && st.loss > relayBadLoss && st.loss > relayBadRatio*best+0.01 {
+				out[k] = st.loss
+			}
 		}
+	}
+	if knownRTT >= 2 {
+		slow := time.Duration(relaySlowRatio*float64(bestRTT)) + relaySlowExtra
+		for k, st := range r.stats {
+			if st.rttWindows >= 2 && st.rtt > slow {
+				if _, ok := out[k]; !ok {
+					out[k] = st.loss
+				}
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
 
-func (r *relays) lossOf(server string) float64 {
+// why tells why a relay is judged worse, for the log.
+func (r *relays) why(server string) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if st := r.stats[server]; st != nil {
-		return st.loss
+	st := r.stats[server]
+	if st == nil {
+		return "is worse"
 	}
-	return 0
+	bestRTT := time.Duration(0)
+	for _, o := range r.stats {
+		if o.rttWindows >= 2 && (bestRTT == 0 || o.rtt < bestRTT) {
+			bestRTT = o.rtt
+		}
+	}
+	if st.rttWindows >= 2 && bestRTT > 0 && st.rtt > time.Duration(relaySlowRatio*float64(bestRTT))+relaySlowExtra {
+		return fmt.Sprintf("answers in %d ms (the best in %d ms)", st.rtt.Milliseconds(), bestRTT.Milliseconds())
+	}
+	return fmt.Sprintf("loses %.1f%% of the packets", 100*st.loss)
 }
 
 // pick chooses the relay for a new route: the usual rotation, unless that

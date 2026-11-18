@@ -23,7 +23,9 @@ import (
 // So after pion's attempt the session sends its own Refresh(0) and waits
 // for VK's answer, repeating it with a fresh nonce if asked.
 
-const releaseTimeout = 2 * time.Second
+// releaseTimeout: a phone on a slow mobile network may need several
+// round trips of half a second each (401, then the request again).
+const releaseTimeout = 5 * time.Second
 
 var releasing sync.WaitGroup
 

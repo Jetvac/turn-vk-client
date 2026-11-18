@@ -123,6 +123,30 @@ const (
 	// (wall clock) this long means the device slept.
 	wakeGrace = 15 * time.Second
 	sleepGap  = 4 * time.Second
+	// sleepCheck: only a sleep this long gets every route probed (and a
+	// line in the log). Android pauses an app with the screen off for a
+	// few seconds at a time, over and over: those short pauses only hold
+	// off route replacement.
+	sleepCheck = 20 * time.Second
+	// dozeWindow: for this long after the device last slept it counts as
+	// dozing, and a direct path is replaced only after dozeReplace of
+	// silence (its pings were paused too).
+	dozeWindow  = 2 * time.Minute
+	dozeReplace = 20 * time.Second
+	// relayMoveEvery: at most one route moves to a better relay this often.
+	relayMoveEvery = 30 * time.Second
+	// VK's allocation limit (error 486) with no guest to move to: the
+	// group waits quotaWait (doubling up to quotaWaitMax) and the engine
+	// uses fewer routes (targetStep less, down to half) for a while; after
+	// targetRestore without error 486 it tries targetStep more again.
+	quotaWait     = time.Minute
+	quotaWaitMax  = 5 * time.Minute
+	quotaCalm     = 3 * time.Minute // no route moves this long after error 486
+	targetStep    = 8
+	targetRestore = 15 * time.Minute
+	// offlineWait: with no network (sendto: network is unreachable) new
+	// routes wait this long, or until the platform reports a new network.
+	offlineWait = 15 * time.Second
 )
 
 // Engine is one running connection.
@@ -173,6 +197,20 @@ type Engine struct {
 	// massSilentLog: when "many routes silent" was last logged.
 	wokeAt        atomic.Int64
 	massSilentLog atomic.Int64
+
+	// target: how many routes the engine keeps now (cfg.Sessions, less
+	// while VK refuses allocations); quotaAt/targetAt: when error 486
+	// last came and when target last changed (unix ns); movedAt: when a
+	// route last moved to a better relay.
+	target   atomic.Int32
+	quotaAt  atomic.Int64
+	targetAt atomic.Int64
+	movedAt  atomic.Int64
+
+	// offline: no network; new routes wait for it (offline.go).
+	offline offlineGate
+
+	logs logLimiter // merges repeated log lines
 
 	statsAcked atomic.Bool // the server acknowledged a statistics report
 }
@@ -225,6 +263,7 @@ type hashState struct {
 	dead      error
 	waitUntil time.Time
 	groups    map[int]*credSlot
+	full      map[int32]time.Time // guests that hit VK's allocation limit, when
 }
 
 type credSlot struct {
@@ -232,6 +271,11 @@ type credSlot struct {
 	cur   atomic.Pointer[vkcreds.Creds]
 	bg    atomic.Bool  // a background refresh is running
 	guest atomic.Int32 // which guest of the call fetches for this group
+	// quotaUntil: VK refused this group more allocations and no other
+	// guest was free: no new route before then (unix ns); quotaFails: how
+	// many times in a row.
+	quotaUntil atomic.Int64
+	quotaFails atomic.Int32
 }
 
 const (
@@ -262,6 +306,7 @@ func New(cfg Config) (*Engine, error) {
 		return nil, err
 	}
 	e := &Engine{cfg: cfg, aead: aead, b: newBind(), state: StateStopped, since: time.Now(), done: make(chan struct{})}
+	e.target.Store(int32(cfg.Sessions))
 	e.gen = randomID()
 	if _, err := rand.Read(e.keys.Private[:]); err != nil {
 		return nil, err
@@ -292,13 +337,15 @@ func New(cfg Config) (*Engine, error) {
 }
 
 func (e *Engine) logf(format string, args ...any) {
-	if e.cfg.Logf != nil {
-		e.cfg.Logf(format, args...)
+	line, ok := e.logs.allow(fmt.Sprintf(format, args...), time.Now())
+	if !ok {
+		return
 	}
-	if !e.cfg.NoStats {
-		if line := fmt.Sprintf(format, args...); statsLogLine(line) {
-			noteEvent(line)
-		}
+	if e.cfg.Logf != nil {
+		e.cfg.Logf("%s", line)
+	}
+	if !e.cfg.NoStats && statsLogLine(line) {
+		noteEvent(line)
 	}
 }
 
@@ -409,6 +456,17 @@ func (e *Engine) worker(i int, s *session.Session) {
 	fails := 0 // failed dials in a row: each tries the next TURN server
 	for e.ctx.Err() == nil {
 		if s == nil {
+			// Fewer routes while VK refuses allocations: this slot rests.
+			if i > 0 && i >= int(e.target.Load()) {
+				if !sleep(e.ctx, 30*time.Second) {
+					return
+				}
+				continue
+			}
+			// No network: wait for one instead of failing route after route.
+			if !e.offline.wait(e.ctx) {
+				return
+			}
 			var err error
 			s, err = e.dial(e.ctx, i, fails)
 			if err != nil {
@@ -420,11 +478,19 @@ func (e *Engine) worker(i int, s *session.Session) {
 					e.fail(err)
 					return
 				}
+				if unreachable(err) {
+					if e.offline.down(time.Now(), offlineWait) {
+						e.noteError("no network: new routes wait for it")
+					}
+					fails--
+					continue
+				}
 				// A wait for VK is logged once, where it starts (the
 				// error that caused it), not by every session that waits.
 				var we *waitError
 				if !errors.As(err, &we) {
 					e.noteError(fmt.Sprintf("session %d: %v", i, err))
+					e.offline.up() // it failed, but not for lack of network
 				}
 				if !sleep(e.ctx, jitter(backoff)) {
 					return
@@ -433,6 +499,7 @@ func (e *Engine) worker(i int, s *session.Session) {
 				continue
 			}
 			fails = 0
+			e.offline.up()
 			if opened {
 				e.reconnect.Add(1)
 			}
@@ -475,7 +542,7 @@ func (e *Engine) worker(i int, s *session.Session) {
 		// went down together (a network switch, a server restart): then
 		// the new allocations are spread out.
 		wait := jitter(backoff)
-		if healthy && e.cfg.Sessions-len(e.b.list()) <= max(1, e.cfg.Sessions/4) {
+		if t := int(e.target.Load()); healthy && t-len(e.b.list()) <= max(1, t/4) {
 			wait = 0
 		}
 		if wait > 0 && !sleep(e.ctx, wait) {
@@ -553,12 +620,22 @@ func (e *Engine) dial(ctx context.Context, i, shift int) (*session.Session, erro
 	var te *session.TURNError
 	switch {
 	case errors.As(err, &te) && te.QuotaReached():
-		if n, moved := hs.nextGuest(g, creds); moved {
+		now := time.Now()
+		e.quotaAt.Store(now.UnixNano())
+		if n, moved := hs.nextGuest(g, creds, now); moved {
 			e.logf("VK call %s…: the guest has no allocations left, group %d moves to guest %d", short(hs.hash), g+1, n+1)
+		} else if wait, first := hs.quotaBackoff(g, now); first {
+			// Every guest is at VK's limit (allocations of closed routes
+			// still count until VK frees them): new credentials would not
+			// help, waiting and fewer routes do.
+			e.logf("VK call %s…: no allocations left for group %d, it waits %s", short(hs.hash), g+1, wait.Round(time.Second))
+			e.lowerTarget(now)
 		}
 	case errors.As(err, &te) && te.CredentialsRejected():
 		hs.invalidate(g, creds)
-	case errors.As(err, &te), err != nil && ctx.Err() != nil && e.ctx.Err() == nil:
+	case err == nil:
+		hs.slot(g).quotaFails.Store(0)
+	case errors.As(err, &te), err != nil && ctx.Err() != nil && e.ctx.Err() == nil && !unreachable(err):
 		// The TURN server did not allocate, or the route never came up.
 		if e.cfg.TURNServer == "" {
 			e.relays.failed(server, time.Now())
@@ -632,6 +709,9 @@ func (e *waitError) Error() string {
 // limit, never holds up a new session.
 func (hs *hashState) get(ctx context.Context, e *Engine, g int) (*vkcreds.Creds, error) {
 	cs := hs.slot(g)
+	if wait := time.Duration(cs.quotaUntil.Load() - time.Now().UnixNano()); wait > 0 {
+		return nil, &waitError{wait}
+	}
 	if c := cs.cur.Load(); c != nil {
 		if c.Fresh() {
 			return c, nil
@@ -689,26 +769,91 @@ func (hs *hashState) fetch(ctx context.Context, e *Engine, g int, cs *credSlot) 
 	return c, nil
 }
 
-// nextGuest moves group g to a guest no other group uses, after VK
-// refused its guest more allocations. c are the refused credentials: a
-// group already moved is left alone.
-func (hs *hashState) nextGuest(g int, c *vkcreds.Creds) (int, bool) {
+// guestRest: a guest that hit VK's allocation limit is not moved to
+// again for this long (its allocations expire meanwhile).
+const guestRest = 5 * time.Minute
+
+// nextGuest moves group g to a guest no other group uses and that has
+// not hit VK's limit lately, after VK refused its guest more allocations.
+// c are the refused credentials: a group already moved is left alone.
+// With no such guest the group keeps its guest and credentials.
+func (hs *hashState) nextGuest(g int, c *vkcreds.Creds, now time.Time) (int, bool) {
 	cs := hs.slot(g)
-	if !cs.cur.CompareAndSwap(c, nil) {
+	if cs.cur.Load() != c {
+		return 0, false
+	}
+	hs.mu.Lock()
+	if hs.full == nil {
+		hs.full = map[int32]time.Time{}
+	}
+	old := cs.guest.Load()
+	hs.full[old] = now
+	used := map[int32]bool{}
+	for _, o := range hs.groups {
+		used[o.guest.Load()] = true
+	}
+	n := int32(-1)
+	for k := int32(1); k < maxGuests; k++ {
+		x := (old + k) % maxGuests
+		if !used[x] && now.Sub(hs.full[x]) > guestRest {
+			n = x
+			break
+		}
+	}
+	hs.mu.Unlock()
+	if n < 0 || !cs.cur.CompareAndSwap(c, nil) {
 		return 0, false
 	}
 	hs.cache.PutCreds(hs.credsKey(g, cs), nil)
-	hs.mu.Lock()
-	n := int32(0)
-	for _, o := range hs.groups {
-		n = max(n, o.guest.Load())
-	}
-	hs.mu.Unlock()
-	if n+1 >= maxGuests {
+	cs.guest.Store(n)
+	return int(n), true
+}
+
+// quotaBackoff holds group g's new routes back after error 486 with no
+// guest to move to; first is true when the wait starts (not when a route
+// already on its way hits the limit too).
+func (hs *hashState) quotaBackoff(g int, now time.Time) (time.Duration, bool) {
+	cs := hs.slot(g)
+	if cs.quotaUntil.Load() > now.UnixNano() {
 		return 0, false
 	}
-	cs.guest.Store(n + 1)
-	return int(n + 1), true
+	n := cs.quotaFails.Add(1)
+	wait := min(quotaWait<<min(n-1, 3), quotaWaitMax)
+	cs.quotaUntil.Store(now.Add(wait).UnixNano())
+	return wait, true
+}
+
+// lowerTarget uses targetStep fewer routes (down to half the set number)
+// after error 486, at most once per quotaWait.
+func (e *Engine) lowerTarget(now time.Time) {
+	t := e.target.Load()
+	floor := int32(max(1, e.cfg.Sessions/2))
+	last := e.targetAt.Load()
+	if t <= floor || now.UnixNano()-last < int64(quotaWait) || !e.targetAt.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	n := max(floor, t-targetStep)
+	e.target.Store(n)
+	e.logf("VK refuses more TURN allocations: using %d routes instead of %d for a while", n, e.cfg.Sessions)
+	e.notify()
+}
+
+// raiseTarget tries targetStep more routes after targetRestore without
+// error 486.
+func (e *Engine) raiseTarget(now time.Time) {
+	t := e.target.Load()
+	if int(t) >= e.cfg.Sessions {
+		return
+	}
+	ns := now.UnixNano()
+	last := e.targetAt.Load()
+	if ns-e.quotaAt.Load() < int64(targetRestore) || ns-last < int64(targetRestore) || !e.targetAt.CompareAndSwap(last, ns) {
+		return
+	}
+	n := min(int32(e.cfg.Sessions), t+targetStep)
+	e.target.Store(n)
+	e.logf("trying %d routes again", n)
+	e.notify()
 }
 
 func (hs *hashState) invalidate(g int, c *vkcreds.Creds) {
@@ -745,12 +890,14 @@ func (e *Engine) watchdog() {
 		list := e.b.list()
 		if wall := time.Now().UnixNano(); wall-lastTick > int64(sleepGap) {
 			// The device slept (Android in the background): timers stopped
-			// and every route missed its pings. Ask each route now and
-			// give them time before judging any.
+			// and every route missed its pings. Give them time before
+			// judging any; after a long sleep ask each route now.
 			e.wokeAt.Store(wall)
-			e.logf("the device was asleep for %s, checking the routes", time.Duration(wall-lastTick).Round(time.Second))
-			for _, s := range list {
-				go s.Probe()
+			if gap := time.Duration(wall - lastTick); gap >= sleepCheck {
+				e.logf("the device was asleep for %s, checking the routes", gap.Round(time.Second))
+				for _, s := range list {
+					go s.Probe()
+				}
 			}
 			lastTick = wall
 			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
@@ -759,9 +906,12 @@ func (e *Engine) watchdog() {
 			lastTick = wall
 		}
 		e.replaceSilentPaths(list)
-		if !e.cfg.NoRelayScoring && e.relays.tick(list, time.Now()) {
+		now := time.Now()
+		e.raiseTarget(now)
+		if !e.cfg.NoRelayScoring && e.relays.tick(list, now) && e.mayMove(now) {
 			if s := e.relays.moveOne(list); s != nil {
-				e.logf("route %d: TURN server %s loses %.1f%% of the packets, moving the route to a better one", s.ID, s.Server, 100*e.relays.lossOf(s.Server))
+				e.movedAt.Store(now.UnixNano())
+				e.logf("route %d: TURN server %s %s, moving the route to a better one", s.ID, s.Server, e.relays.why(s.Server))
 				s.Close()
 			}
 		}
@@ -801,6 +951,16 @@ func (e *Engine) watchdog() {
 	}
 }
 
+// mayMove tells whether a route may move to a better relay now: one move
+// per relayMoveEvery, none while VK refuses allocations (a move frees one
+// and asks for another) or while the device dozes.
+func (e *Engine) mayMove(now time.Time) bool {
+	ns := now.UnixNano()
+	return ns-e.movedAt.Load() >= int64(relayMoveEvery) &&
+		ns-e.quotaAt.Load() >= int64(quotaCalm) &&
+		ns-e.wokeAt.Load() >= int64(dozeWindow)
+}
+
 // replaceSilentPaths closes direct paths that have not heard from the
 // server for pathReplace while others have (their workers open new ones
 // at once). A path that is merely slow keeps answering pings; one that VK
@@ -825,6 +985,11 @@ func (e *Engine) replaceSilentPaths(list []*session.Session) {
 	if fresh == 0 {
 		return
 	}
+	// A dozing phone pauses the pings too: give paths longer.
+	replaceAfter := pathReplace
+	if now.UnixNano()-e.wokeAt.Load() < int64(dozeWindow) {
+		replaceAfter = dozeReplace
+	}
 	total, freshBy := map[string]int{}, map[string]int{}
 	var cands []*session.Session
 	for _, s := range list {
@@ -832,7 +997,7 @@ func (e *Engine) replaceSilentPaths(list []*session.Session) {
 		if s.Fresh(now) {
 			freshBy[s.Server]++
 		}
-		if s.Direct() && s.Silent(now) > pathReplace && time.Since(s.Started) > pathReplace {
+		if s.Direct() && s.Silent(now) > replaceAfter && time.Since(s.Started) > pathReplace {
 			cands = append(cands, s)
 		}
 	}
@@ -1013,7 +1178,7 @@ func (e *Engine) noteError(msg string) {
 // Status returns a snapshot.
 func (e *Engine) Status() Status {
 	list := e.b.list()
-	st := Status{Sessions: len(list), Target: e.cfg.Sessions, RxBytes: e.rxClosed.Load(), TxBytes: e.txClosed.Load(), Reconnects: e.reconnect.Load()}
+	st := Status{Sessions: len(list), Target: int(e.target.Load()), RxBytes: e.rxClosed.Load(), TxBytes: e.txClosed.Load(), Reconnects: e.reconnect.Load()}
 	for _, s := range list {
 		st.RxBytes += s.RxBytes.Load()
 		st.TxBytes += s.TxBytes.Load()
@@ -1137,6 +1302,7 @@ func (e *Engine) Reconnect(why string) {
 		return
 	}
 	e.logf("reconnecting: %s", why)
+	e.offline.up()
 	for _, s := range e.b.list() {
 		s.Close()
 	}
