@@ -46,7 +46,7 @@ func PlanApps(r Rules) AppPlan {
 			vpn = append(vpn, a.Path)
 		}
 	}
-	if r.Default == Direct && !vpnSites && !vpnAddrs {
+	if r.AppsOnly || r.Default == Direct && !vpnSites && !vpnAddrs {
 		return AppPlan{Mode: "allow", Apps: vpn}
 	}
 	if vpnSites {

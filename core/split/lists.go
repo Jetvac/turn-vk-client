@@ -432,3 +432,32 @@ func readGeoSite(path string, want map[string]bool, out map[string]*SiteSet) err
 		return nil
 	})
 }
+
+// BigList: a list this long costs memory and time to load (tens of MB
+// for ru-blocked-all); the apps warn about it.
+const BigList = 200000
+
+// Sizes: the number of entries of each loaded list (address ranges or
+// sites).
+func (l *Lists) Sizes() map[string]int {
+	out := map[string]int{}
+	if l == nil {
+		return out
+	}
+	for n, s := range l.IP {
+		out[n] = s.Len()
+	}
+	for n, s := range l.Site {
+		out[n] = s.Len()
+	}
+	return out
+}
+
+// ApproxFileSize: about how large a list file is to download (MB), for
+// the apps to say before the first download.
+func ApproxFileSize(file string) int {
+	if file == GeoSiteFile {
+		return 90
+	}
+	return 20
+}

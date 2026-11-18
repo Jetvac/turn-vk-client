@@ -12,6 +12,7 @@ import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.provider.Settings
@@ -112,6 +113,9 @@ class TunnelService : VpnService(), mobile.Platform {
             mobile.Mobile.setDataDir(filesDir.absolutePath)
             // The rules the user set (the service may start without the app).
             runCatching { mobile.Mobile.setSplit(store.split) }
+            runCatching { mobile.Mobile.setListsWiFiOnly(store.listsWifiOnly) }
+            // The network now: its mode (rules by network) applies from the start.
+            runCatching { mobile.Mobile.setNetwork(networkKind(), "") }
             mobile.Mobile.loadLists()
             mobile.Mobile.setStats(store.serverStats, "TurnVK ${BuildConfig.VERSION_NAME} android")
             mobile.Mobile.start(profile.link, deviceId, sessions.toLong(), store.obfs, this)
@@ -292,9 +296,11 @@ class TunnelService : VpnService(), mobile.Platform {
     // --- network changes ---
 
     private fun watchNetwork() {
+        unwatchNetwork()
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
         var first = true
         var current: Network? = null
+        var kind = ""
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 if (!first && network != current) {
@@ -304,8 +310,43 @@ class TunnelService : VpnService(), mobile.Platform {
                 first = false
                 current = network
             }
+
+            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                val k = kindOf(caps) ?: networkKind()
+                if (k == kind) return
+                kind = k
+                // Rules by network: a new mode; when the apps Android lets
+                // into the tunnel change, reconnect.
+                val replan = runCatching { mobile.Mobile.setNetwork(k, "") }.getOrDefault(false)
+                if (replan && mobile.Mobile.running()) {
+                    log("правила для сети «${netNames[k] ?: k}» меняют список приложений в VPN — переподключаем")
+                    restart(this@TunnelService)
+                }
+            }
         }
         runCatching { cm.registerDefaultNetworkCallback(cb) }.onSuccess { networkCallback = cb }
+    }
+
+    /** The kind of a network: "wifi", "mobile", "wired"; null for a VPN or unknown. */
+    private fun kindOf(caps: NetworkCapabilities): String? = when {
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> null
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "mobile"
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "wired"
+        else -> null
+    }
+
+    /** The kind of the physical network the phone uses now ("" when unknown). */
+    @Suppress("DEPRECATION")
+    private fun networkKind(): String {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return ""
+        cm.activeNetwork?.let { n -> cm.getNetworkCapabilities(n)?.let { kindOf(it) }?.let { return it } }
+        // The app is inside the VPN (only it was let in): the network under it.
+        for (n in cm.allNetworks) {
+            val c = cm.getNetworkCapabilities(n) ?: continue
+            if (c.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) kindOf(c)?.let { return it }
+        }
+        return ""
     }
 
     private fun unwatchNetwork() {

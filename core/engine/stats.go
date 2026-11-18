@@ -35,8 +35,10 @@ const (
 	statsEventLen  = 240
 	statsSendBatch = 3 // reports sent per tick
 	// statsNoAck: the server acknowledged none of this many sends: it does
-	// not collect statistics (an older version); stop sending to it.
+	// not collect statistics (an older version, or one not restarted after
+	// an update); from then on try only every statsRetry.
 	statsNoAck = 6
+	statsRetry = 10 * time.Minute
 )
 
 type statsReport struct {
@@ -134,6 +136,7 @@ func (e *Engine) statsLoop() {
 	}
 	last := time.Now()
 	unacked := 0
+	var probed time.Time
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -143,7 +146,10 @@ func (e *Engine) statsLoop() {
 				continue
 			}
 			if !e.statsAcked.Load() && unacked >= statsNoAck {
-				continue
+				if time.Since(probed) < statsRetry {
+					continue
+				}
+				probed = time.Now()
 			}
 			unacked += e.sendStats()
 			continue
@@ -207,7 +213,9 @@ func (e *Engine) statsLoop() {
 		m.Captcha = e.captchas.Load() > 0
 		m.TURN = len(turn)
 		e.queueStats(m)
-		unacked += e.sendStats()
+		if e.statsAcked.Load() || unacked < statsNoAck {
+			unacked += e.sendStats()
+		}
 	}
 }
 

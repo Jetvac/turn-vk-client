@@ -92,6 +92,13 @@ class Store(ctx: Context) {
             p.edit().putBoolean("boot_connect", v).apply()
         }
 
+    /** Download the split tunneling lists on Wi-Fi only (on by default). */
+    var listsWifiOnly: Boolean
+        get() = p.getBoolean("lists_wifi_only", true)
+        set(v) {
+            p.edit().putBoolean("lists_wifi_only", v).apply()
+        }
+
     /** Send the server statistics of the connection (on by default). */
     var serverStats: Boolean
         get() = p.getBoolean("server_stats", true)

@@ -108,6 +108,8 @@ type Router struct {
 
 	fmu    sync.Mutex
 	failed map[string]*Failure // sites that did not open direct (retry.go)
+
+	history map[histKey]*Conn // ended connections (history.go); under mu
 }
 
 type flow struct {
@@ -142,6 +144,15 @@ type flow struct {
 	viaVPN bool
 	// hidden: the router's own half of another connection (not listed).
 	hidden bool
+	// qwatch: a direct QUIC flow waiting for its first answer; qheld:
+	// copies of its first packets (retry.go).
+	qretry bool // QUIC that may be retried (set once, in newFlow)
+	// reject: IPv6 for the VPN, which carries IPv4 only: TCP gets a reset
+	// at once (the program falls back to IPv4), UDP is dropped.
+	reject bool
+	qwatch atomic.Bool
+	qmu    sync.Mutex
+	qheld  [][]byte
 }
 
 func (f *flow) touch(now int64) { f.last.Store(now) }
@@ -369,6 +380,12 @@ func (r *Router) route(b []byte, m *matcher, now int64) bool {
 			t.inject(b)
 		}
 	case protoUDP:
+		if f.reject {
+			return false
+		}
+		if f.qwatch.Load() {
+			f.quicKeepPkt(b)
+		}
 		if p.firstFrg {
 			r.startFragments(b, &p, f)
 		} else {
@@ -434,6 +451,22 @@ func (r *Router) newFlow(p *pkt, m *matcher, now int64) *flow {
 			}
 		}
 	}
+	// QUIC sent direct: through the VPN if it did not answer lately.
+	quic := m.retry && p.key.proto == protoUDP && sniffPort(protoUDP, p.key.dst.Port()) && !p.frag && !fixed && !fake
+	f.qretry = quic
+	if quic && d.Route == Direct && !f.sniffing && r.failedBeforeQUIC(f.host, dst) {
+		d = Decision{VPN, whyFailed}
+		f.viaVPN = true
+	}
+	if p.v6 {
+		// IPv6 goes direct only: nothing is relayed or retried through
+		// the VPN, which carries IPv4.
+		f.sniffing, f.quic, f.retry, f.qretry = false, nil, false, false
+		if d.Route == VPN {
+			f.reject = true
+			d.Why += " (IPv6 — только напрямую, программа перейдёт на IPv4)"
+		}
+	}
 	if f.sniffing {
 		// Relaying into the VPN needs the pump: start it now, while the
 		// computer still sends (the next Read starts it).
@@ -442,7 +475,7 @@ func (r *Router) newFlow(p *pkt, m *matcher, now int64) *flow {
 	f.prelim = d
 	f.route, f.why = d.Route, d.Why
 	f.proc = proc
-	f.local.Store(d.Route == Direct || f.sniffing)
+	f.local.Store(d.Route == Direct || f.sniffing || f.reject)
 	if f.sniffing {
 		f.why = "узнаю сайт"
 	}
@@ -461,6 +494,9 @@ func (r *Router) newFlow(p *pkt, m *matcher, now int64) *flow {
 	r.flows[p.key] = f
 	if f.quic != nil {
 		r.quicTimer(f)
+	}
+	if f.qretry && f.route == Direct && !f.sniffing {
+		r.quicWatch(f)
 	}
 	if f.local.Load() {
 		f.counted = true
@@ -484,6 +520,7 @@ func (r *Router) newFlow(p *pkt, m *matcher, now int64) *flow {
 
 // dropFlow forgets a flow; r.mu is held.
 func (r *Router) dropLocked(k flowKey, f *flow) {
+	r.noteHistoryLocked(k, f)
 	delete(r.flows, k)
 	if f.counted {
 		r.direct.Add(-1)
@@ -582,6 +619,13 @@ type Conn struct {
 	Start  int64  `json:"start"` // unix ms
 	Last   int64  `json:"last"`  // unix ms
 	Closed bool   `json:"closed,omitempty"`
+	// Site: the rule a site would get (its main domain: googlevideo.com
+	// for rr3---sn-x.googlevideo.com).
+	Site string `json:"site,omitempty"`
+	// Retried: it did not open direct, so it went through the VPN.
+	Retried bool `json:"retried,omitempty"`
+	// N: how many such connections (History merges them).
+	N int `json:"n,omitempty"`
 }
 
 // Conns lists the known connections, most recently active first (at most
@@ -593,15 +637,7 @@ func (r *Router) Conns(limit int) []Conn {
 		if f.hidden {
 			continue
 		}
-		c := Conn{Proto: "TCP", Src: k.src.String(), Dst: k.dst.String(), PID: f.pid, Path: f.path, Route: f.route, Why: f.why,
-			Host: f.host, Up: f.up.Load(), Down: f.down.Load(), Start: f.start.UnixMilli(), Last: f.last.Load() / 1e6, Closed: f.closed.Load()}
-		if k.proto == protoUDP {
-			c.Proto = "UDP"
-		}
-		if f.path != "" {
-			c.Name = baseName(f.path)
-		}
-		out = append(out, c)
+		out = append(out, r.connOf(k, f))
 	}
 	r.mu.Unlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].Last > out[j].Last })

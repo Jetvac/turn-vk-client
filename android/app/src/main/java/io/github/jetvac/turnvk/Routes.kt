@@ -32,6 +32,8 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
@@ -89,6 +91,9 @@ data class AppRoute(val path: String, val route: String, val off: Boolean = fals
 data class SiteRoute(val domain: String, val route: String, val off: Boolean = false)
 data class ListRoute(val list: String, val route: String, val off: Boolean = false)
 
+/** A mode for a network: "wifi", "mobile" or "wired" (core/split.NetRule). */
+data class NetRoute(val network: String, val mode: String, val off: Boolean = false)
+
 data class SplitRules(
     val on: Boolean = false,
     val default: String = "vpn",
@@ -98,6 +103,10 @@ data class SplitRules(
     val lists: List<ListRoute> = emptyList(),
     /** A site sent direct that does not open is not tried through the VPN. */
     val noRetry: Boolean = false,
+    /** Only the apps sent through the VPN enter it; the others stay out. */
+    val appsOnly: Boolean = false,
+    /** Modes by network. */
+    val networks: List<NetRoute> = emptyList(),
 ) {
     /** The route a new rule gets: the opposite of the others'. */
     val other: String get() = if (default == "direct") "vpn" else "direct"
@@ -107,6 +116,8 @@ data class SplitRules(
         o.put("apps", JSONArray().apply { apps.forEach { put(JSONObject().put("path", it.path).put("route", it.route).put("off", it.off)) } })
         o.put("domains", JSONArray().apply { domains.forEach { put(JSONObject().put("domain", it.domain).put("route", it.route).put("off", it.off)) } })
         o.put("lists", JSONArray().apply { lists.forEach { put(JSONObject().put("list", it.list).put("route", it.route).put("off", it.off)) } })
+        o.put("appsOnly", appsOnly)
+        o.put("networks", JSONArray().apply { networks.forEach { put(JSONObject().put("network", it.network).put("mode", it.mode).put("off", it.off)) } })
         return o.toString()
     }
 
@@ -126,6 +137,8 @@ data class SplitRules(
                 domains = arr("domains") { SiteRoute(it.optString("domain"), it.optString("route", "direct"), it.optBoolean("off")) },
                 lists = arr("lists") { ListRoute(it.optString("list"), it.optString("route", "direct"), it.optBoolean("off")) },
                 noRetry = o.optBoolean("noRetry"),
+                appsOnly = o.optBoolean("appsOnly"),
+                networks = arr("networks") { NetRoute(it.optString("network"), it.optString("mode", "vpn"), it.optBoolean("off")) },
             )
         }.getOrDefault(SplitRules())
     }
@@ -149,6 +162,7 @@ internal val modeTitles = mapOf(
     "vpn" to "Всё через VPN",
     "blocked" to "Только заблокированное через VPN",
     "russia" to "Российское напрямую",
+    "apps" to "Только выбранные приложения через VPN",
     "custom" to "Свои правила",
 )
 
@@ -156,8 +170,28 @@ private val modeTexts = mapOf(
     "vpn" to "Раздельное туннелирование выключено",
     "blocked" to "Сайты и адреса, заблокированные в России, — через VPN, остальное напрямую. Российские сайты и игры работают с обычной скоростью",
     "russia" to "Российские сайты и адреса (.ru, .su, .рф) — напрямую, остальное через VPN",
+    "apps" to "Через VPN идут только приложения с правилом «Через VPN» (ниже); остальные Android не пускает в туннель совсем — меньше расход батареи. Правила для сайтов действуют внутри выбранных приложений",
     "custom" to "Приложения, сайты и списки ниже — как вы настроите",
 )
+
+/** What applies now: the mode for the network the phone is on. */
+internal data class Effective(val mode: String, val network: String, val networkName: String, val here: String) {
+    companion object {
+        fun now(): Effective = runCatching {
+            val o = JSONObject(mobile.Mobile.effective())
+            Effective(o.optString("mode"), o.optString("network"), o.optString("networkName"), o.optString("here"))
+        }.getOrDefault(Effective("", "", "", ""))
+    }
+}
+
+internal val netNames = mapOf("wifi" to "Wi-Fi", "mobile" to "Мобильная сеть", "wired" to "Кабель (Ethernet)")
+
+/** Notes on the rules (core/split.CheckRules), by "kind|key". */
+private fun ruleNotes(r: SplitRules): Map<String, List<Pair<String, Boolean>>> = runCatching {
+    val a = JSONArray(mobile.Mobile.checkRules(r.toJson()))
+    (0 until a.length()).map { a.getJSONObject(it) }
+        .groupBy({ it.optString("kind") + "|" + it.optString("key") }, { it.optString("text") to it.optBoolean("warn") })
+}.getOrDefault(emptyMap())
 
 private fun plural(n: Int, one: String, few: String, many: String): String {
     val a = n % 10
@@ -174,6 +208,8 @@ fun splitSummary(r: SplitRules): String {
     val mode = r.mode()
     if (!r.on) return modeTitles.getValue("vpn")
     var t = if (mode == "custom") "Своё: остальное " + routeName(r.default) else modeTitles[mode] ?: ""
+    val eff = Effective.now()
+    if (eff.network.isNotEmpty()) t = (modeTitles[eff.mode] ?: t) + " (" + eff.networkName + ")"
     val parts = buildList {
         r.apps.count { !it.off }.takeIf { it > 0 }?.let { add(plural(it, "приложение", "приложения", "приложений")) }
         r.domains.count { !it.off }.takeIf { it > 0 }?.let { add(plural(it, "сайт", "сайта", "сайтов")) }
@@ -274,6 +310,10 @@ private data class ListsInfo(
     val busy: Boolean = false,
     val error: String = "",
     val missing: Set<String> = emptySet(),
+    val sizes: Map<String, Int> = emptyMap(),
+    val big: Int = Int.MAX_VALUE,
+    val approx: Map<String, Int> = emptyMap(),
+    val waiting: Boolean = false,
 ) {
     companion object {
         fun parse(s: String): ListsInfo = runCatching {
@@ -285,6 +325,10 @@ private data class ListsInfo(
                 busy = o.optBoolean("busy"),
                 error = o.optString("error"),
                 missing = (0 until ma.length()).map { ma.getString(it) }.toSet(),
+                sizes = o.optJSONObject("sizes")?.let { m -> m.keys().asSequence().associateWith { m.optInt(it) } }.orEmpty(),
+                big = o.optInt("big", Int.MAX_VALUE),
+                approx = o.optJSONObject("approx")?.let { m -> m.keys().asSequence().associateWith { m.optInt(it) } }.orEmpty(),
+                waiting = o.optBoolean("waiting"),
             )
         }.getOrDefault(ListsInfo())
     }
@@ -321,12 +365,17 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
     var info by remember { mutableStateOf(ListsInfo()) }
     var conns by remember { mutableStateOf<List<JSONObject>>(emptyList()) }
     var fails by remember { mutableStateOf<List<JSONObject>>(emptyList()) }
+    var recent by remember { mutableStateOf(false) }
+    var filter by remember { mutableStateOf("all") }
+    var eff by remember { mutableStateOf(Effective.now()) }
+    val notes = remember(rules) { ruleNotes(rules) }
     // The lists' state, and the connections while connected.
-    LaunchedEffect(active, rules) {
+    LaunchedEffect(active, rules, recent) {
         while (true) {
             info = ListsInfo.parse(withContext(Dispatchers.IO) { runCatching { mobile.Mobile.listsInfo() }.getOrDefault("") })
+            eff = Effective.now()
             conns = if (active) withContext(Dispatchers.IO) {
-                runCatching { JSONArray(mobile.Mobile.conns()) }.getOrDefault(JSONArray()).let { a -> (0 until a.length()).map { a.getJSONObject(it) } }
+                runCatching { JSONArray(if (recent) mobile.Mobile.history() else mobile.Mobile.conns()) }.getOrDefault(JSONArray()).let { a -> (0 until a.length()).map { a.getJSONObject(it) } }
             } else emptyList()
             fails = if (active) withContext(Dispatchers.IO) {
                 runCatching { JSONArray(mobile.Mobile.failures()) }.getOrDefault(JSONArray()).let { a -> (0 until a.length()).map { a.getJSONObject(it) } }
@@ -363,6 +412,8 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
                 )
             }
         }
+
+        NetworksPanel(rules, update, active, eff)
 
         if (active && applied != null && planNow.isNotEmpty() && planNow != applied) {
             Banner(
@@ -419,6 +470,7 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
                         onOff = { v -> update(rules.copy(apps = rules.apps.toMutableList().also { it[i] = a.copy(off = !v) })) },
                         onDelete = { update(rules.copy(apps = rules.apps.filterIndexed { j, _ -> j != i })) },
                         first = i == 0,
+                        notes = if (a.off) emptyList() else notes["app|${a.path}"].orEmpty(),
                     )
                 }
                 Spacer(Modifier.height(8.dp))
@@ -477,6 +529,7 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
                         onOff = { v -> update(rules.copy(domains = rules.domains.toMutableList().also { it[i] = d.copy(off = !v) })) },
                         onDelete = { update(rules.copy(domains = rules.domains.filterIndexed { j, _ -> j != i })) },
                         first = i == 0,
+                        notes = if (d.off) emptyList() else notes["domain|${d.domain}"].orEmpty(),
                     )
                 }
                 Spacer(Modifier.height(6.dp))
@@ -529,11 +582,22 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
                 val has = info.files.map { it.first }.toSet()
                 rules.lists.forEachIndexed { i, l ->
                     val missing = !l.off && l.list in info.missing
-                    val file = if (l.list.startsWith("geoip:")) "geoip.dat" else "geosite.dat"
+                    val ip = l.list.startsWith("geoip:")
+                    val file = if (ip) "geoip.dat" else "geosite.dat"
+                    val n = info.sizes[l.list] ?: 0
+                    val big = n > info.big
+                    val sub = l.list + when {
+                        missing && file in has -> " — такого списка нет"
+                        missing -> " — скачается после подключения (файл около ${info.approx[if (ip) "geoip" else "geosite"] ?: "?"} МБ)"
+                        n > 0 -> " · " + String.format(ru, "%,d", n) + (if (ip) " диапазонов" else " сайтов") +
+                            if (big) " — большой список: больше памяти и дольше загрузка" else ""
+                        else -> ""
+                    }
                     RuleRow(
                         title = listTitle(l.list),
-                        sub = l.list + if (missing) (if (file in has) " — такого списка нет" else " — скачается после подключения") else "",
-                        subWarn = missing, icon = null, route = l.route, off = l.off,
+                        sub = sub,
+                        subWarn = missing || big, icon = null, route = l.route, off = l.off,
+                        notes = if (l.off) emptyList() else notes["list|${l.list}"].orEmpty(),
                         onRoute = { r -> update(rules.copy(lists = rules.lists.toMutableList().also { it[i] = l.copy(route = r) })) },
                         onOff = { v -> update(rules.copy(lists = rules.lists.toMutableList().also { it[i] = l.copy(off = !v) })) },
                         onDelete = { update(rules.copy(lists = rules.lists.filterIndexed { j, _ -> j != i })) },
@@ -544,6 +608,7 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 6.dp)) {
                         val st = when {
                             info.busy -> "Скачиваю списки…"
+                            info.waiting -> "Списки скачаются при подключении к Wi-Fi (или нажмите «Обновить»)."
                             info.files.isNotEmpty() -> "Обновлены: " + info.files.joinToString(", ") { (n, size, upd) ->
                                 (if (n == "geoip.dat") "страны " else "сайты ") + fmtUpdated(upd) + " (" + String.format(ru, "%.1f", size / 1048576.0) + " МБ)"
                             }
@@ -558,9 +623,22 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
                         }) { Text("Обновить") }
                     }
                 }
+                if (rules.lists.isNotEmpty() || rules.networks.isNotEmpty()) {
+                    var wifiOnly by remember { mutableStateOf(store.listsWifiOnly) }
+                    SwitchRow(
+                        title = "Скачивать списки только по Wi-Fi",
+                        text = "Файл сайтов — около ${info.approx["geosite"] ?: 90} МБ. В мобильной сети списки ждут Wi-Fi; кнопка «Обновить» скачивает сразу",
+                        checked = wifiOnly,
+                        onChange = {
+                            wifiOnly = it
+                            store.listsWifiOnly = it
+                            runCatching { mobile.Mobile.setListsWiFiOnly(it) }
+                        },
+                    )
+                }
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "Списки сайтов работают как правила для сайтов. Страны и адреса сервисов — для приложений без своего правила. Если адрес или сайт есть в нескольких списках, побеждает VPN. Списки (runetfreedom) обновляются после подключения и дважды в день.",
+                    "Списки сайтов работают как правила для сайтов. Страны и адреса сервисов — для приложений без своего правила. Если адрес или сайт есть в нескольких списках, побеждает VPN. Списки (runetfreedom) обновляются после подключения, не чаще раза в 3 дня, кнопкой «Обновить» — сразу.",
                     fontSize = 12.5.sp, color = pal.muted, lineHeight = 17.sp,
                 )
             }
@@ -570,13 +648,39 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
         if (active) {
             Panel {
                 Column {
-                    SectionTitle("Соединения сейчас", Modifier.padding(bottom = 8.dp))
+                    SectionTitle("Соединения", Modifier.padding(bottom = 4.dp))
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        FilterChip(selected = !recent, onClick = { recent = false; conns = emptyList() }, label = { Text("Сейчас", fontSize = 13.sp) })
+                        FilterChip(selected = recent, onClick = { recent = true; conns = emptyList() }, label = { Text("Закрытые за час", fontSize = 13.sp) })
+                        if (recent) TextButton(onClick = {
+                            scope.launch { withContext(Dispatchers.IO) { runCatching { mobile.Mobile.forgetHistory() } }; conns = emptyList() }
+                        }) { Text("Очистить") }
+                    }
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        listOf("all" to "Все", "direct" to "Напрямую", "vpn" to "Через VPN", "retried" to "Не открылись напрямую").forEach { (id, label) ->
+                            FilterChip(selected = filter == id, onClick = { filter = id }, label = { Text(label, fontSize = 13.sp) })
+                        }
+                    }
+                    val shown = conns.filter { c ->
+                        when (filter) {
+                            "all" -> true
+                            "retried" -> c.optBoolean("retried")
+                            else -> c.optString("route") == filter
+                        }
+                    }
                     // Connections without an app's package: Android's own
                     // (DNS from the system resolver, system services), by UID.
-                    val groups = conns.groupBy { c -> c.optString("path").ifEmpty { c.optLong("pid").let { if (it > 0) "uid:$it" else "" } } }.entries
+                    val groups = shown.groupBy { c -> c.optString("path").ifEmpty { c.optLong("pid").let { if (it > 0) "uid:$it" else "" } } }.entries
                         .sortedByDescending { e -> e.value.maxOf { it.optLong("last") } }
                     if (groups.isEmpty()) {
-                        Text("Соединений пока нет: список заполняется, пока открыта эта вкладка.", fontSize = 12.5.sp, color = pal.muted)
+                        Text(
+                            when {
+                                filter != "all" -> "Ничего не найдено."
+                                recent -> "Закрытых соединений пока нет."
+                                else -> "Соединений пока нет: список заполняется, пока открыта эта вкладка."
+                            },
+                            fontSize = 12.5.sp, color = pal.muted,
+                        )
                     }
                     groups.take(40).forEachIndexed { gi, (pkg, list) ->
                         if (gi > 0) HorizontalDivider(color = pal.line)
@@ -587,6 +691,72 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
         }
         Note("Правила действуют сразу для новых соединений; открытые соединения сохраняют свой путь, пока приложение их не переоткроет.")
         Spacer(Modifier.height(8.dp))
+    }
+}
+
+/** Modes by network: Wi-Fi, mobile data, Ethernet. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun NetworksPanel(rules: SplitRules, update: (SplitRules) -> Unit, active: Boolean, eff: Effective) {
+    Panel {
+        Column {
+            SectionTitle("Режим по сети", Modifier.padding(bottom = 2.dp))
+            val now = when {
+                !active -> "Сеть видна, пока VPN подключён."
+                eff.here.isEmpty() -> "Сейчас: сеть не определена."
+                eff.network.isNotEmpty() -> "Сейчас: ${eff.here} — режим «${modeTitles[eff.mode] ?: eff.mode}»"
+                else -> "Сейчас: ${eff.here} — без правила для этой сети"
+            } + if (!rules.on && rules.networks.isNotEmpty()) ". Раздельное туннелирование выключено — правила по сети не действуют." else ""
+            Text(now, fontSize = 12.5.sp, color = pal.muted, lineHeight = 17.sp)
+            rules.networks.forEachIndexed { i, n ->
+                HorizontalDivider(color = pal.line, modifier = Modifier.padding(vertical = 6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            (netNames[n.network] ?: n.network.removePrefix("wifi:")) + if (active && eff.network == n.network) " · сейчас" else "",
+                            fontWeight = FontWeight.SemiBold, color = if (n.off) pal.muted else MaterialTheme.colorScheme.onSurface,
+                        )
+                        ModePicker(n.mode) { m -> update(rules.copy(networks = rules.networks.toMutableList().also { it[i] = n.copy(mode = m) })) }
+                    }
+                    Switch(checked = !n.off, onCheckedChange = { v -> update(rules.copy(networks = rules.networks.toMutableList().also { it[i] = n.copy(off = !v) })) })
+                    IconButton(onClick = { update(rules.copy(networks = rules.networks.filterIndexed { j, _ -> j != i })) }) {
+                        Icon(Icons.Filled.Delete, "Удалить", tint = pal.muted)
+                    }
+                }
+            }
+            val free = netNames.keys.filter { k -> rules.networks.none { it.network == k } }
+            if (free.isNotEmpty()) {
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 8.dp)) {
+                    free.forEach { k ->
+                        Chip("+ " + netNames.getValue(k)) {
+                            update(rules.copy(on = true, networks = rules.networks + NetRoute(k, if (k == "wifi") "vpn" else "blocked")))
+                        }
+                    }
+                }
+            }
+            Text(
+                "Например: в мобильной сети — «Только заблокированное через VPN», в чужом Wi-Fi — «Всё через VPN». В сети с правилом её режим действует поверх ваших правил. Если от этого меняется, какие приложения Android пускает в VPN, TurnVK переподключится сам.",
+                fontSize = 12.5.sp, color = pal.muted, lineHeight = 17.sp, modifier = Modifier.padding(top = 6.dp),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ModePicker(mode: String, onPick: (String) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        TextButton(onClick = { open = true }, contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp), modifier = Modifier.height(32.dp)) {
+            Text((if (mode == "custom") "Свои правила (как настроено)" else modeTitles[mode] ?: mode) + " ▾", fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            modeTitles.forEach { (id, title) ->
+                DropdownMenuItem(
+                    text = { Text(if (id == "custom") "Свои правила (как настроено)" else title) },
+                    onClick = { open = false; onPick(id) },
+                )
+            }
+        }
     }
 }
 
@@ -744,6 +914,7 @@ private fun RuleRow(
     onDelete: () -> Unit,
     first: Boolean,
     subWarn: Boolean = false,
+    notes: List<Pair<String, Boolean>> = emptyList(),
 ) {
     if (!first) HorizontalDivider(color = pal.line, modifier = Modifier.padding(vertical = 6.dp))
     Column(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
@@ -761,6 +932,9 @@ private fun RuleRow(
             IconButton(onClick = onDelete) { Icon(Icons.Filled.Delete, "Удалить", tint = pal.muted) }
         }
         RouteSeg(route, Modifier.padding(top = 4.dp).width(240.dp), onRoute)
+        notes.forEach { (text, warn) ->
+            Text(text, fontSize = 12.sp, color = if (warn) pal.warn else pal.muted, lineHeight = 16.sp, modifier = Modifier.padding(top = 4.dp))
+        }
     }
 }
 
@@ -777,6 +951,7 @@ private fun ConnGroup(pkg: String, list: List<JSONObject>, labels: AppLabels, ru
         else -> labels.get(pkg)
     }
     val direct = list.count { it.optString("route") == "direct" }
+    val total = list.sumOf { it.optInt("n", 1).coerceAtLeast(1) }
     Column(Modifier.fillMaxWidth().clickable { open = !open }.padding(vertical = 8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             if (icon != null) Image(icon, null, Modifier.size(28.dp)) else Spacer(Modifier.size(28.dp))
@@ -784,7 +959,7 @@ private fun ConnGroup(pkg: String, list: List<JSONObject>, labels: AppLabels, ru
             Column(Modifier.weight(1f)) {
                 Text(label, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(
-                    "соединений: ${list.size}" + when (direct) {
+                    "соединений: $total" + when (direct) {
                         0 -> ", все через VPN"
                         list.size -> ", все напрямую"
                         else -> ", напрямую $direct"
@@ -797,12 +972,24 @@ private fun ConnGroup(pkg: String, list: List<JSONObject>, labels: AppLabels, ru
             list.sortedByDescending { it.optLong("last") }.take(30).forEach { c ->
                 val host = c.optString("host")
                 val dst = c.optString("dst")
+                val n = c.optInt("n")
                 Text(
                     (if (host.isNotEmpty()) "$host (${dst.substringAfterLast(':')})" else dst) +
-                        " · ${c.optString("proto")} · ${routeName(c.optString("route"))} — ${c.optString("why")}",
+                        " · ${c.optString("proto")} · ${routeName(c.optString("route"))} — ${c.optString("why")}" +
+                        if (n > 1) " · ×$n" else "",
                     fontSize = 12.sp, color = pal.muted, lineHeight = 16.sp,
                     modifier = Modifier.padding(start = 38.dp, top = 4.dp),
                 )
+                // A rule for this site alone (its main domain), the other way.
+                val site = c.optString("site")
+                if (site.isNotEmpty()) {
+                    val other = if (c.optString("route") == "direct") "vpn" else "direct"
+                    TextButton(
+                        onClick = { update(rules.copy(on = true, domains = rules.domains.filter { it.domain != site } + SiteRoute(site, other))) },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                        modifier = Modifier.padding(start = 30.dp).height(30.dp),
+                    ) { Text("$site — ${routeName(other)}", fontSize = 12.5.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                }
             }
             if (pkg.isNotEmpty() && !pkg.startsWith("uid:")) {
                 Row(Modifier.padding(start = 38.dp, top = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {

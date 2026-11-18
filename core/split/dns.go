@@ -179,20 +179,30 @@ func (r *Router) dnsSnoop(payload []byte) {
 		if err != nil {
 			return
 		}
-		if ah.Type != dnsmessage.TypeA {
+		var addr netip.Addr
+		switch ah.Type {
+		case dnsmessage.TypeA:
+			a, err := ps.AResource()
+			if err != nil {
+				return
+			}
+			addr = netip.AddrFrom4(a.A)
+		case dnsmessage.TypeAAAA:
+			a, err := ps.AAAAResource()
+			if err != nil {
+				return
+			}
+			addr = netip.AddrFrom16(a.AAAA)
+		default:
 			if ps.SkipAnswer() != nil {
 				return
 			}
 			continue
 		}
-		a, err := ps.AResource()
-		if err != nil {
-			return
-		}
 		ttl := min(max(time.Duration(ah.TTL)*time.Second, hostMinTTL), hostMaxTTL)
 		r.hmu.Lock()
 		if len(r.hosts) < maxHosts {
-			r.hosts[netip.AddrFrom4(a.A)] = hostEntry{name, now.Add(ttl).UnixNano()}
+			r.hosts[addr] = hostEntry{name, now.Add(ttl).UnixNano()}
 		}
 		r.hmu.Unlock()
 	}

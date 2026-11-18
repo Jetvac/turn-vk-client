@@ -13,9 +13,24 @@ const (
 	// ModeRussia: Russian sites and addresses direct, the rest through
 	// the VPN.
 	ModeRussia = "russia"
+	// ModeApps: only the chosen programs (apps) use the VPN; everything
+	// else goes direct (Android keeps the others out of the tunnel).
+	ModeApps = "apps"
 	// ModeCustom: the user's own rules.
 	ModeCustom = "custom"
 )
+
+// Modes: every mode, in the order the apps offer them.
+var Modes = []string{ModeVPN, ModeBlocked, ModeRussia, ModeApps, ModeCustom}
+
+func validMode(m string) bool {
+	for _, x := range Modes {
+		if x == m {
+			return true
+		}
+	}
+	return false
+}
 
 var modeLists = map[string][]ListRule{
 	ModeBlocked: {{List: "geosite:ru-blocked", Route: VPN}, {List: "geoip:ru-blocked", Route: VPN}},
@@ -30,6 +45,9 @@ var modeDomains = map[string][]DomainRule{
 func ModeOf(r Rules) string {
 	if !r.On {
 		return ModeVPN
+	}
+	if r.AppsOnly {
+		return ModeApps
 	}
 	has := func(name string, route Route) bool {
 		for _, l := range r.Lists {
@@ -58,6 +76,7 @@ func ApplyMode(r Rules, mode string) Rules {
 	r.Apps = append([]AppRule(nil), r.Apps...)
 	r.Domains = append([]DomainRule(nil), r.Domains...)
 	r.Lists = append([]ListRule(nil), r.Lists...)
+	r.Networks = append([]NetRule(nil), r.Networks...)
 	switch mode {
 	case ModeVPN:
 		r.On = false
@@ -66,7 +85,10 @@ func ApplyMode(r Rules, mode string) Rules {
 		r.Default = Direct
 	case ModeRussia:
 		r.Default = VPN
+	case ModeApps:
+		r.Default = Direct
 	}
+	r.AppsOnly = mode == ModeApps
 	r.On = true
 	r.LAN = r.LAN || mode != ModeCustom
 	for _, want := range modeLists[mode] {

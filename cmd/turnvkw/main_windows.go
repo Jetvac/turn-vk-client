@@ -32,6 +32,11 @@ var page string
 var wintunDLL []byte
 
 func main() {
+	// Started again: show the running copy's window (before asking for
+	// administrator rights, so that no prompt comes up for nothing).
+	if signalRunning() {
+		return
+	}
 	if !winvpn.Elevated() {
 		relaunchElevated()
 		return
@@ -51,6 +56,9 @@ func main() {
 		}
 		windows.CloseHandle(h)
 		if !afterUpdate || try >= 50 {
+			if signalRunning() {
+				return
+			}
 			message("TurnVK уже запущен.", windows.MB_ICONINFORMATION)
 			return
 		}
@@ -85,9 +93,16 @@ func main() {
 	}
 	w.SetSize(400, 600, webview2.HintMin)
 	a.w = w
+	t := startTray(a, uintptr(w.Window()))
 	if autostart {
-		minimize(w.Window())
+		// Started with Windows: the user did not ask to see the window.
+		if t.added {
+			_, _, _ = showWindow.Call(t.hwnd, windows.SW_HIDE)
+		} else {
+			minimize(w.Window())
+		}
 	}
+	go t.watchShow()
 	a.bind(w)
 	w.SetHtml(page)
 
@@ -131,6 +146,7 @@ func main() {
 	}
 
 	w.Run()
+	t.remove()
 	a.logf("window closed")
 	close(stop)
 	// The window is gone; free VK's allocations before the process ends.

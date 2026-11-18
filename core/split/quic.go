@@ -88,6 +88,10 @@ func (r *Router) quicFinish(f *flow, host string) {
 		q.timer.Stop()
 	}
 	d := r.decideSniffed(f, host, q.prelim)
+	if f.qretry && d.Route == Direct && r.failedBeforeQUIC(host, f.key.dst.Addr()) {
+		d = Decision{VPN, whyFailed}
+		f.viaVPN = true
+	}
 	r.settle(f, host, d)
 	held := q.held
 	q.held, q.chunks = nil, nil
@@ -99,6 +103,12 @@ func (r *Router) quicFinish(f *flow, host string) {
 		return
 	}
 	f.local.Store(true)
+	if f.qretry {
+		r.quicWatch(f)
+		for _, b := range held {
+			f.quicKeepPkt(b)
+		}
+	}
 	var p pkt
 	for _, b := range held {
 		if parse(b, &p) && !p.frag {

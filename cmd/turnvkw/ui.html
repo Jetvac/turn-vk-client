@@ -220,6 +220,23 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
 .conn { display: flex; gap: 8px; align-items: baseline; font-size: 12.5px; padding: 3px 0; }
 .conn .dst { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; user-select: text; }
 .conn.closed { opacity: .5; }
+.conn .act { flex: none; font: inherit; font-size: 11.5px; padding: 1px 8px; border-radius: 99px; border: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; }
+.conn .act:hover { color: var(--accent); border-color: var(--accent); }
+.conn .n { flex: none; font-size: 11.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.rnote { font-size: 12px; color: var(--muted); margin: 4px 0 0; line-height: 1.35; }
+.rnote.bad { color: var(--warn); }
+.filters { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin: 0 0 8px; }
+.fbtn { font: inherit; font-size: 12px; padding: 3px 10px; border-radius: 99px; border: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; }
+.fbtn.on { background: var(--accent-soft); color: var(--accent); border-color: transparent; font-weight: 600; }
+.netrow { display: flex; align-items: center; gap: 6px 10px; padding: 8px 0; border-top: 1px solid var(--line); flex-wrap: wrap; }
+.netrow select { flex: 1 1 150px; width: auto; min-width: 0; }
+.netrow .grow { flex: 1 1 140px; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.netrow.off .grow, .netrow.off select { opacity: .5; }
+@media (max-width: 560px) {
+  .netrow .grow { flex-basis: 100%; }
+  .conn { flex-wrap: wrap; row-gap: 2px; }
+  .conn .dst { flex-basis: 100%; }
+}
 .mode { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); cursor: pointer; }
 .mode:first-of-type { border-top: 0; }
 .mode .grow { flex: 1; min-width: 0; }
@@ -233,12 +250,18 @@ input[type=range] { flex: 1; accent-color: var(--accent); }
 .explain .host { font-weight: 600; }
 .explain .note { padding: 4px 0 0; }
 select { font: inherit; color: var(--text); background: var(--card2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; outline: none; max-width: 100%; }
-.fail { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid var(--line); }
+.fail { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 8px 0; border-top: 1px solid var(--line); }
 .fail:first-child { border-top: 0; padding-top: 0; }
-.fail .grow { flex: 1; min-width: 0; }
+.fail .grow { flex: 1 1 220px; min-width: 0; }
 .fail .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fail .meta { font-size: 12px; color: var(--muted); }
 #spHome .switch { margin-left: 4px; }
+/* A narrow window: a site's or list's route goes under its name. */
+@media (max-width: 560px) {
+  .rule .top { flex-wrap: wrap; row-gap: 6px; }
+  .rule .top > .seg { order: 5; flex-basis: 100%; max-width: 240px; }
+  .rule .bottom { margin-left: 0; }
+}
 .toast { position: fixed; left: 50%; bottom: 84px; transform: translateX(-50%) translateY(10px); background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 10px; font-size: 13px; opacity: 0; transition: opacity .2s, transform .2s; pointer-events: none; }
 .toast.on { opacity: 1; transform: translateX(-50%); }
 </style>
@@ -356,9 +379,21 @@ select { font: inherit; color: var(--text); background: var(--card2); border: 1p
         <div class="mode" data-m="vpn"><div class="radio"></div><div class="grow"><div class="lbl">Всё через VPN</div><div class="hint">Раздельное туннелирование выключено</div></div></div>
         <div class="mode" data-m="blocked"><div class="radio"></div><div class="grow"><div class="lbl">Только заблокированное через VPN</div><div class="hint">Сайты и адреса, заблокированные в России, — через VPN, остальное напрямую. Российские сайты и игры работают с обычной скоростью</div></div></div>
         <div class="mode" data-m="russia"><div class="radio"></div><div class="grow"><div class="lbl">Российское напрямую</div><div class="hint">Российские сайты и адреса (.ru, .su, .рф) — напрямую, остальное через VPN</div></div></div>
+        <div class="mode" data-m="apps"><div class="radio"></div><div class="grow"><div class="lbl">Только выбранные программы через VPN</div><div class="hint">Через VPN идут только программы с правилом «Через VPN» (ниже), всё остальное — напрямую. Правила для сайтов действуют внутри этих программ</div></div></div>
         <div class="mode" data-m="custom"><div class="radio"></div><div class="grow"><div class="lbl">Свои правила</div><div class="hint">Программы, сайты и списки ниже — как вы настроите</div></div></div>
       </div>
       <div class="small muted" style="margin-top:8px">Режим добавляет нужные списки и не трогает ваши правила для программ и сайтов. Путь выбирается для каждого нового соединения, поэтому игра со всеми её серверами и вспомогательными программами идёт одним путём.</div>
+    </div>
+    <div class="card">
+      <div class="title">Режим по сети</div>
+      <div class="small muted" id="netNow" style="margin:-4px 0 6px"></div>
+      <div id="netRules"></div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:8px">
+        <select id="netWhich" style="flex:1 1 150px"></select>
+        <select id="netMode" style="flex:1 1 150px"></select>
+        <button class="btn primary" id="netAdd">Добавить</button>
+      </div>
+      <div class="small muted" style="margin-top:8px">Например: дома — «Только заблокированное через VPN», в чужом Wi-Fi — «Всё через VPN». В сети с правилом её режим действует поверх ваших правил; переключатель на главной выключает всё.</div>
     </div>
     <div class="card">
       <div class="title">Куда пойдёт сайт?</div>
@@ -451,8 +486,10 @@ select { font: inherit; color: var(--text); background: var(--card2); border: 1p
       <div class="small muted" style="margin-top:10px">Списки сайтов работают как правила для сайтов. Страны и адреса сервисов — для программ без своего правила: «Россия напрямую» пускает российские адреса мимо VPN, но не трогает программу, которой вы указали «через VPN». Если адрес или сайт есть в нескольких списках, побеждает VPN. Списки (runetfreedom, обновляются каждые 6 часов) скачиваются только через VPN: после подключения и дважды в день.</div>
     </div>
     <div class="card">
-      <div class="title">Соединения сейчас</div>
-      <input type="text" id="spFilter" placeholder="Поиск: программа или адрес" style="margin-bottom:8px">
+      <div class="title">Соединения</div>
+      <div class="filters" id="spConnView"><button class="fbtn on" data-v="now">Сейчас</button><button class="fbtn" data-v="recent">Закрытые за час</button><span style="flex:1"></span><button class="fbtn" id="spHistClear" style="display:none">Очистить</button></div>
+      <div class="filters" id="spConnFilter"><button class="fbtn on" data-f="all">Все</button><button class="fbtn" data-f="direct">Напрямую</button><button class="fbtn" data-f="vpn">Через VPN</button><button class="fbtn" data-f="retried">Не открылись напрямую</button></div>
+      <input type="text" id="spFilter" placeholder="Поиск: программа, сайт или адрес" style="margin-bottom:8px">
       <div id="spConns"></div>
     </div>
     <div class="note" style="margin-bottom:12px"><svg><use href="#i-info"/></svg><span>Правила действуют сразу для новых соединений; уже открытые соединения сохраняют свой путь, пока программа их не переоткроет.</span></div>
@@ -478,6 +515,10 @@ select { font: inherit; color: var(--text); background: var(--card2); border: 1p
       <div class="opt">
         <div class="grow"><div class="lbl">Запускать вместе с Windows</div><div class="hint">TurnVK откроется свёрнутым при входе в Windows и сразу подключится к выбранному серверу</div></div>
         <label class="switch"><input type="checkbox" id="autostart"><i></i></label>
+      </div>
+      <div class="opt">
+        <div class="grow"><div class="lbl">Работать в фоне после закрытия окна</div><div class="hint">Крестик прячет окно, TurnVK остаётся подключённым; значок — рядом с часами. Выйти — правой кнопкой по значку</div></div>
+        <label class="switch"><input type="checkbox" id="totray"><i></i></label>
       </div>
       <div class="opt">
         <div class="grow"><div class="lbl">Отправлять статистику серверу</div><div class="hint">Раз в минуту: скорость, маршруты, задержки, потери и ошибки подключения — чтобы владелец сервера мог улучшать работу. Адреса сайтов и содержимое трафика не отправляются</div></div>
@@ -671,6 +712,7 @@ window.onView = function (v) {
   $('autoconn').checked = v.settings.connect_on_start;
   $('autostart').checked = v.settings.autostart;
   $('srvstats').checked = !v.settings.no_stats;
+  $('totray').checked = !v.settings.close_quits;
   $('ver').textContent = v.version; $('dev').textContent = v.device;
 };
 
@@ -779,6 +821,7 @@ document.querySelectorAll('#obfs button').forEach(b => b.onclick = () => {
 });
 $('autoconn').onchange = sendOptions;
 $('srvstats').onchange = () => tvkSetStats($('srvstats').checked);
+$('totray').onchange = () => tvkSetCloseQuits(!$('totray').checked);
 $('autostart').onchange = async () => {
   try { await tvkSetAutostart($('autostart').checked); }
   catch (e) { alert('Не удалось изменить автозапуск: ' + (e && e.message || e)); }
@@ -827,10 +870,11 @@ $('spHomeOn').onchange = () => {
 $('spHome').onclick = () => show('split');
 function hasRules() { const r = V.settings.split || {}; return (r.apps || []).length + (r.domains || []).length + (r.lists || []).length > 0 || r.default === 'direct'; }
 function plural(n, one, few, many) { const a = n % 10, b = n % 100; return n + ' ' + (a === 1 && b !== 11 ? one : a >= 2 && a <= 4 && (b < 12 || b > 14) ? few : many); }
-const modeNames = { vpn: 'Всё через VPN', blocked: 'Только заблокированное через VPN', russia: 'Российское напрямую', custom: 'Свои правила' };
+const modeNames = { vpn: 'Всё через VPN', blocked: 'Только заблокированное через VPN', russia: 'Российское напрямую', apps: 'Только выбранные программы через VPN', custom: 'Свои правила' };
 // The same as split.ModeOf, for the page's own changes before Go answers.
 function localMode(r) {
   if (!r.on) return 'vpn';
+  if (r.appsOnly) return 'apps';
   const has = (n, rt) => (r.lists || []).some(l => l.list === n && l.route === rt && !l.off);
   const def = r.default || 'vpn';
   if (def === 'direct' && has('geosite:ru-blocked', 'vpn')) return 'blocked';
@@ -844,6 +888,7 @@ function renderSplitHome() {
   const r = V.settings.split || {};
   $('spHomeOn').checked = !!r.on;
   let t = modeNames[V.mode] || '';
+  if (r.on && V.net_rule) t = modeNames[V.eff_mode] + ' (' + V.net_rule + ')';
   if (r.on) {
     const on = (xs) => (xs || []).filter(x => !x.off).length;
     const parts = [];
@@ -858,8 +903,18 @@ function renderSplitHome() {
 $('spLAN').onchange = () => { const r = spRules(); r.lan = $('spLAN').checked; saveSplit(r); };
 document.querySelectorAll('#spDefault button').forEach(b => b.onclick = () => { const r = spRules(); r.default = b.dataset.v; saveSplit(r); });
 
+// Notes on a rule (split.CheckRules): beaten, changes nothing, an exception.
+function addNotes(el, kind, key) {
+  (V.notes || []).filter(n => n.kind === kind && n.key === key).forEach(n => {
+    const d = document.createElement('div');
+    d.className = 'rnote' + (n.warn ? ' bad' : '');
+    d.textContent = n.text;
+    el.appendChild(d);
+  });
+}
 function renderSplit() {
   if (!V) return;
+  renderNets();
   const r = V.settings.split || {}, apps = r.apps || [];
   V.mode = localMode(r);
   renderModes();
@@ -870,7 +925,7 @@ function renderSplit() {
   document.querySelectorAll('#spDefault button').forEach(b => b.classList.toggle('on', b.dataset.v === (r.default || 'vpn')));
   renderDomains();
   renderLists();
-  const box = $('spList'), key = JSON.stringify(apps);
+  const box = $('spList'), key = JSON.stringify([apps, V.notes]);
   if (box.dataset.k === key) return;
   box.dataset.k = key;
   box.innerHTML = '';
@@ -900,6 +955,7 @@ function renderSplit() {
     });
     const kids = el.querySelector('.check input'); kids.checked = !!a.children;
     kids.onchange = () => { const r = spRules(); r.apps[i].children = kids.checked; saveSplit(r); };
+    if (!a.off) addNotes(el, 'app', a.path);
     box.appendChild(el);
   });
 }
@@ -927,7 +983,7 @@ document.querySelectorAll('#spPresets button').forEach(b => b.onclick = () => ad
 
 function renderDomains() {
   const ds = (V.settings.split && V.settings.split.domains) || [];
-  const box = $('spDomains'), key = JSON.stringify(ds);
+  const box = $('spDomains'), key = JSON.stringify([ds, V.notes]);
   if (box.dataset.k === key) return;
   box.dataset.k = key;
   box.innerHTML = '';
@@ -946,9 +1002,76 @@ function renderDomains() {
       b.classList.toggle('on', b.dataset.v === d.route);
       b.onclick = () => { const r = spRules(); r.domains[i].route = b.dataset.v; saveSplit(r); };
     });
+    if (!d.off) addNotes(el, 'domain', d.domain);
     box.appendChild(el);
   });
 }
+
+// --- Rules by network ---
+function netName(k) {
+  if (k.startsWith('wifi:')) return 'Wi-Fi «' + k.slice(5) + '»';
+  return { wifi: 'Любой Wi-Fi', wired: 'Кабель (Ethernet)', mobile: 'Мобильная сеть' }[k] || k;
+}
+function modeOptions(sel, cur) {
+  sel.innerHTML = '';
+  ['vpn', 'blocked', 'russia', 'apps', 'custom'].forEach(m => {
+    const o = document.createElement('option'); o.value = m; o.textContent = m === 'custom' ? 'Свои правила (как настроено)' : modeNames[m];
+    sel.appendChild(o);
+  });
+  if (cur) sel.value = cur;
+}
+function renderNets() {
+  const r = V.settings.split || {}, nets = r.networks || [];
+  let now;
+  if (!V.running) now = 'Сеть видна, пока VPN подключён.';
+  else if (!V.net) now = 'Сейчас: сеть не определена.';
+  else now = 'Сейчас: ' + V.net + (V.net_rule ? ' — режим «' + modeNames[V.eff_mode] + '»' : ' — без правила для этой сети');
+  if (!r.on && nets.length) now += ' Раздельное туннелирование выключено — правила по сети не действуют.';
+  $('netNow').textContent = now;
+  const which = $('netWhich'), wkey = JSON.stringify([V.net_key, nets]);
+  if (which.dataset.k !== wkey) {
+    which.dataset.k = wkey;
+    which.innerHTML = '';
+    const opts = [];
+    if (V.net_key && V.net_key.startsWith('wifi:')) opts.push(V.net_key);
+    opts.push('wifi', 'wired', 'mobile');
+    opts.filter(k => !nets.some(n => n.network === k)).forEach(k => {
+      const o = document.createElement('option'); o.value = k; o.textContent = k.startsWith('wifi:') ? 'Этот Wi-Fi: «' + k.slice(5) + '»' : netName(k);
+      which.appendChild(o);
+    });
+    $('netAdd').disabled = !which.options.length;
+  }
+  if (!$('netMode').options.length) modeOptions($('netMode'), 'vpn');
+  const box = $('netRules'), key = JSON.stringify([nets, V.net_rule_key, V.running]);
+  if (box.dataset.k === key) return;
+  box.dataset.k = key;
+  box.innerHTML = '';
+  nets.forEach((n, i) => {
+    const el = document.createElement('div');
+    el.className = 'netrow' + (n.off ? ' off' : '');
+    el.innerHTML = '<div class="grow"></div><select></select>'
+      + '<label class="switch" title="Правило включено"><input type="checkbox"><i></i></label>'
+      + '<button class="iconbtn" title="Удалить"><svg><use href="#i-trash"/></svg></button>';
+    el.querySelector('.grow').textContent = netName(n.network) + (V.running && n.network === V.net_rule_key ? ' · сейчас' : '');
+    const sel = el.querySelector('select'); modeOptions(sel, n.mode);
+    sel.onchange = () => { const r = spRules(); r.networks[i].mode = sel.value; saveSplit(r); };
+    const on = el.querySelector('.switch input'); on.checked = !n.off;
+    on.onchange = () => { const r = spRules(); r.networks[i].off = !on.checked; saveSplit(r); };
+    el.querySelector('.iconbtn').onclick = () => { const r = spRules(); r.networks.splice(i, 1); saveSplit(r); };
+    box.appendChild(el);
+  });
+}
+$('netAdd').onclick = () => {
+  const k = $('netWhich').value;
+  if (!k) return;
+  const r = spRules();
+  r.networks = (r.networks || []).filter(n => n.network !== k);
+  r.networks.push({ network: k, mode: $('netMode').value });
+  let note = netName(k) + ': ' + modeNames[$('netMode').value];
+  if (!r.on) { r.on = true; note += '. Раздельное туннелирование включено'; }
+  saveSplit(r);
+  toast(note);
+};
 
 // --- Lists (geoip / geosite) ---
 const regionNames = (() => { try { return new Intl.DisplayNames(['ru'], { type: 'region' }); } catch (e) { return null; } })();
@@ -1065,7 +1188,8 @@ function renderLists() {
   $('spListUpdate').disabled = !!info.busy;
   const nf = files.map(f => f.name + f.updated).join();
   if (nf !== renderLists.nf) { renderLists.nf = nf; listNames = { geoip: null, geosite: null }; }
-  const box = $('spLists'), key = JSON.stringify([ls, [...missing], files.map(f => f.name)]);
+  const sizes = info.sizes || {}, approx = info.approx || {};
+  const box = $('spLists'), key = JSON.stringify([ls, [...missing], files.map(f => f.name), sizes, V.notes]);
   if (box.dataset.k === key) return;
   box.dataset.k = key;
   box.innerHTML = '';
@@ -1079,9 +1203,13 @@ function renderLists() {
     el.querySelector('.name').textContent = listTitle(l.list);
     const p = el.querySelector('.path');
     let sub = l.list;
+    const ip = l.list.startsWith('geoip:'), n = sizes[l.list];
     if (!l.off && missing.has(l.list)) {
-      sub += has(l.list.startsWith('geoip:') ? 'geoip.dat' : 'geosite.dat') ? ' — такого списка нет' : ' — скачается после подключения';
+      sub += has(ip ? 'geoip.dat' : 'geosite.dat') ? ' — такого списка нет' : ' — скачается после подключения (файл ' + (ip ? 'адресов' : 'сайтов') + ' — около ' + (approx[ip ? 'geoip' : 'geosite'] || '?') + ' МБ)';
       p.style.color = 'var(--warn)';
+    } else if (n) {
+      sub += ' · ' + n.toLocaleString('ru-RU') + (ip ? ' диапазонов' : ' сайтов');
+      if (n > (info.big || 1e9)) { sub += ' — большой список: больше памяти и дольше загрузка'; p.style.color = 'var(--warn)'; }
     }
     p.textContent = sub; p.style.direction = 'ltr';
     const on = el.querySelector('.switch input'); on.checked = !l.off;
@@ -1091,6 +1219,7 @@ function renderLists() {
       b.classList.toggle('on', b.dataset.v === l.route);
       b.onclick = () => { const r = spRules(); r.lists[i].route = b.dataset.v; saveSplit(r); };
     });
+    if (!l.off) addNotes(el, 'list', l.list);
     box.appendChild(el);
   });
 }
@@ -1158,11 +1287,24 @@ function renderFails() {
 $('spFailClear').onclick = () => { tvkForgetFailures(); fails = []; renderFails(); };
 
 const openGroups = new Set();
-let conns = [];
+let conns = [], connView = 'now', connFilter = 'all';
+document.querySelectorAll('#spConnView .fbtn[data-v]').forEach(b => b.onclick = () => {
+  connView = b.dataset.v;
+  document.querySelectorAll('#spConnView .fbtn[data-v]').forEach(x => x.classList.toggle('on', x === b));
+  $('spHistClear').style.display = connView === 'recent' ? '' : 'none';
+  conns = [];
+  pollConns();
+});
+document.querySelectorAll('#spConnFilter .fbtn').forEach(b => b.onclick = () => {
+  connFilter = b.dataset.f;
+  document.querySelectorAll('#spConnFilter .fbtn').forEach(x => x.classList.toggle('on', x === b));
+  renderConns();
+});
+$('spHistClear').onclick = async () => { await tvkForgetHistory(); conns = []; renderConns(); };
 async function pollConns() {
   clearTimeout(pollConns.h);
   if (tab !== 'split') return;
-  try { conns = V && V.running ? (await tvkConns()) || [] : []; } catch (e) { conns = []; }
+  try { conns = V && V.running ? (await (connView === 'recent' ? tvkHistory() : tvkConns())) || [] : []; } catch (e) { conns = []; }
   try { fails = V && V.running ? (await tvkFailures()) || [] : []; } catch (e) { fails = []; }
   renderConns();
   renderFails();
@@ -1174,7 +1316,8 @@ function renderConns() {
   if (!V || !V.running) { box.innerHTML = '<div class="small muted">Подключитесь, чтобы видеть, какие программы куда соединяются.</div>'; return; }
   const q = $('spFilter').value.trim().toLowerCase();
   const groups = new Map();
-  conns.forEach(c => {
+  const pass = (c) => connFilter === 'all' || (connFilter === 'retried' ? c.retried : c.route === connFilter);
+  conns.filter(pass).forEach(c => {
     const k = c.path || (c.pid ? 'pid:' + c.pid : '?');
     if (!groups.has(k)) groups.set(k, { key: k, path: c.path || '', name: c.name || (c.pid ? 'Процесс ' + c.pid : 'Программа не определена'), list: [], up: 0, down: 0, direct: 0, vpn: 0, last: 0 });
     const g = groups.get(k);
@@ -1184,7 +1327,7 @@ function renderConns() {
   if (q) list = list.filter(g => g.name.toLowerCase().includes(q) || g.path.toLowerCase().includes(q) || g.list.some(c => c.dst.includes(q) || (c.host || '').includes(q)));
   list.sort((a, b) => b.last - a.last);
   if (!list.length) {
-    box.innerHTML = '<div class="small muted">' + (q ? 'Ничего не найдено.' : 'Соединений пока нет: список заполняется, пока открыта эта вкладка.') + '</div>';
+    box.innerHTML = '<div class="small muted">' + (q || connFilter !== 'all' ? 'Ничего не найдено.' : connView === 'recent' ? 'Закрытых соединений пока нет.' : 'Соединений пока нет: список заполняется, пока открыта эта вкладка.') + '</div>';
     return;
   }
   box.innerHTML = '';
@@ -1195,7 +1338,8 @@ function renderConns() {
     el.innerHTML = '<div class="head"><div class="grow"><div class="name"></div><div class="meta"></div></div>' + chip + '</div><div class="body"></div>';
     el.querySelector('.name').textContent = g.name;
     el.querySelector('.name').title = g.path;
-    el.querySelector('.meta').textContent = 'соединений: ' + g.list.length + ' · ↓ ' + size(g.down) + ' ↑ ' + size(g.up);
+    const count = g.list.reduce((n, c) => n + (c.n || 1), 0);
+    el.querySelector('.meta').textContent = 'соединений: ' + count + ' · ↓ ' + size(g.down) + ' ↑ ' + size(g.up);
     el.querySelector('.head').onclick = () => { openGroups.has(g.key) ? openGroups.delete(g.key) : openGroups.add(g.key); el.classList.toggle('open'); };
     const body = el.querySelector('.body');
     if (g.path) {
@@ -1214,6 +1358,20 @@ function renderConns() {
       const port = c.dst.slice(c.dst.lastIndexOf(':'));
       r.querySelector('.dst').textContent = c.proto + ' ' + (c.host ? c.host + (fake ? port : ' · ' + c.dst) : c.dst);
       r.title = c.why + ' · ↓ ' + size(c.down) + ' ↑ ' + size(c.up);
+      if (c.n > 1) {
+        const n = document.createElement('span'); n.className = 'n'; n.textContent = '×' + c.n;
+        r.insertBefore(n, r.querySelector('.chip'));
+      }
+      // A rule for this site alone (its main domain), the other way.
+      if (c.site) {
+        const other = c.route === 'direct' ? 'vpn' : 'direct';
+        const b = document.createElement('button');
+        b.className = 'act';
+        b.textContent = c.site + ' ' + (other === 'vpn' ? '→ VPN' : '→ напрямую');
+        b.title = 'Правило для сайта ' + c.site + ': ' + routeName(other);
+        b.onclick = (e) => { e.stopPropagation(); addDomain(c.site, other); };
+        r.appendChild(b);
+      }
       body.appendChild(r);
     });
     if (g.list.length > 40) {

@@ -51,6 +51,11 @@ type settings struct {
 	Autostart bool `json:"autostart"`
 	// NoStats: send the server no statistics (on by default).
 	NoStats bool `json:"no_stats"`
+	// CloseQuits: closing the window quits TurnVK instead of leaving it
+	// in the notification area (tray_windows.go).
+	CloseQuits bool `json:"close_quits"`
+	// TrayTold: the notification "TurnVK works in the background" was shown.
+	TrayTold bool `json:"tray_told"`
 	// Split: which programs go through the VPN (split tunneling).
 	Split split.Rules `json:"split"`
 }
@@ -74,6 +79,16 @@ type view struct {
 	Lists listsView `json:"lists"`
 	// Mode: the split tunneling mode the rules are in (split.ModeOf).
 	Mode string `json:"mode"`
+	// Net: the network now ("Wi-Fi «Home»", "кабель"; "" when unknown or
+	// not connected); NetRule: the network rule in use ("" for none) and
+	// EffMode: the mode applied because of it.
+	Net        string `json:"net"`
+	NetKey     string `json:"net_key"`
+	NetRule    string `json:"net_rule"`
+	NetRuleKey string `json:"net_rule_key"`
+	EffMode    string `json:"eff_mode"`
+	// Notes on the rules (split.CheckRules).
+	Notes []split.RuleNote `json:"notes"`
 }
 
 type app struct {
@@ -101,6 +116,8 @@ type app struct {
 	last   *lastConn
 	update *release
 	lists  listsState
+	// The physical network while connected (split rules by network).
+	netKind, netName string
 }
 
 // lastConn is what a report shows of a connection that has ended.
@@ -226,6 +243,14 @@ func (a *app) snapshot() view {
 	v.Settings.Profiles = append([]profile(nil), a.s.Profiles...)
 	v.Lists = a.listsView()
 	v.Mode = split.ModeOf(a.s.Split)
+	v.Notes = split.CheckRules(a.s.Split)
+	if a.eng != nil && a.netKind != "" {
+		v.NetKey = split.NetworkKey(a.netKind, a.netName)
+		v.Net = split.NetworkName(v.NetKey)
+	}
+	if eff, key := a.effective(); key != "" {
+		v.NetRule, v.NetRuleKey, v.EffMode = split.NetworkName(key), key, split.ModeOf(eff)
+	}
 	if p := a.current(); p != nil {
 		v.Settings.Current = p.ID
 	}
@@ -241,6 +266,31 @@ func (a *app) push() {
 	v := a.snapshot()
 	a.mu.Unlock()
 	a.eval("onView", v)
+	theTray.setTip(trayTip(v))
+	// VK's check needs the window: bring it up from the background.
+	if v.Status != nil && v.Status.State == engine.StateCaptcha {
+		theTray.showOnce("captcha")
+	} else {
+		theTray.showOnce("")
+	}
+}
+
+// trayTip is the text under the mouse on the tray icon.
+func trayTip(v view) string {
+	if !v.Running || v.Status == nil {
+		return "TurnVK — отключено"
+	}
+	switch v.Status.State {
+	case engine.StateConnected:
+		return "TurnVK — подключено"
+	case engine.StateConnecting:
+		return "TurnVK — подключается…"
+	case engine.StateCaptcha:
+		return "TurnVK — VK просит пройти проверку"
+	case engine.StateFailed:
+		return "TurnVK — ошибка подключения"
+	}
+	return "TurnVK"
 }
 
 // bind exposes the page's calls. They run on the window's thread, so
@@ -320,6 +370,13 @@ func (a *app) bind(w webview2.WebView) {
 	must(w.Bind("tvkSelect", func(id string) {
 		a.mu.Lock()
 		a.s.Current = id
+		a.save()
+		a.mu.Unlock()
+		a.push()
+	}))
+	must(w.Bind("tvkSetCloseQuits", func(on bool) {
+		a.mu.Lock()
+		a.s.CloseQuits = on
 		a.save()
 		a.mu.Unlock()
 		a.push()
@@ -415,6 +472,23 @@ func (a *app) bind(w webview2.WebView) {
 		go a.updateLists(e, true)
 		return nil
 	}))
+	must(w.Bind("tvkHistory", func() []split.Conn {
+		a.mu.Lock()
+		rt := a.router
+		a.mu.Unlock()
+		if rt == nil {
+			return nil
+		}
+		return rt.History(400)
+	}))
+	must(w.Bind("tvkForgetHistory", func() {
+		a.mu.Lock()
+		rt := a.router
+		a.mu.Unlock()
+		if rt != nil {
+			rt.ForgetHistory()
+		}
+	}))
 	must(w.Bind("tvkConns", func() []split.Conn {
 		a.mu.Lock()
 		rt := a.router
@@ -477,9 +551,10 @@ func (a *app) setSplit(r split.Rules) {
 	a.s.Split = r
 	a.save()
 	rt, e := a.router, a.eng
+	eff, _ := a.effective()
 	a.mu.Unlock()
 	if rt != nil {
-		rt.SetRules(r)
+		rt.SetRules(eff)
 		// New answers for names the rules now treat differently.
 		byName := len(r.Domains) > 0 || len(old.Domains) > 0 || len(r.Lists) > 0 || len(old.Lists) > 0
 		if old.On != r.On && byName || !sameDomains(old, r) || !slices.Equal(old.Lists, r.Lists) {
@@ -595,12 +670,14 @@ func (a *app) connect() error {
 		return errors.New("предыдущее подключение ещё закрывается, попробуйте через пару секунд")
 	}
 	var e *engine.Engine
-	v, err := winvpn.New(a.logf, func() {
+	var v *winvpn.VPN
+	v, err = winvpn.New(a.logf, func() {
 		a.mu.Lock()
 		cur := a.eng
 		a.mu.Unlock()
 		if cur != nil && cur == e {
 			cur.Reconnect("the network changed")
+			go a.networkChanged(v)
 		}
 	})
 	if err != nil {
@@ -629,7 +706,8 @@ func (a *app) connect() error {
 	stopped := a.stopped
 	note = fmt.Sprintf("connecting to %s (%s), %d routes", p.Name, l.Host, a.s.Sessions)
 	a.health = ""
-	rules := a.s.Split
+	a.netKind, a.netName = v.Network()
+	rules, _ := a.effective()
 	open := func(c *engine.WGConfig) (tun.Device, error) {
 		dev, err := v.Open(c)
 		if err != nil {
@@ -663,7 +741,7 @@ func (a *app) connect() error {
 		if a.eng == e {
 			a.router = rt
 			// Rules changed while connecting.
-			rules = a.s.Split
+			rules, _ = a.effective()
 		}
 		a.mu.Unlock()
 		rt.SetRules(rules)
@@ -763,4 +841,43 @@ func (a *app) remember(e *engine.Engine) {
 		return
 	}
 	a.last = &lastConn{eng: e, Ended: time.Now(), Status: st, Diag: d}
+}
+
+// effective: the split rules for the network the computer is on; a.mu is
+// held.
+func (a *app) effective() (split.Rules, string) {
+	if a.eng == nil {
+		return a.s.Split, ""
+	}
+	return split.ForNetwork(a.s.Split, a.netKind, a.netName)
+}
+
+// networkChanged applies the rules for the new network (the Wi-Fi's name
+// takes Windows a moment after the switch).
+func (a *app) networkChanged(v *winvpn.VPN) {
+	for _, wait := range []time.Duration{2 * time.Second, 5 * time.Second} {
+		time.Sleep(wait)
+		kind, name := v.Network()
+		a.mu.Lock()
+		if a.vpn != v {
+			a.mu.Unlock()
+			return
+		}
+		same := kind == a.netKind && name == a.netName
+		a.netKind, a.netName = kind, name
+		eff, key := a.effective()
+		rt := a.router
+		a.mu.Unlock()
+		if same {
+			continue
+		}
+		if rt != nil {
+			rt.SetRules(eff)
+			split.FlushDNS()
+		}
+		if key != "" {
+			a.logf("network %s: split mode %s", kind, split.ModeOf(eff))
+		}
+		a.push()
+	}
 }

@@ -31,6 +31,11 @@ type listsView struct {
 	// Missing: lists the rules name but the files do not have (or the
 	// files are not downloaded yet).
 	Missing []string `json:"missing"`
+	// Sizes: entries of each loaded list; Big: the size above which a
+	// list is large; Approx: about how many MB each file is.
+	Sizes  map[string]int `json:"sizes"`
+	Big    int            `json:"big"`
+	Approx map[string]int `json:"approx"`
 }
 
 type listsState struct {
@@ -52,11 +57,12 @@ func (a *app) listsDir() string {
 
 // listsView: a.mu is held.
 func (a *app) listsView() listsView {
-	v := listsView{Busy: a.lists.busy, Error: a.lists.err}
+	v := listsView{Busy: a.lists.busy, Error: a.lists.err, Sizes: a.lists.loaded.Sizes(), Big: split.BigList,
+		Approx: map[string]int{"geosite": split.ApproxFileSize(split.GeoSiteFile), "geoip": split.ApproxFileSize(split.GeoIPFile)}}
 	if dir := a.listsDir(); dir != "" {
 		v.Files = split.ListFiles(dir)
 	}
-	for _, r := range a.s.Split.Lists {
+	for _, r := range split.AllLists(a.s.Split) {
 		if !r.Off && !a.lists.loaded.Has(r.List) {
 			v.Missing = append(v.Missing, r.List)
 		}
@@ -67,7 +73,7 @@ func (a *app) listsView() listsView {
 // loadLists reads the lists the rules name and gives them to the router.
 func (a *app) loadLists() {
 	a.mu.Lock()
-	dir, rules := a.listsDir(), slices.Clone(a.s.Split.Lists)
+	dir, rules := a.listsDir(), split.AllLists(a.s.Split)
 	a.mu.Unlock()
 	if dir == "" {
 		return
@@ -94,7 +100,7 @@ func (a *app) loadLists() {
 func sameLists(a, b split.Rules) bool {
 	key := func(r split.Rules) []string {
 		var out []string
-		for _, l := range r.Lists {
+		for _, l := range split.AllLists(r) {
 			if !l.Off {
 				out = append(out, l.List)
 			}
@@ -113,7 +119,7 @@ func (a *app) updateLists(e *engine.Engine, force bool) {
 		a.mu.Unlock()
 		return
 	}
-	files := split.NeededFiles(a.s.Split.Lists)
+	files := split.NeededFiles(split.AllLists(a.s.Split))
 	dir := a.listsDir()
 	if len(files) == 0 || dir == "" {
 		a.mu.Unlock()
@@ -201,7 +207,8 @@ func (a *app) listNames(file string) []string {
 // any) under the current rules.
 func (a *app) explain(target, app string) (split.Explanation, error) {
 	a.mu.Lock()
-	rules, lists := a.s.Split, a.lists.loaded
+	rules, _ := a.effective()
+	lists := a.lists.loaded
 	a.mu.Unlock()
 	var addrs []netip.Addr
 	if h, err := split.NormalizeDomain(target); err == nil && strings.Contains(h, ".") {

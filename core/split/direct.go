@@ -15,6 +15,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -58,7 +59,7 @@ type tcpDirect struct {
 
 func newTCPDirect(r *Router) (*tcpDirect, error) {
 	s := stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, quietIPv6},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 	})
 	t := &tcpDirect{r: r, s: s, ep: channel.New(1024, uint32(r.mtu), "")}
@@ -76,7 +77,7 @@ func newTCPDirect(r *Router) (*tcpDirect, error) {
 	if e := s.SetSpoofing(1, true); e != nil {
 		return nil, fail("spoofing", e)
 	}
-	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
+	s.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}, {Destination: header.IPv6EmptySubnet, NIC: 1}})
 	// Reno, gVisor's default, not cubic as in the console client: here the
 	// stack talks to programs on the same computer, and cubic stalls at
 	// such round trips (a test sends 320 KB through it).
@@ -99,7 +100,11 @@ func newTCPDirect(r *Router) (*tcpDirect, error) {
 
 func (t *tcpDirect) inject(b []byte) {
 	pb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(b)})
-	t.ep.InjectInbound(ipv4.ProtocolNumber, pb)
+	proto := ipv4.ProtocolNumber
+	if len(b) > 0 && b[0]>>4 == 6 {
+		proto = ipv6.ProtocolNumber
+	}
+	t.ep.InjectInbound(proto, pb)
 	pb.DecRef()
 }
 
@@ -131,9 +136,14 @@ func (t *tcpDirect) close() {
 
 func (t *tcpDirect) accept(req *tcp.ForwarderRequest) {
 	id := req.ID()
-	src := netip.AddrPortFrom(netip.AddrFrom4(id.RemoteAddress.As4()), id.RemotePort)
-	dst := netip.AddrPortFrom(netip.AddrFrom4(id.LocalAddress.As4()), id.LocalPort)
+	src := netip.AddrPortFrom(stackAddr(id.RemoteAddress), id.RemotePort)
+	dst := netip.AddrPortFrom(stackAddr(id.LocalAddress), id.LocalPort)
 	f := t.r.flowFor(flowKey{protoTCP, src, dst})
+	if f != nil && f.reject {
+		req.Complete(true)
+		f.closed.Store(true)
+		return
+	}
 	if f != nil && f.sniffing {
 		t.acceptSniffing(req, f, src, dst)
 		return
@@ -176,6 +186,9 @@ func (t *tcpDirect) accept(req *tcp.ForwarderRequest) {
 // site's name, address after address.
 func (r *Router) dialTCP(d *net.Dialer, dst netip.AddrPort) (net.Conn, error) {
 	if !isFake(dst.Addr()) {
+		if dst.Addr().Is6() {
+			return d.DialContext(r.ctx, "tcp6", r.remap(dst).String())
+		}
 		return d.DialContext(r.ctx, "tcp4", r.remap(dst).String())
 	}
 	name := r.o.Fake.Name(dst.Addr())
@@ -321,7 +334,11 @@ func (u *udpNAT) sock(client netip.AddrPort) *natSock {
 		return nil
 	}
 	lc := net.ListenConfig{Control: u.r.control}
-	pc, err := lc.ListenPacket(u.r.ctx, "udp4", "0.0.0.0:0")
+	network, local := "udp4", "0.0.0.0:0"
+	if client.Addr().Is6() {
+		network, local = "udp6", "[::]:0"
+	}
+	pc, err := lc.ListenPacket(u.r.ctx, network, local)
 	if err != nil {
 		u.r.o.Logf("split: UDP socket: %v", err)
 		return nil
@@ -376,3 +393,15 @@ func (u *udpNAT) close() {
 		s.c.Close()
 	}
 }
+
+// stackAddr converts an address of the TCP stack.
+func stackAddr(a tcpip.Address) netip.Addr {
+	if a.Len() == 16 {
+		return netip.AddrFrom16(a.As16())
+	}
+	return netip.AddrFrom4(a.As4())
+}
+
+// quietIPv6 is IPv6 without router solicitations and address checks: the
+// stacks here only answer connections.
+var quietIPv6 = ipv6.NewProtocolWithOptions(ipv6.Options{})

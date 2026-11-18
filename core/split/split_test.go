@@ -19,6 +19,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
@@ -158,12 +159,23 @@ var (
 	lo      = netip.MustParseAddr("127.0.0.1")
 )
 
+// IPv6 likewise: 2001:db8::1 is ::1.
+var (
+	testFar6 = netip.MustParseAddr("2001:db8::1")
+	lo6      = netip.MustParseAddr("::1")
+	me6      = netip.MustParseAddr("fd00:7475:726e::2")
+)
+
 func swapTest(a netip.AddrPort) netip.AddrPort {
 	switch a.Addr() {
 	case testFar:
 		return netip.AddrPortFrom(lo, a.Port())
 	case lo:
 		return netip.AddrPortFrom(testFar, a.Port())
+	case testFar6:
+		return netip.AddrPortFrom(lo6, a.Port())
+	case lo6:
+		return netip.AddrPortFrom(testFar6, a.Port())
 	}
 	return a
 }
@@ -190,13 +202,14 @@ func newRig(t *testing.T, rules Rules, tweak ...func(*Options)) *rig {
 	}
 	g.r = New(g.ft, opts, rules)
 	g.pc = stack.New(stack.Options{
-		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, quietIPv6},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
 	ep := channel.New(1024, 1280, "")
 	g.pc.CreateNIC(1, ep)
 	g.pc.AddProtocolAddress(1, tcpip.ProtocolAddress{Protocol: ipv4.ProtocolNumber, AddressWithPrefix: tcpip.AddrFrom4(me.As4()).WithPrefix()}, stack.AddressProperties{})
-	g.pc.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}})
+	g.pc.AddProtocolAddress(1, tcpip.ProtocolAddress{Protocol: ipv6.ProtocolNumber, AddressWithPrefix: tcpip.AddrFrom16(me6.As16()).WithPrefix()}, stack.AddressProperties{})
+	g.pc.SetRouteTable([]tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: 1}, {Destination: header.IPv6EmptySubnet, NIC: 1}})
 	ctx, cancel := context.WithCancel(context.Background())
 	// The computer's packets enter the adapter...
 	go func() {
@@ -217,7 +230,11 @@ func newRig(t *testing.T, rules Rules, tweak ...func(*Options)) *rig {
 			select {
 			case b := <-g.ft.in:
 				pb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(b)})
-				ep.InjectInbound(ipv4.ProtocolNumber, pb)
+				proto := ipv4.ProtocolNumber
+				if b[0]>>4 == 6 {
+					proto = ipv6.ProtocolNumber
+				}
+				ep.InjectInbound(proto, pb)
 				pb.DecRef()
 			case <-ctx.Done():
 				return

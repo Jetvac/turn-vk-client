@@ -62,6 +62,14 @@ type Rules struct {
 	// NoRetry: a site sent direct that does not open is not tried again
 	// through the VPN.
 	NoRetry bool `json:"noRetry,omitempty"`
+	// AppsOnly: only programs with a rule "through the VPN" use it;
+	// everything else goes direct, whatever the rules for sites and lists
+	// say (they apply inside those programs). On Android the other apps
+	// do not even enter the tunnel.
+	AppsOnly bool `json:"appsOnly,omitempty"`
+	// Networks switch the mode by the network the device is on
+	// (network.go).
+	Networks []NetRule `json:"networks,omitempty"`
 }
 
 // DefaultRules: off; when turned on, everything goes through the VPN except
@@ -122,6 +130,17 @@ func (r *Rules) Normalize() {
 		lout = append(lout, l)
 	}
 	r.Lists = lout
+	nout := r.Networks[:0]
+	nseen := map[string]bool{}
+	for _, n := range r.Networks {
+		n.Network = normNetwork(n.Network)
+		if n.Network == "" || nseen[n.Network] || !validMode(n.Mode) {
+			continue
+		}
+		nseen[n.Network] = true
+		nout = append(nout, n)
+	}
+	r.Networks = nout
 }
 
 func key(path string, folder bool) string {
@@ -217,6 +236,8 @@ var lanPrefixes = []netip.Prefix{
 	netip.MustParsePrefix("192.168.0.0/16"),
 	netip.MustParsePrefix("169.254.0.0/16"),
 	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("fc00::/7"),
 }
 
 func newMatcher(r Rules, alwaysVPN []netip.Prefix, lists *Lists) *matcher {
@@ -229,7 +250,7 @@ func newMatcher(r Rules, alwaysVPN []netip.Prefix, lists *Lists) *matcher {
 		for _, d := range m.dom {
 			m.vpnSites = m.vpnSites || d.Route == VPN
 		}
-		m.anyDirect = m.directSites || r.Default == Direct
+		m.anyDirect = m.directSites || r.Default == Direct || r.AppsOnly
 		for i := range r.Lists {
 			l := &r.Lists[i]
 			if l.Off || lists == nil {
@@ -304,28 +325,54 @@ func (m *matcher) decide(dst netip.Addr, host string, p *Proc) Decision {
 	if d, ok := m.fixed(dst); ok {
 		return d
 	}
+	if m.rules.AppsOnly {
+		// Only the chosen programs use the VPN; inside them the rules
+		// for sites still apply.
+		a, parent := m.appFor(p)
+		if a == nil || a.Route != VPN {
+			return Decision{Direct, whyNotChosen}
+		}
+		if d, ok := m.site(host); ok {
+			return d
+		}
+		return Decision{VPN, m.why(a, parent)}
+	}
 	if d, ok := m.site(host); ok {
 		return d
 	}
-	if p != nil && p.Path != "" {
-		if a := m.app(normPath(p.Path)); a != nil {
-			return Decision{a.Route, m.why(a, "")}
-		}
-		for _, n := range p.Alt {
-			if a := m.app(normPath(n)); a != nil {
-				return Decision{a.Route, m.why(a, "")}
-			}
-		}
-		for _, parent := range p.Parents {
-			if a := m.app(normPath(parent)); a != nil && a.Children {
-				return Decision{a.Route, m.why(a, baseName(parent))}
-			}
-		}
+	if a, parent := m.appFor(p); a != nil {
+		return Decision{a.Route, m.why(a, parent)}
 	}
 	if d, ok := m.ipList(dst); ok {
 		return d
 	}
 	return Decision{m.rules.Default, "остальные программы"}
+}
+
+// whyNotChosen: with only the chosen programs through the VPN, another
+// program's connection.
+const whyNotChosen = "программа не выбрана для VPN"
+
+// appFor finds the rule for a program: its own, another name of it, or
+// that of a program which started it (parent: that program's name).
+func (m *matcher) appFor(p *Proc) (a *AppRule, parent string) {
+	if p == nil || p.Path == "" {
+		return nil, ""
+	}
+	if a := m.app(normPath(p.Path)); a != nil {
+		return a, ""
+	}
+	for _, n := range p.Alt {
+		if a := m.app(normPath(n)); a != nil {
+			return a, ""
+		}
+	}
+	for _, pp := range p.Parents {
+		if a := m.app(normPath(pp)); a != nil && a.Children {
+			return a, baseName(pp)
+		}
+	}
+	return nil, ""
 }
 
 // site finds the rule for a site's name: the user's own sites first (the

@@ -202,24 +202,40 @@ func (r *Router) openSniffed(f *flow, src, dst netip.AddrPort, host string, head
 
 // --- the sites that failed direct ---
 
-func failKeys(host string, dst netip.Addr) []string {
+// failKeys: the keys a failure is kept under. QUIC's are apart ("q"):
+// a network that lets no UDP through must not send the sites' TCP through
+// the VPN too.
+func failKeys(host string, dst netip.Addr, quic bool) []string {
+	p := ""
+	if quic {
+		p = "q"
+	}
 	var k []string
 	if host != "" {
-		k = append(k, "h:"+strings.ToLower(strings.TrimSuffix(host, ".")))
+		k = append(k, p+"h:"+strings.ToLower(strings.TrimSuffix(host, ".")))
 	}
 	if dst.IsValid() && !isFake(dst) {
-		k = append(k, "a:"+dst.String())
+		k = append(k, p+"a:"+dst.String())
 	}
 	return k
 }
 
 // failedBefore: the site (by name, else by address) did not open direct
-// lately but did through the VPN.
+// lately but did through the VPN (TCP; QUIC also when its own QUIC did
+// not).
 func (r *Router) failedBefore(host string, dst netip.Addr) bool {
+	return r.failedBeforeAs(host, dst, false)
+}
+
+func (r *Router) failedBeforeQUIC(host string, dst netip.Addr) bool {
+	return r.failedBeforeAs(host, dst, true) || r.failedBeforeAs(host, dst, false)
+}
+
+func (r *Router) failedBeforeAs(host string, dst netip.Addr, quic bool) bool {
 	now := time.Now().UnixMilli()
 	r.fmu.Lock()
 	defer r.fmu.Unlock()
-	for _, k := range failKeys(host, dst) {
+	for _, k := range failKeys(host, dst, quic) {
 		if x := r.failed[k]; x != nil && x.OK && now-x.Last < failTTL.Milliseconds() {
 			return true
 		}
@@ -247,7 +263,7 @@ func (r *Router) noteFailed(f *flow, host string, err error, ok bool) {
 	if r.failed == nil || len(r.failed) > maxFailures {
 		r.failed = map[string]*Failure{}
 	}
-	keys := failKeys(host, dst)
+	keys := failKeys(host, dst, f.key.proto == protoUDP)
 	var x *Failure
 	for _, k := range keys {
 		if x = r.failed[k]; x != nil {
@@ -323,4 +339,54 @@ func (r *Router) ForgetFailures() {
 	r.fmu.Lock()
 	r.failed = nil
 	r.fmu.Unlock()
+}
+
+// --- QUIC ---
+
+// A QUIC connection (UDP 443) sent direct to a real address is watched:
+// when nothing comes back in quicRetryWait, its next packets go through
+// the VPN, starting with copies of its first ones (the program resends
+// them anyway), and the site is remembered as for TCP. A site behind a
+// placeholder is not switched (the VPN cannot reach a placeholder); its
+// program falls back to TCP, which is retried.
+const (
+	quicRetryWait = 2 * time.Second
+	quicKeep      = 4
+)
+
+// quicWatch starts watching a direct QUIC flow.
+func (r *Router) quicWatch(f *flow) {
+	f.qwatch.Store(true)
+	r.wantPump.Store(true)
+	time.AfterFunc(quicRetryWait, func() { r.quicCheck(f) })
+}
+
+// quicKeepPkt keeps a copy of one of the flow's first packets.
+func (f *flow) quicKeepPkt(b []byte) {
+	f.qmu.Lock()
+	if len(f.qheld) < quicKeep {
+		f.qheld = append(f.qheld, append([]byte(nil), b...))
+	}
+	f.qmu.Unlock()
+}
+
+func (r *Router) quicCheck(f *flow) {
+	if !f.qwatch.CompareAndSwap(true, false) || r.ctx.Err() != nil {
+		return
+	}
+	f.qmu.Lock()
+	held := f.qheld
+	f.qheld = nil
+	f.qmu.Unlock()
+	if f.down.Load() > 0 || f.closed.Load() || !f.local.Load() {
+		return
+	}
+	r.mu.Lock()
+	f.route, f.why = VPN, whyRetried
+	r.mu.Unlock()
+	f.local.Store(false)
+	for _, b := range held {
+		r.injectPkt(b)
+	}
+	r.noteFailed(f, f.host, &directErr{why: "QUIC: нет ответа за 2 с"}, true)
 }

@@ -43,7 +43,18 @@ var sp = struct {
 	busy   bool
 	err    string
 	names  map[string][]string
-}{rules: split.DefaultRules(), fake: split.NewFake()}
+	// The network the phone is on (SetNetwork): the rules by network
+	// apply to it.
+	netKind, netName string
+	// wifiOnly: the lists are updated on Wi-Fi only (or by hand).
+	wifiOnly bool
+	waiting  bool // an update waits for Wi-Fi
+}{rules: split.DefaultRules(), fake: split.NewFake(), wifiOnly: true}
+
+// effective: the rules for the current network; sp.mu is held.
+func effective() (split.Rules, string) {
+	return split.ForNetwork(sp.rules, sp.netKind, sp.netName)
+}
 
 // SetSplit sets the rules (JSON, as on Windows: on, default, lan, apps
 // with package names as paths, domains, lists) and applies them to new
@@ -60,10 +71,11 @@ func SetSplit(rulesJSON string) (string, error) {
 	sp.mu.Lock()
 	old := sp.rules
 	sp.rules = r
+	eff, _ := effective()
 	rt := sp.router
 	sp.mu.Unlock()
 	if rt != nil {
-		rt.SetRules(r)
+		rt.SetRules(eff)
 	}
 	if !sameListNames(old, r) {
 		go loadLists()
@@ -76,7 +88,7 @@ func SetSplit(rulesJSON string) (string, error) {
 func sameListNames(a, b split.Rules) bool {
 	key := func(r split.Rules) []string {
 		var out []string
-		for _, l := range r.Lists {
+		for _, l := range split.AllLists(r) {
 			if !l.Off {
 				out = append(out, l.List)
 			}
@@ -93,7 +105,7 @@ func sameListNames(a, b split.Rules) bool {
 // should be let in (nothing else goes through the VPN).
 func AppPlan() string {
 	sp.mu.Lock()
-	r := sp.rules
+	r, _ := effective()
 	sp.mu.Unlock()
 	b, _ := json.Marshal(split.PlanApps(r))
 	return string(b)
@@ -126,6 +138,88 @@ func Conns() string {
 	return string(b)
 }
 
+// History returns, as JSON, the connections that ended in the last hour,
+// merged by app, site and route (n: how many), while connected.
+func History() string {
+	sp.mu.Lock()
+	rt := sp.router
+	sp.mu.Unlock()
+	if rt == nil {
+		return "[]"
+	}
+	b, _ := json.Marshal(rt.History(300))
+	return string(b)
+}
+
+// ForgetHistory empties that list.
+func ForgetHistory() {
+	sp.mu.Lock()
+	rt := sp.router
+	sp.mu.Unlock()
+	if rt != nil {
+		rt.ForgetHistory()
+	}
+}
+
+// CheckRules returns, as JSON (split.RuleNote), the notes on the rules
+// (JSON): which rule changes nothing, which is beaten by another.
+func CheckRules(rulesJSON string) string {
+	r := split.DefaultRules()
+	_ = json.Unmarshal([]byte(rulesJSON), &r)
+	b, _ := json.Marshal(split.CheckRules(r))
+	if string(b) == "null" {
+		return "[]"
+	}
+	return string(b)
+}
+
+// SetNetwork tells the network the phone is on: kind "wifi", "mobile",
+// "wired" or "" (unknown), and the Wi-Fi's name when known. The rules
+// for that network apply to new connections at once. It returns true
+// when the apps Android lets into the tunnel change (a reconnect is
+// needed).
+func SetNetwork(kind, wifiName string) bool {
+	sp.mu.Lock()
+	before, _ := effective()
+	sp.netKind, sp.netName = kind, wifiName
+	eff, key := effective()
+	rt := sp.router
+	wait := sp.waiting && kind != split.NetMobile
+	sp.mu.Unlock()
+	if rt != nil {
+		rt.SetRules(eff)
+	}
+	if key != "" {
+		splitLog(fmt.Sprintf("сеть: %s — режим «%s»", split.NetworkName(key), split.ModeOf(eff)))
+	}
+	if wait {
+		go updateLists(currentEngine(), false)
+	}
+	a, _ := json.Marshal(split.PlanApps(before))
+	b, _ := json.Marshal(split.PlanApps(eff))
+	return string(a) != string(b)
+}
+
+// Effective returns, as JSON, what applies now: mode, the network rule
+// in use (network, its name in words) and the network.
+func Effective() string {
+	sp.mu.Lock()
+	eff, key := effective()
+	kind, name := sp.netKind, sp.netName
+	sp.mu.Unlock()
+	b, _ := json.Marshal(map[string]any{"mode": split.ModeOf(eff), "network": key, "networkName": split.NetworkName(key),
+		"kind": kind, "wifi": name, "here": split.NetworkName(split.NetworkKey(kind, name))})
+	return string(b)
+}
+
+// SetListsWiFiOnly: update the lists on Wi-Fi only (the button "update"
+// works anywhere).
+func SetListsWiFiOnly(on bool) {
+	sp.mu.Lock()
+	sp.wifiOnly = on
+	sp.mu.Unlock()
+}
+
 // wrapTun puts the router in front of WireGuard.
 func wrapTun(dev tun.Device, c *engine.WGConfig, p Platform, protect func(uintptr) error) tun.Device {
 	always := []netip.Prefix{c.Address.Masked()}
@@ -152,7 +246,8 @@ func wrapTun(dev tun.Device, c *engine.WGConfig, p Platform, protect func(uintpt
 		},
 	}
 	sp.mu.Lock()
-	rules, lists := sp.rules, sp.lists
+	rules, _ := effective()
+	lists := sp.lists
 	sp.mu.Unlock()
 	rt := split.New(dev, split.Options{
 		Protect: protect, Owner: owner, AlwaysVPN: always, DNS: dns, Fake: sp.fake, Addr: c.Address.Addr(),
@@ -164,10 +259,11 @@ func wrapTun(dev tun.Device, c *engine.WGConfig, p Platform, protect func(uintpt
 	}, rules)
 	sp.mu.Lock()
 	sp.router = rt
-	rules = sp.rules // changed meanwhile
+	rules, _ = effective() // changed meanwhile
+	all := split.AllLists(sp.rules)
 	sp.mu.Unlock()
 	rt.SetRules(rules)
-	if len(split.NeededFiles(rules.Lists)) > 0 {
+	if len(split.NeededFiles(all)) > 0 {
 		rt.UsePump() // the lists come through the tunnel (DialVPN)
 	}
 	return rt
@@ -194,7 +290,7 @@ func listsDir() string {
 func loadLists() {
 	dir := listsDir()
 	sp.mu.Lock()
-	rules := slices.Clone(sp.rules.Lists)
+	rules := split.AllLists(sp.rules)
 	sp.mu.Unlock()
 	if dir == "" {
 		return
@@ -218,6 +314,12 @@ type listsView struct {
 	Busy    bool             `json:"busy"`
 	Error   string           `json:"error"`
 	Missing []string         `json:"missing"`
+	// Sizes: entries of each loaded list; Big: the size above which a
+	// list is large; Approx: about how many MB each file to download is.
+	Sizes   map[string]int `json:"sizes"`
+	Big     int            `json:"big"`
+	Approx  map[string]int `json:"approx"`
+	Waiting bool           `json:"waiting"` // waits for Wi-Fi
 }
 
 // ListsInfo returns the state of the lists as JSON: files (name, size,
@@ -226,8 +328,9 @@ type listsView struct {
 func ListsInfo() string {
 	dir := listsDir()
 	sp.mu.Lock()
-	v := listsView{Busy: sp.busy, Error: sp.err}
-	for _, r := range sp.rules.Lists {
+	v := listsView{Busy: sp.busy, Error: sp.err, Sizes: sp.lists.Sizes(), Big: split.BigList, Waiting: sp.waiting,
+		Approx: map[string]int{"geosite": split.ApproxFileSize(split.GeoSiteFile), "geoip": split.ApproxFileSize(split.GeoIPFile)}}
+	for _, r := range split.AllLists(sp.rules) {
 		if !r.Off && !sp.lists.Has(r.List) {
 			v.Missing = append(v.Missing, r.List)
 		}
@@ -293,11 +396,19 @@ func updateLists(e *engine.Engine, force bool) {
 	}
 	dir := listsDir()
 	sp.mu.Lock()
-	files := split.NeededFiles(sp.rules.Lists)
+	files := split.NeededFiles(split.AllLists(sp.rules))
 	if sp.busy || dir == "" || len(files) == 0 {
 		sp.mu.Unlock()
 		return
 	}
+	// On mobile data the lists wait for Wi-Fi (the site file is near
+	// 90 MB), unless asked for by hand.
+	if !force && sp.wifiOnly && sp.netKind == split.NetMobile {
+		sp.waiting = true
+		sp.mu.Unlock()
+		return
+	}
+	sp.waiting = false
 	sp.busy, sp.err = true, ""
 	sp.mu.Unlock()
 
@@ -385,7 +496,8 @@ func ApplyMode(rulesJSON, mode string) (string, error) {
 // While connected, the site's addresses are found through the VPN.
 func Explain(target, app string) (string, error) {
 	sp.mu.Lock()
-	r, l, rt := sp.rules, sp.lists, sp.router
+	r, _ := effective()
+	l, rt := sp.lists, sp.router
 	sp.mu.Unlock()
 	if l == nil && len(r.Lists) > 0 {
 		loadLists()
