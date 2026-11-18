@@ -118,6 +118,10 @@ const (
 	// pathReplace: a direct path silent this long while others answer is
 	// replaced (three missed pings).
 	pathReplace = 6 * time.Second
+	// relayDownProof: how much later than a silent TURN server's routes
+	// others must have answered for that server to be blamed (a ping
+	// round, so a server restart or lost network blames no relay).
+	relayDownProof = 2 * time.Second
 	// wakeGrace: after the device slept, routes get this long to answer
 	// before any is replaced; sleepGap: a gap between the watchdog's ticks
 	// (wall clock) this long means the device slept.
@@ -990,13 +994,11 @@ func (e *Engine) replaceSilentPaths(list []*session.Session) {
 	if now.UnixNano()-e.wokeAt.Load() < int64(dozeWindow) {
 		replaceAfter = dozeReplace
 	}
-	total, freshBy := map[string]int{}, map[string]int{}
+	total, heard := map[string]int{}, map[string]int64{}
 	var cands []*session.Session
 	for _, s := range list {
 		total[s.Server]++
-		if s.Fresh(now) {
-			freshBy[s.Server]++
-		}
+		heard[s.Server] = max(heard[s.Server], s.LastRx.Load())
 		if s.Direct() && s.Silent(now) > replaceAfter && time.Since(s.Started) > pathReplace {
 			cands = append(cands, s)
 		}
@@ -1009,11 +1011,14 @@ func (e *Engine) replaceSilentPaths(list []*session.Session) {
 		silent[s.Server]++
 	}
 	// Every route through a TURN server fell silent while routes through
-	// another answer: that server stopped relaying. New routes go elsewhere
-	// for a while instead of waiting out its allocation timeout.
+	// another kept answering after it: that server stopped relaying. New
+	// routes go elsewhere for a while instead of waiting out its
+	// allocation timeout. When the WDTT server restarts or the device
+	// loses the network, every route stops at about the same moment and
+	// none answers later: no relay is to blame.
 	down := map[string]bool{}
 	for sv, n := range silent {
-		if n == total[sv] && n >= 2 && fresh-freshBy[sv] >= 2 && e.cfg.TURNServer == "" {
+		if n == total[sv] && n >= 2 && answeredAfter(list, sv, heard[sv]) >= 2 && e.cfg.TURNServer == "" {
 			down[sv] = true
 			e.logf("TURN server %s stopped relaying, new routes avoid it for %s", sv, relayDownFor)
 			e.relays.failed(sv, now)
@@ -1034,7 +1039,7 @@ func (e *Engine) replaceSilentPaths(list []*session.Session) {
 				s.Probe()
 			}
 		}
-		if last := e.massSilentLog.Load(); now.UnixNano()-last > int64(time.Minute) && e.massSilentLog.CompareAndSwap(last, now.UnixNano()) {
+		if last := e.massSilentLog.Load(); n < len(cands) && now.UnixNano()-last > int64(time.Minute) && e.massSilentLog.CompareAndSwap(last, now.UnixNano()) {
 			e.logf("%d of %d routes silent at once: checking them instead of replacing", len(cands)-n, len(list))
 		}
 		return
@@ -1043,6 +1048,19 @@ func (e *Engine) replaceSilentPaths(list []*session.Session) {
 		e.logf("route %d (%s) silent for %s, replacing it", s.ID, s.Server, s.Silent(now).Round(time.Second))
 		s.Close()
 	}
+}
+
+// answeredAfter counts routes through other TURN servers that heard from
+// the WDTT server well after the last route through sv did (a ping round
+// later): proof that the server and the network were still there.
+func answeredAfter(list []*session.Session, sv string, last int64) int {
+	n := 0
+	for _, s := range list {
+		if s.Server != sv && s.LastRx.Load() > last+int64(relayDownProof) {
+			n++
+		}
+	}
+	return n
 }
 
 // replaceDeadPaths probes every path and closes those that do not answer
@@ -1178,7 +1196,9 @@ func (e *Engine) noteError(msg string) {
 // Status returns a snapshot.
 func (e *Engine) Status() Status {
 	list := e.b.list()
-	st := Status{Sessions: len(list), Target: int(e.target.Load()), RxBytes: e.rxClosed.Load(), TxBytes: e.txClosed.Load(), Reconnects: e.reconnect.Load()}
+	// Routes opened before VK refused more keep running: the target
+	// limits new ones, so it is never shown below the routes there are.
+	st := Status{Sessions: len(list), Target: max(int(e.target.Load()), len(list)), RxBytes: e.rxClosed.Load(), TxBytes: e.txClosed.Load(), Reconnects: e.reconnect.Load()}
 	for _, s := range list {
 		st.RxBytes += s.RxBytes.Load()
 		st.TxBytes += s.TxBytes.Load()

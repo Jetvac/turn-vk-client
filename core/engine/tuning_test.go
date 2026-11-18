@@ -294,3 +294,33 @@ func TestLogLimiter(t *testing.T) {
 		t.Fatalf("next window: %q %v", line, ok)
 	}
 }
+
+// A relay is blamed only when routes through another answered well after
+// it fell silent; when everything stops together (the WDTT server
+// restarts, the network goes) none is.
+func TestRelayDownProof(t *testing.T) {
+	const a, b = "a:1", "b:1"
+	var list []*session.Session
+	for i := 0; i < 4; i++ {
+		list = append(list, route(a), route(b))
+	}
+	stop := time.Now()
+	set := func(sv string, at time.Time) {
+		for _, s := range list {
+			if s.Server == sv {
+				s.LastRx.Store(at.UnixNano())
+			}
+		}
+	}
+	// Everything stopped at once; b's last pings came a moment later.
+	set(a, stop.Add(-1500*time.Millisecond))
+	set(b, stop.Add(-200*time.Millisecond))
+	if n := answeredAfter(list, a, stop.Add(-1500*time.Millisecond).UnixNano()); n != 0 {
+		t.Fatalf("blamed a relay for a common stop: %d", n)
+	}
+	// Only a stopped: b keeps answering.
+	set(b, stop.Add(5*time.Second))
+	if n := answeredAfter(list, a, stop.Add(-1500*time.Millisecond).UnixNano()); n != 4 {
+		t.Fatalf("answered after = %d, want 4", n)
+	}
+}
