@@ -105,6 +105,8 @@ data class SplitRules(
     val noRetry: Boolean = false,
     /** Only the apps sent through the VPN enter it; the others stay out. */
     val appsOnly: Boolean = false,
+    /** "Own rules" chosen: not read back as a ready-made mode. */
+    val custom: Boolean = false,
     /** Modes by network. */
     val networks: List<NetRoute> = emptyList(),
 ) {
@@ -117,6 +119,7 @@ data class SplitRules(
         o.put("domains", JSONArray().apply { domains.forEach { put(JSONObject().put("domain", it.domain).put("route", it.route).put("off", it.off)) } })
         o.put("lists", JSONArray().apply { lists.forEach { put(JSONObject().put("list", it.list).put("route", it.route).put("off", it.off)) } })
         o.put("appsOnly", appsOnly)
+        if (custom) o.put("custom", true)
         o.put("networks", JSONArray().apply { networks.forEach { put(JSONObject().put("network", it.network).put("mode", it.mode).put("off", it.off)) } })
         return o.toString()
     }
@@ -138,6 +141,7 @@ data class SplitRules(
                 lists = arr("lists") { ListRoute(it.optString("list"), it.optString("route", "direct"), it.optBoolean("off")) },
                 noRetry = o.optBoolean("noRetry"),
                 appsOnly = o.optBoolean("appsOnly"),
+                custom = o.optBoolean("custom"),
                 networks = arr("networks") { NetRoute(it.optString("network"), it.optString("mode", "vpn"), it.optBoolean("off")) },
             )
         }.getOrDefault(SplitRules())

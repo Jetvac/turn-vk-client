@@ -67,6 +67,9 @@ type Rules struct {
 	// say (they apply inside those programs). On Android the other apps
 	// do not even enter the tunnel.
 	AppsOnly bool `json:"appsOnly,omitempty"`
+	// Custom: the user chose "own rules", so the rules are not read back
+	// as a ready-made mode even when they still hold its lists.
+	Custom bool `json:"custom,omitempty"`
 	// Networks switch the mode by the network the device is on
 	// (network.go).
 	Networks []NetRule `json:"networks,omitempty"`

@@ -874,6 +874,7 @@ const modeNames = { vpn: 'Всё через VPN', blocked: 'Только заб�
 // The same as split.ModeOf, for the page's own changes before Go answers.
 function localMode(r) {
   if (!r.on) return 'vpn';
+  if (r.custom) return 'custom';
   if (r.appsOnly) return 'apps';
   const has = (n, rt) => (r.lists || []).some(l => l.list === n && l.route === rt && !l.off);
   const def = r.default || 'vpn';

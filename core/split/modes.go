@@ -46,6 +46,9 @@ func ModeOf(r Rules) string {
 	if !r.On {
 		return ModeVPN
 	}
+	if r.Custom {
+		return ModeCustom
+	}
 	if r.AppsOnly {
 		return ModeApps
 	}
@@ -89,6 +92,7 @@ func ApplyMode(r Rules, mode string) Rules {
 		r.Default = Direct
 	}
 	r.AppsOnly = mode == ModeApps
+	r.Custom = mode == ModeCustom
 	r.On = true
 	r.LAN = r.LAN || mode != ModeCustom
 	for _, want := range modeLists[mode] {
