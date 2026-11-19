@@ -151,6 +151,18 @@ const (
 	// offlineWait: with no network (sendto: network is unreachable) new
 	// routes wait this long, or until the platform reports a new network.
 	offlineWait = 15 * time.Second
+	// silentWait..silentWaitMax: while the WDTT server answers no route
+	// (it is down, or its network is), one route checks it this often,
+	// doubling; the rest wait. Each check costs a VK allocation.
+	silentWait    = 15 * time.Second
+	silentWaitMax = 2 * time.Minute
+	// allocLife: how long VK may go on counting an allocation nobody
+	// freed (a TURN allocation's lifetime).
+	allocLife = 10 * time.Minute
+	// raiseProbe: error 486 this soon after more routes were tried means
+	// that number does not fit; the next try waits twice as long (up to
+	// four times targetRestore).
+	raiseProbe = 5 * time.Minute
 )
 
 // Engine is one running connection.
@@ -213,6 +225,15 @@ type Engine struct {
 
 	// offline: no network; new routes wait for it (offline.go).
 	offline offlineGate
+	// silent: the WDTT server answers no route; new routes wait (one
+	// checks it now and then).
+	silent offlineGate
+	// raisedAt: when more routes were last tried (unix ns, 0 once
+	// judged); raiseFails: how many tries in a row met error 486 at once.
+	raisedAt   atomic.Int64
+	raiseFails atomic.Int32
+	// unfreedAt: when a route's allocation was last left unfreed.
+	unfreedAt atomic.Int64
 
 	logs logLimiter // merges repeated log lines
 
@@ -268,6 +289,12 @@ type hashState struct {
 	waitUntil time.Time
 	groups    map[int]*credSlot
 	full      map[int32]time.Time // guests that hit VK's allocation limit, when
+	// start: when this engine began; bases: guests 0..bases-1 are the
+	// groups' own; moved: a base guest an earlier run left busy -> the
+	// guest its groups use instead (startGuest).
+	start time.Time
+	bases int32
+	moved map[int32]int32
 }
 
 type credSlot struct {
@@ -331,8 +358,11 @@ func New(cfg Config) (*Engine, error) {
 		Cache:   &vkcreds.Cache{Path: cfg.VKCache},
 		Logf:    e.logf,
 	}
+	// Groups start on guests 0..bases-1 of each call (startGuest).
+	perHash := (cfg.Sessions + len(cfg.Link.Hashes) - 1) / max(1, len(cfg.Link.Hashes))
+	bases := int32((perHash + perGuest - 1) / perGuest)
 	for _, h := range cfg.Link.Hashes {
-		e.hashes = append(e.hashes, &hashState{hash: h, cache: e.vk.Cache})
+		e.hashes = append(e.hashes, &hashState{hash: h, cache: e.vk.Cache, start: time.Now(), bases: bases})
 	}
 	if len(e.hashes) == 0 {
 		return nil, errors.New("no VK call in the link")
@@ -471,6 +501,10 @@ func (e *Engine) worker(i int, s *session.Session) {
 			if !e.offline.wait(e.ctx) {
 				return
 			}
+			// The server answers no route: one route checks it.
+			if !e.silent.wait(e.ctx) {
+				return
+			}
 			var err error
 			s, err = e.dial(e.ctx, i, fails)
 			if err != nil {
@@ -485,6 +519,17 @@ func (e *Engine) worker(i int, s *session.Session) {
 				if unreachable(err) {
 					if e.offline.down(time.Now(), offlineWait) {
 						e.noteError("no network: new routes wait for it")
+					}
+					fails--
+					continue
+				}
+				// VK allocated, but the WDTT server answers no route:
+				// it is down (or its network is). One route checks it
+				// now and then instead of every route, each costing a
+				// VK allocation.
+				if errors.Is(err, session.ErrNoWelcome) && e.mode.Load() == modeDirect && len(e.b.list()) == 0 {
+					if d, news := e.silent.backoff(time.Now(), silentWait, silentWaitMax); news {
+						e.noteError(fmt.Sprintf("the server does not answer: one route checks it every %s", d.Round(time.Second)))
 					}
 					fails--
 					continue
@@ -504,6 +549,7 @@ func (e *Engine) worker(i int, s *session.Session) {
 			}
 			fails = 0
 			e.offline.up()
+			e.silent.up()
 			if opened {
 				e.reconnect.Add(1)
 			}
@@ -596,7 +642,7 @@ func (e *Engine) dial(ctx context.Context, i, shift int) (*session.Session, erro
 		Peer: e.peer, TURNServer: server, Username: creds.Username, Password: creds.Password,
 		AEAD: e.aead, Mode: e.cfg.Mode, Net: e.cfg.Net,
 		ConnPassword: e.cfg.Link.Password, DeviceID: e.cfg.DeviceID, Generation: e.gen, Worker: i,
-		OnReset: e.serverReset, Logf: e.logf,
+		OnReset: e.serverReset, Logf: e.logf, OnUnfreed: e.noteUnfreed,
 		Direct: mode != modeDTLS, Keys: &e.keys, ServerKey: e.cfg.Link.ServerKey,
 	}
 	if mode == modeUnknown {
@@ -638,7 +684,9 @@ func (e *Engine) dial(ctx context.Context, i, shift int) (*session.Session, erro
 	case errors.As(err, &te) && te.CredentialsRejected():
 		hs.invalidate(g, creds)
 	case err == nil:
-		hs.slot(g).quotaFails.Store(0)
+		cs := hs.slot(g)
+		cs.quotaFails.Store(0)
+		hs.cache.Hold(hs.guestKey(cs.guest.Load()), time.Now())
 	case errors.As(err, &te), err != nil && ctx.Err() != nil && e.ctx.Err() == nil && !unreachable(err):
 		// The TURN server did not allocate, or the route never came up.
 		if e.cfg.TURNServer == "" {
@@ -677,7 +725,7 @@ func (hs *hashState) slot(g int) *credSlot {
 	cs := hs.groups[g]
 	if cs == nil {
 		cs = &credSlot{}
-		cs.guest.Store(int32(g * perCreds / perGuest))
+		cs.guest.Store(hs.startGuest(int32(g*perCreds/perGuest), time.Now()))
 		// Credentials saved by an earlier run: no VK request at all.
 		if c := hs.cache.Creds(hs.credsKey(g, cs)); c != nil {
 			cs.cur.Store(c)
@@ -686,6 +734,76 @@ func (hs *hashState) slot(g int) *credSlot {
 	}
 	return cs
 }
+
+// busy tells whether an earlier run left guest x's allocations unfreed
+// lately (the app was killed, or stopped without network): VK may still
+// count them. hs.mu is held.
+func (hs *hashState) busy(x int32, now time.Time) bool {
+	t := hs.cache.Held(hs.guestKey(x))
+	return t.Before(hs.start.Truncate(time.Second)) && now.Sub(t) < allocLife // saved in seconds
+}
+
+// startGuest picks the guest a group starts with: its own (base), unless
+// an earlier run left it busy; then a guest no group starts with, the
+// same for both groups of the guest, so the first routes do not all meet
+// error 486. hs.mu is held.
+func (hs *hashState) startGuest(base int32, now time.Time) int32 {
+	if to, ok := hs.moved[base]; ok {
+		return to
+	}
+	if !hs.busy(base, now) {
+		return base
+	}
+	taken := map[int32]bool{}
+	for _, to := range hs.moved {
+		taken[to] = true
+	}
+	for x := hs.bases; x < maxGuests; x++ {
+		if !taken[x] && !hs.busy(x, now) {
+			if hs.moved == nil {
+				hs.moved = map[int32]int32{}
+			}
+			hs.moved[base] = x
+			return x
+		}
+	}
+	return base
+}
+
+// guestKey names guest x of the call in the cache's holds.
+func (hs *hashState) guestKey(x int32) string {
+	return fmt.Sprintf("%s#%d", hs.hash, x)
+}
+
+// holdGuests notes the guests whose routes hold allocations now (saved
+// at most once a minute), so that a run killed later knows which are busy.
+func (hs *hashState) holdGuests(now time.Time) {
+	hs.mu.Lock()
+	var gs []int32
+	for _, cs := range hs.groups {
+		if cs.cur.Load() != nil {
+			gs = append(gs, cs.guest.Load())
+		}
+	}
+	hs.mu.Unlock()
+	for _, x := range gs {
+		hs.cache.Hold(hs.guestKey(x), now)
+	}
+}
+
+// freeGuests forgets the holds this run made: its allocations were freed.
+func (hs *hashState) freeGuests() {
+	var keys []string
+	for x := int32(0); x < maxGuests; x++ {
+		if k := hs.guestKey(x); !hs.cache.Held(k).Before(hs.start.Truncate(time.Second)) {
+			keys = append(keys, k)
+		}
+	}
+	hs.cache.Free(keys...)
+}
+
+// noteUnfreed: a route's allocation could not be freed.
+func (e *Engine) noteUnfreed() { e.unfreedAt.Store(time.Now().UnixNano()) }
 
 func (hs *hashState) blocked() error {
 	hs.mu.Lock()
@@ -799,7 +917,7 @@ func (hs *hashState) nextGuest(g int, c *vkcreds.Creds, now time.Time) (int, boo
 	n := int32(-1)
 	for k := int32(1); k < maxGuests; k++ {
 		x := (old + k) % maxGuests
-		if !used[x] && now.Sub(hs.full[x]) > guestRest {
+		if !used[x] && now.Sub(hs.full[x]) > guestRest && !hs.busy(x, now) {
 			n = x
 			break
 		}
@@ -830,10 +948,21 @@ func (hs *hashState) quotaBackoff(g int, now time.Time) (time.Duration, bool) {
 // lowerTarget uses targetStep fewer routes (down to half the set number)
 // after error 486, at most once per quotaWait.
 func (e *Engine) lowerTarget(now time.Time) {
+	// Right after more routes were tried: that number does not fit, and
+	// the next try waits longer. Later: it did fit.
+	afterRaise := false
+	if r := e.raisedAt.Swap(0); r > 0 {
+		if now.UnixNano()-r < int64(raiseProbe) {
+			afterRaise = true
+			e.raiseFails.Store(min(e.raiseFails.Load()+1, 2))
+		} else {
+			e.raiseFails.Store(0)
+		}
+	}
 	t := e.target.Load()
 	floor := int32(max(1, e.cfg.Sessions/2))
 	last := e.targetAt.Load()
-	if t <= floor || now.UnixNano()-last < int64(quotaWait) || !e.targetAt.CompareAndSwap(last, now.UnixNano()) {
+	if t <= floor || (!afterRaise && now.UnixNano()-last < int64(quotaWait)) || !e.targetAt.CompareAndSwap(last, now.UnixNano()) {
 		return
 	}
 	n := max(floor, t-targetStep)
@@ -843,7 +972,8 @@ func (e *Engine) lowerTarget(now time.Time) {
 }
 
 // raiseTarget tries targetStep more routes after targetRestore without
-// error 486.
+// error 486 (twice or four times as long when the last tries met 486 at
+// once).
 func (e *Engine) raiseTarget(now time.Time) {
 	t := e.target.Load()
 	if int(t) >= e.cfg.Sessions {
@@ -851,11 +981,13 @@ func (e *Engine) raiseTarget(now time.Time) {
 	}
 	ns := now.UnixNano()
 	last := e.targetAt.Load()
-	if ns-e.quotaAt.Load() < int64(targetRestore) || ns-last < int64(targetRestore) || !e.targetAt.CompareAndSwap(last, ns) {
+	restore := int64(targetRestore) << e.raiseFails.Load()
+	if ns-e.quotaAt.Load() < restore || ns-last < restore || !e.targetAt.CompareAndSwap(last, ns) {
 		return
 	}
 	n := min(int32(e.cfg.Sessions), t+targetStep)
 	e.target.Store(n)
+	e.raisedAt.Store(ns)
 	e.logf("trying %d routes again", n)
 	e.notify()
 }
@@ -912,6 +1044,11 @@ func (e *Engine) watchdog() {
 		e.replaceSilentPaths(list)
 		now := time.Now()
 		e.raiseTarget(now)
+		if len(list) > 0 {
+			for _, hs := range e.hashes {
+				hs.holdGuests(now)
+			}
+		}
 		if !e.cfg.NoRelayScoring && e.relays.tick(list, now) && e.mayMove(now) {
 			if s := e.relays.moveOne(list); s != nil {
 				e.movedAt.Store(now.UnixNano())
@@ -1111,7 +1248,13 @@ func (e *Engine) Stop() {
 	waitTimeout(&e.workers, 5*time.Second)
 	// Free the TURN allocations before the app exits, or VK keeps counting
 	// them against the next start (error 486).
-	session.WaitReleased(3 * time.Second)
+	// All freed (none left unfreed lately): the next start may use the
+	// same guests at once.
+	if session.WaitReleased(3*time.Second) && time.Since(time.Unix(0, e.unfreedAt.Load())) > allocLife {
+		for _, hs := range e.hashes {
+			hs.freeGuests()
+		}
+	}
 	e.mu.Lock()
 	if e.state != StateFailed {
 		e.state = StateStopped
@@ -1323,6 +1466,7 @@ func (e *Engine) Reconnect(why string) {
 	}
 	e.logf("reconnecting: %s", why)
 	e.offline.up()
+	e.silent.up()
 	for _, s := range e.b.list() {
 		s.Close()
 	}

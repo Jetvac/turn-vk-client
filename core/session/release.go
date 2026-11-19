@@ -30,13 +30,16 @@ const releaseTimeout = 5 * time.Second
 var releasing sync.WaitGroup
 
 // WaitReleased waits (at most d) until the allocations of closed sessions
-// are freed; the engine calls it when it stops.
-func WaitReleased(d time.Duration) {
+// are freed; the engine calls it when it stops. It returns false if some
+// were still being freed when d ran out.
+func WaitReleased(d time.Duration) bool {
 	c := make(chan struct{})
 	go func() { releasing.Wait(); close(c) }()
 	select {
 	case <-c:
+		return true
 	case <-time.After(d):
+		return false
 	}
 }
 

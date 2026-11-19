@@ -57,6 +57,9 @@ type Params struct {
 	// Logf, if set, gets the session's own notes (a TURN allocation that
 	// could not be freed).
 	Logf func(format string, args ...any)
+	// OnUnfreed, if set, is called when the session's TURN allocation
+	// could not be freed: VK keeps counting it until its lifetime ends.
+	OnUnfreed func()
 
 	// Direct selects the direct protocol (TurnVK servers) instead of
 	// DTLS + GETCONF. Keys is the client's WireGuard key pair; ServerKey,
@@ -127,6 +130,7 @@ type Session struct {
 	turnAddr           net.Addr
 	turnUser, turnPass string
 	logf               func(format string, args ...any)
+	onUnfreed          func()
 	closed             atomic.Bool
 	done               chan struct{}
 	once               sync.Once
@@ -205,7 +209,7 @@ func Dial(ctx context.Context, p Params) (*Session, error) {
 		return nil, &TURNError{fmt.Errorf("allocate: %w", err)}
 	}
 	s.Relay = s.relay.LocalAddr().String()
-	s.turnAddr, s.turnUser, s.turnPass, s.logf = turnAddr, p.Username, p.Password, p.Logf
+	s.turnAddr, s.turnUser, s.turnPass, s.logf, s.onUnfreed = turnAddr, p.Username, p.Password, p.Logf, p.OnUnfreed
 	if p.Direct {
 		timeout := p.DirectTimeout
 		if timeout <= 0 {
@@ -347,6 +351,7 @@ func (s *Session) Write(b []byte) error {
 		}
 		s.TxBytes.Add(uint64(len(b)))
 		s.TxPackets.Add(1)
+		s.touch(time.Now().UnixNano())
 		return nil
 	}
 	if _, err := s.dtls.Write(b); err != nil {
@@ -401,6 +406,9 @@ func (s *Session) Close() {
 				releaseCount[r].Add(1)
 				if err != nil && s.logf != nil {
 					s.logf("route %d: TURN allocation on %s not freed: %v", s.ID, s.Server, err)
+				}
+				if err != nil && s.onUnfreed != nil {
+					s.onUnfreed()
 				}
 			}
 			if s.tc != nil {

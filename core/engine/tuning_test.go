@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -322,5 +323,95 @@ func TestRelayDownProof(t *testing.T) {
 	set(b, stop.Add(5*time.Second))
 	if n := answeredAfter(list, a, stop.Add(-1500*time.Millisecond).UnixNano()); n != 4 {
 		t.Fatalf("answered after = %d, want 4", n)
+	}
+}
+
+// While the WDTT server answers no route, one route checks it, less often
+// each time it fails; routes that failed together count once.
+func TestSilentBackoff(t *testing.T) {
+	var g offlineGate
+	now := time.Now()
+	for i := 0; i < 5; i++ {
+		if d, _ := g.backoff(now, silentWait, silentWaitMax); d != silentWait {
+			t.Fatalf("burst failure %d: wait %s", i, d)
+		}
+	}
+	want := silentWait
+	for i := 0; i < 5; i++ {
+		g.mu.Lock()
+		g.until = time.Now() // the wait is over: the next route checks
+		g.mu.Unlock()
+		if !g.wait(context.Background()) {
+			t.Fatal("the checking route was held")
+		}
+		want = min(2*want, silentWaitMax)
+		if d, _ := g.backoff(time.Now(), silentWait, silentWaitMax); d != want {
+			t.Fatalf("check %d failed: wait %s, want %s", i, d, want)
+		}
+	}
+	g.up()
+	if d, _ := g.backoff(time.Now(), silentWait, silentWaitMax); d != silentWait {
+		t.Fatalf("after up: wait %s", d)
+	}
+}
+
+// Guests an earlier run left with unfreed allocations are skipped at the
+// start; the two groups of a guest move together.
+func TestStartGuestBusy(t *testing.T) {
+	e := testEngine(t, 64) // guests 0..3, two groups each
+	hs := e.hashes[0]
+	before := time.Now().Add(-2 * time.Minute)
+	hs.cache.Hold(hs.guestKey(0), before)
+	hs.cache.Hold(hs.guestKey(4), before)
+	hs.cache.Hold(hs.guestKey(1), time.Now().Add(-allocLife-time.Minute))
+	got := []int32{}
+	for g := 0; g < 4; g++ {
+		got = append(got, hs.slot(g).guest.Load())
+	}
+	if want := []int32{5, 5, 1, 1}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("guests %v, want %v", got, want)
+	}
+	// This run's own holds do not make guests busy, and a clean stop
+	// forgets them; an earlier run's stay.
+	hs.cache.Hold(hs.guestKey(5), time.Now())
+	if hs.busy(5, time.Now()) {
+		t.Fatal("this run's guest judged busy")
+	}
+	hs.freeGuests()
+	if !hs.cache.Held(hs.guestKey(5)).IsZero() || hs.cache.Held(hs.guestKey(0)).IsZero() {
+		t.Fatal("freeGuests forgot the wrong holds")
+	}
+}
+
+// More routes that meet error 486 at once: back down now, and wait twice
+// as long before the next try.
+func TestRaiseBackoff(t *testing.T) {
+	e := testEngine(t, 64)
+	now := time.Now()
+	e.lowerTarget(now)
+	e.quotaAt.Store(now.UnixNano())
+	at := now.Add(targetRestore + time.Second)
+	e.raiseTarget(at)
+	if e.target.Load() != 64 {
+		t.Fatalf("not raised: %d", e.target.Load())
+	}
+	e.quotaAt.Store(at.Add(2 * time.Second).UnixNano())
+	e.lowerTarget(at.Add(2 * time.Second))
+	if e.target.Load() != 56 || e.raiseFails.Load() != 1 {
+		t.Fatalf("after a failed raise: target %d, fails %d", e.target.Load(), e.raiseFails.Load())
+	}
+	e.raiseTarget(at.Add(targetRestore + time.Minute))
+	if e.target.Load() != 56 {
+		t.Fatal("raised again after targetRestore")
+	}
+	at2 := at.Add(2*targetRestore + time.Minute)
+	e.raiseTarget(at2)
+	if e.target.Load() != 64 {
+		t.Fatal("not raised after twice targetRestore")
+	}
+	// A 486 long after the raise: that number fitted.
+	e.lowerTarget(at2.Add(time.Hour))
+	if e.raiseFails.Load() != 0 {
+		t.Fatalf("fails %d after a raise that held", e.raiseFails.Load())
 	}
 }

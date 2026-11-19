@@ -225,7 +225,10 @@ func (p *pacer) pick(list []*session.Session, n int, skip *session.Session, bulk
 		if s == skip || s.Pace.Tokens < size {
 			continue
 		}
-		score := float64(s.RTT.Load())/2e9 - s.Pace.Tokens/s.Pace.Get()
+		// Half the round trip plus what waits ahead of the packet: an
+		// idle path with the shortest round trip first; under load the
+		// spare paths (spreads it).
+		score := float64(s.RTT.Load())/2e9 + s.Pace.Queued()
 		if best == nil || score < bestScore {
 			best, bestScore = s, score
 		}

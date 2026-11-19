@@ -36,10 +36,15 @@ const (
 	pingInterval = 2 * time.Second
 	// PathFresh: a path that has answered within this carries traffic;
 	// pathDead: one silent for this long is replaced; probeWait: a probed
-	// path that has not answered within this is left out at once.
+	// path that has not answered within this is left out at once (less
+	// once its round trip is known, see probeLimit); idleProbe: a path
+	// that carries packets but has not heard from the server for this
+	// long is probed at once instead of at the next ping.
 	PathFresh      = 10 * time.Second
 	pathDead       = 25 * time.Second
 	probeWait      = 2 * time.Second
+	probeWaitMin   = 500 * time.Millisecond
+	idleProbe      = time.Second
 	helloRetry     = time.Second
 	reattachWithin = 10 * time.Second
 )
@@ -91,10 +96,33 @@ func (s *Session) Fresh(now time.Time) bool {
 		return true
 	}
 	rx, n := s.LastRx.Load(), now.UnixNano()
-	if p := s.probeAt.Load(); p > rx && n-p > int64(probeWait) {
+	if p := s.probeAt.Load(); p > rx && n-p > probeLimit(s.RTT.Load()) {
 		return false
 	}
 	return n-rx < int64(PathFresh)
+}
+
+// probeLimit is how long a probed path may take to answer (ns): a few
+// round trips, at least probeWaitMin, at most probeWait (also while the
+// round trip is not known yet).
+func probeLimit(rtt int64) int64 {
+	if rtt <= 0 {
+		return int64(probeWait)
+	}
+	return min(int64(probeWait), max(int64(probeWaitMin), 4*rtt+int64(300*time.Millisecond)))
+}
+
+// touch: a packet went out on the path. One that has not heard from the
+// server for idleProbe is pinged now, so that a dead path stops carrying
+// traffic within about a second instead of at the next ping.
+func (s *Session) touch(now int64) {
+	rx := s.LastRx.Load()
+	if now-rx < int64(idleProbe) {
+		return
+	}
+	if p := s.probeAt.Load(); p <= rx && s.probeAt.CompareAndSwap(p, now) {
+		_ = s.ping()
+	}
 }
 
 // probe pings the path now; Fresh turns false if no answer comes within

@@ -67,3 +67,19 @@ func TestNotPacedWithoutFeedback(t *testing.T) {
 		t.Fatal("paced although the server sends no FEEDBACK")
 	}
 }
+
+// An idle path with the shorter round trip carries small packets even when
+// the other one is paced at a lower rate (the spare tokens of a slow path
+// are no reason to prefer it).
+func TestPacerPickShortestIdle(t *testing.T) {
+	fast, slow := pacedSession(20*time.Millisecond), pacedSession(40*time.Millisecond)
+	slow.Pace.Seed(60_000)
+	fast.Pace.Seed(400_000)
+	now := time.Now().UnixNano()
+	fast.Pace.Refill(now)
+	slow.Pace.Refill(now)
+	p := &pacer{}
+	if got := p.pick([]*session.Session{slow, fast}, 100, nil, false); got != fast {
+		t.Fatal("small packet not on the path with the shorter round trip")
+	}
+}

@@ -19,6 +19,10 @@ type offlineGate struct {
 	until  time.Time     // offline until then (zero: online)
 	wake   chan struct{} // closed when the network is back
 	logged time.Time     // when "no network" was last logged
+	// every: how often one route tries (offlineWait if zero); probing:
+	// a route went to check and has not reported yet.
+	every   time.Duration
+	probing bool
 }
 
 // down notes that a route failed for lack of network; it returns true
@@ -37,6 +41,23 @@ func (g *offlineGate) down(now time.Time, d time.Duration) bool {
 	return true
 }
 
+// backoff is down with a wait of base, doubled (up to most) each time
+// the route that went to check fails too; routes that failed together
+// before the gate closed do not count.
+func (g *offlineGate) backoff(now time.Time, base, most time.Duration) (time.Duration, bool) {
+	g.mu.Lock()
+	switch {
+	case g.until.IsZero() || g.every == 0:
+		g.every = base
+	case g.probing:
+		g.every = min(2*g.every, most)
+	}
+	g.probing = false
+	d := g.every
+	g.mu.Unlock()
+	return d, g.down(now, d)
+}
+
 // up lets every waiting route go.
 func (g *offlineGate) up() {
 	g.mu.Lock()
@@ -45,6 +66,7 @@ func (g *offlineGate) up() {
 		return
 	}
 	g.until = time.Time{}
+	g.every, g.probing = 0, false
 	if g.wake != nil {
 		close(g.wake)
 		g.wake = nil
@@ -63,8 +85,13 @@ func (g *offlineGate) wait(ctx context.Context) bool {
 		}
 		now := time.Now()
 		if !now.Before(g.until) {
-			// This route checks the network; the rest wait for its answer.
-			g.until = now.Add(offlineWait)
+			// This route checks; the rest wait for its answer.
+			step := g.every
+			if step == 0 {
+				step = offlineWait
+			}
+			g.until = now.Add(step)
+			g.probing = true
 			g.mu.Unlock()
 			return ctx.Err() == nil
 		}

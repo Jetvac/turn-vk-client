@@ -22,12 +22,14 @@ type Cache struct {
 	loaded bool
 	guests map[string]*guest
 	creds  map[string]*Creds
+	held   map[string]int64 // unix seconds; see Hold
 }
 
 // cacheFile is the file's layout.
 type cacheFile struct {
 	Guests map[string]*guest `json:"guests"`
 	Creds  map[string]*Creds `json:"creds,omitempty"`
+	Held   map[string]int64  `json:"held,omitempty"`
 }
 
 // Creds returns saved TURN credentials still usable for an hour, or nil.
@@ -66,6 +68,59 @@ func (c *Cache) PutCreds(key string, cr *Creds) {
 	}
 	c.saveLocked()
 }
+
+// Hold notes that the TURN allocations of key (a guest of a call) were in
+// use at t. If the app is killed, or stops without network, VK keeps
+// counting them until their lifetime ends, and a new start with the same
+// guest meets error 486 at once. Saved at most once a minute per key.
+func (c *Cache) Hold(key string, t time.Time) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.loadLocked()
+	if t.Unix()-c.held[key] < 60 {
+		return
+	}
+	c.held[key] = t.Unix()
+	c.saveLocked()
+}
+
+// Held returns when key's allocations were last noted in use (zero if
+// never, or long ago).
+func (c *Cache) Held(key string) time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.loadLocked()
+	if t, ok := c.held[key]; ok {
+		return time.Unix(t, 0)
+	}
+	return time.Time{}
+}
+
+// Free forgets the given keys' holds: their allocations were freed.
+func (c *Cache) Free(keys ...string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.loadLocked()
+	n := len(c.held)
+	for _, k := range keys {
+		delete(c.held, k)
+	}
+	if len(c.held) != n {
+		c.saveLocked()
+	}
+}
+
+// heldFor: holds older than this are dropped (allocations live minutes).
+const heldFor = time.Hour
 
 // guest is one anonymous participant of a call.
 type guest struct {
@@ -118,6 +173,7 @@ func (c *Cache) loadLocked() {
 	c.loaded = true
 	c.guests = map[string]*guest{}
 	c.creds = map[string]*Creds{}
+	c.held = map[string]int64{}
 	if c.Path == "" {
 		return
 	}
@@ -130,6 +186,9 @@ func (c *Cache) loadLocked() {
 		c.guests = f.Guests
 		if f.Creds != nil {
 			c.creds = f.Creds
+		}
+		if f.Held != nil {
+			c.held = f.Held
 		}
 	} else {
 		// The first layout: guests only.
@@ -149,13 +208,18 @@ func (c *Cache) loadLocked() {
 			delete(c.creds, k)
 		}
 	}
+	for k, t := range c.held {
+		if now-t > int64(heldFor/time.Second) {
+			delete(c.held, k)
+		}
+	}
 }
 
 func (c *Cache) saveLocked() {
 	if c.Path == "" {
 		return
 	}
-	b, err := json.Marshal(cacheFile{Guests: c.guests, Creds: c.creds})
+	b, err := json.Marshal(cacheFile{Guests: c.guests, Creds: c.creds, Held: c.held})
 	if err != nil {
 		return
 	}
