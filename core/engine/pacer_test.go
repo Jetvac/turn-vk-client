@@ -83,3 +83,27 @@ func TestPacerPickShortestIdle(t *testing.T) {
 		t.Fatal("small packet not on the path with the shorter round trip")
 	}
 }
+
+// The copy of a small packet goes through another VK TURN server, even
+// when a path on the same one has the shorter round trip.
+func TestPacerCopyOtherRelay(t *testing.T) {
+	a1, a2, b := pacedSession(10*time.Millisecond), pacedSession(12*time.Millisecond), pacedSession(30*time.Millisecond)
+	a1.Server, a2.Server, b.Server = "1.1.1.1:19302", "1.1.1.1:19302", "2.2.2.2:19302"
+	now := time.Now().UnixNano()
+	list := []*session.Session{a1, a2, b}
+	for _, s := range list {
+		s.Pace.Refill(now)
+	}
+	p := &pacer{}
+	first := p.pick(list, 100, nil, false)
+	if first != a1 {
+		t.Fatal("first copy not on the shortest path")
+	}
+	if got := p.pickCopy(list, 100, first); got != b {
+		t.Fatal("second copy not through the other relay")
+	}
+	// Only one relay: any other path.
+	if got := p.pickCopy(list[:2], 100, a1); got != a2 {
+		t.Fatal("no copy with a single relay")
+	}
+}

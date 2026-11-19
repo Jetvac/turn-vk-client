@@ -508,6 +508,7 @@ func (a *app) bind(w webview2.WebView) {
 		}()
 	}))
 	must(w.Bind("tvkReport", func() { go a.report() }))
+	must(w.Bind("tvkPing", func() { go a.ping() }))
 	must(w.Bind("tvkCheckUpdate", func() { go a.checkUpdate(true) }))
 	must(w.Bind("tvkInstallUpdate", func() { go a.installUpdate() }))
 	must(w.Bind("tvkShowFile", func(path string) {

@@ -60,6 +60,8 @@ type Params struct {
 	// OnUnfreed, if set, is called when the session's TURN allocation
 	// could not be freed: VK keeps counting it until its lifetime ends.
 	OnUnfreed func()
+	// RTTs, if set, counts every round trip the path's pings measure.
+	RTTs *Hist
 
 	// Direct selects the direct protocol (TurnVK servers) instead of
 	// DTLS + GETCONF. Keys is the client's WireGuard key pair; ServerKey,
@@ -131,6 +133,7 @@ type Session struct {
 	turnUser, turnPass string
 	logf               func(format string, args ...any)
 	onUnfreed          func()
+	rtts               *Hist
 	closed             atomic.Bool
 	done               chan struct{}
 	once               sync.Once
@@ -163,6 +166,11 @@ type Session struct {
 	resetAt   time.Time // first RESET not yet answered by a WELCOME
 	denied    atomic.Pointer[error]
 	probeAt   atomic.Int64 // last probe not yet answered, unix ns
+	// txWait: the first packet sent since the server was last heard from
+	// on the path (unix ns); acks: the server confirms what it receives
+	// (FEEDBACK), so a path that confirms nothing is dead (Fresh).
+	txWait atomic.Int64
+	acks   atomic.Bool
 }
 
 var handshakeSlots = make(chan struct{}, 4)
@@ -209,7 +217,7 @@ func Dial(ctx context.Context, p Params) (*Session, error) {
 		return nil, &TURNError{fmt.Errorf("allocate: %w", err)}
 	}
 	s.Relay = s.relay.LocalAddr().String()
-	s.turnAddr, s.turnUser, s.turnPass, s.logf, s.onUnfreed = turnAddr, p.Username, p.Password, p.Logf, p.OnUnfreed
+	s.turnAddr, s.turnUser, s.turnPass, s.logf, s.onUnfreed, s.rtts = turnAddr, p.Username, p.Password, p.Logf, p.OnUnfreed, p.RTTs
 	if p.Direct {
 		timeout := p.DirectTimeout
 		if timeout <= 0 {

@@ -74,3 +74,35 @@ func TestTouchProbesIdlePath(t *testing.T) {
 		t.Fatalf("limit on a slow path: %v", got)
 	}
 }
+
+// A path whose server confirms what it receives stops carrying traffic a
+// few round trips after a packet sent on it went unanswered; one whose
+// server sends no FEEDBACK (an older server) is judged by pings only.
+func TestFreshUnconfirmed(t *testing.T) {
+	aead, _ := chacha20poly1305.New(make([]byte, 32))
+	s := &Session{direct: true, relay: &countConn{}, aead: aead, sealer: wrap.NewSealer(aead, wrap.Audio), peer: &net.UDPAddr{}}
+	now := time.Now()
+	s.LastRx.Store(now.Add(-100 * time.Millisecond).UnixNano())
+	s.RTT.Store(int64(20 * time.Millisecond))
+	s.touch(now.UnixNano())
+	later := now.Add(ackWaitMin + 10*time.Millisecond)
+	if !s.Fresh(later) {
+		t.Fatal("left out without FEEDBACK from the server")
+	}
+	s.acks.Store(true)
+	if !s.Fresh(now.Add(200 * time.Millisecond)) {
+		t.Fatal("left out before the answer was due")
+	}
+	if s.Fresh(later) {
+		t.Fatal("still carrying traffic with nothing confirmed")
+	}
+	s.LastRx.Store(later.UnixNano())
+	if !s.Fresh(later) {
+		t.Fatal("not back after an answer")
+	}
+	// The next packet starts a new wait; the old one does not count.
+	s.touch(later.Add(time.Millisecond).UnixNano())
+	if !s.Fresh(later.Add(100 * time.Millisecond)) {
+		t.Fatal("a new packet judged by the old wait")
+	}
+}

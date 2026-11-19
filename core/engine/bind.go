@@ -38,6 +38,10 @@ type bind struct {
 	dropped atomic.Uint64
 	rx      atomic.Uint64
 	tx      atomic.Uint64
+
+	// For the statistics: how long held packets waited in the reorder
+	// buffer, and small packets in the pacer's queue.
+	holds, qwait session.Hist
 }
 
 const (
@@ -51,6 +55,7 @@ func newBind() *bind {
 	b := &bind{recv: make(chan []byte, recvQueue), closed: make(chan struct{}), queues: map[*session.Session]*pathQueue{}}
 	b.pacer = newPacer(b)
 	b.reorder.Out = b.deliver
+	b.reorder.Waited = b.holds.Add
 	empty := []*session.Session{}
 	b.sessions.Store(&empty)
 	return b
@@ -108,6 +113,13 @@ func (b *bind) deliver(pkt []byte) {
 		b.dropped.Add(1)
 		putBuf(pkt)
 	}
+}
+
+// gaps returns how many gaps the reorder buffer gave up on so far.
+func (b *bind) gaps() uint64 {
+	b.reorder.mu.Lock()
+	defer b.reorder.mu.Unlock()
+	return b.reorder.Gaps
 }
 
 // deliverOrdered is deliver for packets of a TurnVK server, which spreads

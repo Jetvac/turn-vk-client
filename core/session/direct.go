@@ -40,11 +40,15 @@ const (
 	// once its round trip is known, see probeLimit); idleProbe: a path
 	// that carries packets but has not heard from the server for this
 	// long is probed at once instead of at the next ping.
-	PathFresh      = 10 * time.Second
-	pathDead       = 25 * time.Second
-	probeWait      = 2 * time.Second
-	probeWaitMin   = 500 * time.Millisecond
-	idleProbe      = time.Second
+	PathFresh    = 10 * time.Second
+	pathDead     = 25 * time.Second
+	probeWait    = 2 * time.Second
+	probeWaitMin = 500 * time.Millisecond
+	idleProbe    = time.Second
+	// ackWaitMin: a path whose server confirms what it receives (FEEDBACK,
+	// within 50 ms) and has confirmed nothing sent on it for a few round
+	// trips, at least this long, stops carrying traffic until it answers.
+	ackWaitMin     = 300 * time.Millisecond
 	helloRetry     = time.Second
 	reattachWithin = 10 * time.Second
 )
@@ -99,7 +103,20 @@ func (s *Session) Fresh(now time.Time) bool {
 	if p := s.probeAt.Load(); p > rx && n-p > probeLimit(s.RTT.Load()) {
 		return false
 	}
+	if w := s.txWait.Load(); w > rx && s.acks.Load() && n-w > ackLimit(s.RTT.Load()) {
+		return false
+	}
 	return n-rx < int64(PathFresh)
+}
+
+// ackLimit is how long a path whose server confirms what it receives may
+// go without answering a packet sent on it (ns): a few round trips, at
+// least ackWaitMin, at most probeWait.
+func ackLimit(rtt int64) int64 {
+	if rtt <= 0 {
+		return int64(probeWait)
+	}
+	return min(int64(probeWait), max(int64(ackWaitMin), 3*rtt+int64(100*time.Millisecond)))
 }
 
 // probeLimit is how long a probed path may take to answer (ns): a few
@@ -117,6 +134,9 @@ func probeLimit(rtt int64) int64 {
 // traffic within about a second instead of at the next ping.
 func (s *Session) touch(now int64) {
 	rx := s.LastRx.Load()
+	if w := s.txWait.Load(); w <= rx {
+		s.txWait.CompareAndSwap(w, now)
+	}
 	if now-rx < int64(idleProbe) {
 		return
 	}
@@ -357,8 +377,10 @@ func (s *Session) readDirectData(b []byte) (int, error) {
 			sent := int64(binary.BigEndian.Uint64(b[2:10]))
 			if rtt := time.Now().UnixNano() - sent; rtt > 0 && rtt < int64(time.Minute) {
 				s.RTT.Store(rtt)
+				s.rtts.Add(time.Duration(rtt))
 			}
 		case t == msgFeedback:
+			s.acks.Store(true)
 			s.Pace.OnFeedback(b[:n], time.Now().UnixNano())
 		case t == msgStatsAck && n >= 6:
 			if f := s.StatsAck; f != nil {

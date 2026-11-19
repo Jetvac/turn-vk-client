@@ -101,6 +101,17 @@ type statsMinute struct {
 	Calls      int     `json:"calls"`         // VK calls in the link
 	Slept      bool    `json:"slept"`         // the device slept during the minute
 	Gap        int     `json:"gap,omitempty"` // s the engine did not run (sleep)
+	// Spikes: the routes' ping round trips (all pongs of the minute), how
+	// long packets the reorder buffer held waited, how long small packets
+	// (games, pings, ACKs) waited in the upload pacer; packets the pacer
+	// dropped as too old, received packets dropped because WireGuard did
+	// not keep up, and gaps the reorder buffer gave up on (lost packets).
+	Ping   *session.Lat `json:"ping,omitempty"`
+	Hold   *session.Lat `json:"hold,omitempty"`
+	Queue  *session.Lat `json:"queue,omitempty"`
+	QDrop  uint64       `json:"q_drop,omitempty"`
+	RxDrop uint64       `json:"rx_drop,omitempty"`
+	Gaps   uint64       `json:"gaps,omitempty"`
 }
 
 // statsAck is called by the sessions' read loops.
@@ -126,6 +137,10 @@ func (e *Engine) statsLoop() {
 	send := time.NewTicker(10 * time.Second)
 	defer send.Stop()
 	var prevRx, prevTx, prevLost, prevPk, prevRec uint64
+	prevQDrop, prevRxDrop, prevGaps := e.b.pacer.dropped.Load(), e.b.dropped.Load(), e.b.gaps()
+	e.rtts.Take()
+	e.b.holds.Take()
+	e.b.qwait.Take()
 	if rx, tx, _, ok := e.wgStats(); ok {
 		prevRx, prevTx = rx, tx
 	}
@@ -211,6 +226,10 @@ func (e *Engine) statsLoop() {
 		rec := e.reconnect.Load()
 		m.Reconnects, prevRec = rec-prevRec, rec
 		m.Captcha = e.captchas.Load() > 0
+		m.Ping, m.Hold, m.Queue = e.rtts.Take(), e.b.holds.Take(), e.b.qwait.Take()
+		qd, rd, gp := e.b.pacer.dropped.Load(), e.b.dropped.Load(), e.b.gaps()
+		m.QDrop, m.RxDrop, m.Gaps = sub0(qd, prevQDrop), sub0(rd, prevRxDrop), sub0(gp, prevGaps)
+		prevQDrop, prevRxDrop, prevGaps = qd, rd, gp
 		m.TURN = len(turn)
 		e.queueStats(m)
 		if e.statsAcked.Load() || unacked < statsNoAck {

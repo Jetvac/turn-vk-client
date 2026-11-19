@@ -234,6 +234,8 @@ type Engine struct {
 	raiseFails atomic.Int32
 	// unfreedAt: when a route's allocation was last left unfreed.
 	unfreedAt atomic.Int64
+	// rtts: the round trips the routes' pings measured (statistics).
+	rtts session.Hist
 
 	logs logLimiter // merges repeated log lines
 
@@ -642,7 +644,7 @@ func (e *Engine) dial(ctx context.Context, i, shift int) (*session.Session, erro
 		Peer: e.peer, TURNServer: server, Username: creds.Username, Password: creds.Password,
 		AEAD: e.aead, Mode: e.cfg.Mode, Net: e.cfg.Net,
 		ConnPassword: e.cfg.Link.Password, DeviceID: e.cfg.DeviceID, Generation: e.gen, Worker: i,
-		OnReset: e.serverReset, Logf: e.logf, OnUnfreed: e.noteUnfreed,
+		OnReset: e.serverReset, Logf: e.logf, OnUnfreed: e.noteUnfreed, RTTs: &e.rtts,
 		Direct: mode != modeDTLS, Keys: &e.keys, ServerKey: e.cfg.Link.ServerKey,
 	}
 	if mode == modeUnknown {
@@ -1486,4 +1488,13 @@ func (e *Engine) serverReset() {
 		go s.Probe()
 	}
 	e.rehandshake("the server reset a session")
+}
+
+// Context ends when the engine stops (Background before Start; set
+// there, before the engine is handed to anyone).
+func (e *Engine) Context() context.Context {
+	if e.ctx == nil {
+		return context.Background()
+	}
+	return e.ctx
 }

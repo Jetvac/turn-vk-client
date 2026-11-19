@@ -112,6 +112,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -137,6 +138,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 
 // ---------------------------------------------------------------- theme
 //
@@ -1223,6 +1225,7 @@ private fun LogsTab() {
                 ) { Text(if (collecting) "Проверяем сеть…" else "Собрать отчёт", fontWeight = FontWeight.SemiBold) }
             }
         }
+        PingPanel()
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(bottom = 12.dp)) {
             LogButton("Копировать") {
                 ctx.getSystemService(ClipboardManager::class.java)
@@ -1246,6 +1249,64 @@ private fun LogsTab() {
                     }
                 }
             }
+        }
+    }
+}
+
+/** The ping test: 20 s of round trips through the tunnel, as games feel it. */
+@Composable
+private fun PingPanel() {
+    var running by remember { mutableStateOf(false) }
+    var result by remember { mutableStateOf<JSONObject?>(null) }
+    LaunchedEffect(running) {
+        if (running) {
+            val json = withContext(Dispatchers.IO) { mobile.Mobile.ping() }
+            result = runCatching { JSONObject(json) }.getOrNull()
+            result?.optString("text")?.takeIf { it.isNotEmpty() }?.let { TunnelState.log(it) }
+            running = false
+        }
+    }
+    Panel(Modifier.padding(bottom = 12.dp)) {
+        Column {
+            Text("Пинг через VPN", fontWeight = FontWeight.SemiBold)
+            Text(
+                "20 секунд, 4 замера в секунду через туннель до 1.1.1.1 — так VPN ощущают игры. Видны задержка и всплески.",
+                color = pal.muted, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp, bottom = 10.dp),
+            )
+            val r = result
+            if (r != null && !running) {
+                val got = r.optJSONArray("got")
+                if (got != null && got.length() > 0) {
+                    val samples = List(got.length()) { got.optDouble(it, -1.0) }
+                    val ok = samples.filter { it >= 0 }
+                    val top = maxOf(50.0, ok.maxOrNull() ?: 0.0) * 1.1
+                    val med = r.optDouble("p50", 0.0)
+                    val c = pal
+                    Canvas(Modifier.fillMaxWidth().height(60.dp).padding(bottom = 8.dp)) {
+                        val bw = size.width / 80f
+                        samples.forEachIndexed { i, v ->
+                            val h = if (v < 0) size.height else maxOf(2f, (v / top * size.height).toFloat())
+                            val col = if (v < 0) c.err else if (v > med + 50) c.warn else c.accent
+                            drawRect(col, Offset(i * bw + 1f, size.height - h), Size(maxOf(1f, bw - 2f), h))
+                        }
+                    }
+                }
+                val sent = r.optInt("sent")
+                val lost = r.optInt("lost")
+                fun n(v: Double) = if (v >= 10) "%.0f".format(v) else "%.1f".format(v)
+                Text(
+                    if (sent == 0 || sent == lost) "Не удалось: " + r.optString("error").ifEmpty { "нет ответов" }
+                    else "Обычно ${n(r.optDouble("p50"))} мс, в 95 % замеров до ${n(r.optDouble("p95"))} мс, худший ${n(r.optDouble("max"))} мс. " +
+                        "Разброс ${n(r.optDouble("jitter"))} мс, всплесков (на 50 мс выше обычного) ${r.optInt("spikes")}, потеряно $lost из $sent.",
+                    fontSize = 13.sp, modifier = Modifier.padding(bottom = 10.dp),
+                )
+            }
+            OutlinedButton(
+                onClick = { running = true },
+                enabled = !running,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(10.dp),
+            ) { Text(if (running) "Измеряем… около 20 секунд" else "Проверить пинг") }
         }
     }
 }

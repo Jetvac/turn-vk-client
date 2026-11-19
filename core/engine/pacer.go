@@ -14,8 +14,9 @@ import (
 // at the rate VK lets through, so that the queue forms here rather than
 // as loss at VK:
 //   - small packets (TCP ACKs, DNS, pings, games, calls) go first, and the
-//     smallest go on two sessions at once: whichever arrives first counts,
-//     WireGuard drops the other as a replay;
+//     smallest go on two sessions at once, through two different VK TURN
+//     servers when there are: whichever arrives first counts, WireGuard
+//     drops the other as a replay; a relay that stalls does not stall both;
 //   - bulk packets stay on one session until its tokens run out: the TCP
 //     sender is on this device, and many stacks (gVisor's in the CLI, older
 //     Windows and Android ones) take reordering for loss and slow down
@@ -29,7 +30,7 @@ const (
 	maxQueueDelay = 60 * time.Millisecond
 	maxQueueBytes = 4 << 20
 	smallPacket   = 512 // smaller packets are latency-sensitive
-	dupPacket     = 256 // smaller packets go on two sessions
+	dupPacket     = 400 // smaller packets go on two sessions (most game packets)
 	pacerIdleExit = time.Minute
 )
 
@@ -57,6 +58,7 @@ type pacer struct {
 
 	wake    chan struct{}
 	dropped atomic.Uint64
+	other   []*session.Session // pickCopy's scratch, under mu
 }
 
 func newPacer(b *bind) *pacer { return &pacer{b: b, wake: make(chan struct{}, 1)} }
@@ -180,9 +182,10 @@ func (p *pacer) step(out []sendItem) ([]sendItem, time.Duration) {
 		if s == nil {
 			break
 		}
+		p.b.qwait.Add(time.Duration(ns - q.at))
 		out = append(out, sendItem{s: s, b: q.b})
 		if len(q.b) < dupPacket {
-			if s2 := p.pick(list, len(q.b), s, false); s2 != nil {
+			if s2 := p.pickCopy(list, len(q.b), s); s2 != nil {
 				out = append(out, sendItem{s: s2, b: q.b, dup: true})
 			}
 		}
@@ -248,6 +251,21 @@ func (p *pacer) pick(list []*session.Session, n int, skip *session.Session, bulk
 	}
 	best.Pace.Tokens -= size
 	return best
+}
+
+// pickCopy picks the session for the copy of a small packet that went on
+// s: through another VK TURN server if one can send now, else any other.
+func (p *pacer) pickCopy(list []*session.Session, n int, s *session.Session) *session.Session {
+	p.other = p.other[:0]
+	for _, x := range list {
+		if x.Server != s.Server {
+			p.other = append(p.other, x)
+		}
+	}
+	if x := p.pick(p.other, n, nil, false); x != nil {
+		return x
+	}
+	return p.pick(list, n, s, false)
 }
 
 func (p *pacer) idleSince(now int64) time.Duration {

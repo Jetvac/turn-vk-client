@@ -14,6 +14,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.provider.Settings
 import android.service.quicksettings.TileService
@@ -69,6 +70,7 @@ class TunnelService : VpnService(), mobile.Platform {
     private val worker = Executors.newSingleThreadExecutor()
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val store by lazy { Store(this) }
+    private var wifiLocks: List<WifiManager.WifiLock> = emptyList()
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -120,6 +122,7 @@ class TunnelService : VpnService(), mobile.Platform {
             mobile.Mobile.setStats(store.serverStats, "TurnVK ${BuildConfig.VERSION_NAME} android")
             mobile.Mobile.start(profile.link, deviceId, sessions.toLong(), store.obfs, this)
             watchNetwork()
+            holdWifi()
         } catch (e: Exception) {
             fail(e.message ?: e.toString())
         }
@@ -134,6 +137,7 @@ class TunnelService : VpnService(), mobile.Platform {
 
     private fun stopTunnel() {
         unwatchNetwork()
+        releaseWifi()
         worker.execute {
             mobile.Mobile.stop()
             TunnelState.setPlan(null)
@@ -153,8 +157,41 @@ class TunnelService : VpnService(), mobile.Platform {
 
     override fun onDestroy() {
         unwatchNetwork()
+        releaseWifi()
         mobile.Mobile.stop()
         super.onDestroy()
+    }
+
+    /**
+     * Wi-Fi without power saving while connected: in power saving the phone
+     * wakes for incoming packets only every 100-300 ms, which games feel as
+     * ping spikes. The low-latency lock (Android 10+) works while TurnVK is
+     * on screen; the high-performance one also in the background up to
+     * Android 13 (from 14 it turns into the low-latency lock).
+     */
+    @Suppress("DEPRECATION")
+    @Synchronized
+    private fun holdWifi() {
+        if (wifiLocks.isNotEmpty()) return
+        val wm = applicationContext.getSystemService(WifiManager::class.java) ?: return
+        val modes = buildList {
+            if (Build.VERSION.SDK_INT >= 29) add(WifiManager.WIFI_MODE_FULL_LOW_LATENCY)
+            add(WifiManager.WIFI_MODE_FULL_HIGH_PERF)
+        }
+        wifiLocks = modes.mapNotNull { mode ->
+            runCatching {
+                wm.createWifiLock(mode, "TurnVK:$mode").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            }.getOrNull()
+        }
+    }
+
+    @Synchronized
+    private fun releaseWifi() {
+        wifiLocks.forEach { runCatching { it.release() } }
+        wifiLocks = emptyList()
     }
 
     // --- mobile.Platform ---
