@@ -12,8 +12,8 @@ android {
         applicationId = "io.github.jetvac.turnvk"
         minSdk = 24
         targetSdk = 35
-        versionCode = 15
-        versionName = "0.8.5"
+        versionCode = 16
+        versionName = "0.8.6"
     }
 
     // The release key comes from the environment (CI: repository secrets).

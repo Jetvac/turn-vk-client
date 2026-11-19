@@ -10,13 +10,16 @@ type AppPlan struct {
 	// enter.
 	Mode string   `json:"mode"`
 	Apps []string `json:"apps"`
+	// Games: game apps are kept out too ("games direct"), unless only
+	// chosen apps enter.
+	Games bool `json:"games,omitempty"`
 }
 
 // PlanApps works the plan out from the rules.
 func PlanApps(r Rules) AppPlan {
 	r.Normalize()
 	if !r.On {
-		return AppPlan{Mode: "disallow"}
+		return AppPlan{Mode: "disallow", Games: r.Games}
 	}
 	// Sites beat the rules for programs, so a site sent through the VPN
 	// reaches into apps sent direct. Address lists only refine the
@@ -52,5 +55,7 @@ func PlanApps(r Rules) AppPlan {
 	if vpnSites {
 		direct = nil
 	}
-	return AppPlan{Mode: "disallow", Apps: direct}
+	// Game apps go out even then: a game's traffic is mostly its servers'
+	// addresses, and the lowest ping is the point.
+	return AppPlan{Mode: "disallow", Apps: direct, Games: r.Games}
 }

@@ -509,6 +509,7 @@ func (a *app) bind(w webview2.WebView) {
 	}))
 	must(w.Bind("tvkReport", func() { go a.report() }))
 	must(w.Bind("tvkPing", func() { go a.ping() }))
+	must(w.Bind("tvkGameNames", split.GameNames))
 	must(w.Bind("tvkCheckUpdate", func() { go a.checkUpdate(true) }))
 	must(w.Bind("tvkInstallUpdate", func() { go a.installUpdate() }))
 	must(w.Bind("tvkShowFile", func(path string) {
@@ -575,8 +576,12 @@ func (a *app) setSplit(r split.Rules) {
 // describeSplit sums the rules up for the log (program names, not paths:
 // paths hold the user's name).
 func describeSplit(r split.Rules) string {
+	games := ""
+	if r.Games {
+		games = ", games direct: " + strings.Join(split.GameNames(), ", ")
+	}
 	if !r.On {
-		return "off"
+		return "off" + games
 	}
 	var direct, vpn []string
 	for _, x := range r.Apps {
@@ -616,7 +621,7 @@ func describeSplit(r split.Rules) string {
 			vpn = append(vpn, l.List)
 		}
 	}
-	return fmt.Sprintf("on, others %s, LAN direct %v, direct: %v, VPN: %v", r.Default, r.LAN, direct, vpn)
+	return fmt.Sprintf("on, others %s, LAN direct %v, direct: %v, VPN: %v%s", r.Default, r.LAN, direct, vpn, games)
 }
 
 // sameDomains: the rules by name are the same (on, off, routes).
@@ -746,7 +751,7 @@ func (a *app) connect() error {
 		}
 		a.mu.Unlock()
 		rt.SetRules(rules)
-		if rules.On {
+		if rules.On || rules.Games {
 			a.logf("split tunneling: %s", describeSplit(rules))
 			if len(rules.Domains) > 0 || len(rules.Lists) > 0 {
 				// Answers cached before connecting would bypass the rules.

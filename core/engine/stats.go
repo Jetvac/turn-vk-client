@@ -112,6 +112,9 @@ type statsMinute struct {
 	QDrop  uint64       `json:"q_drop,omitempty"`
 	RxDrop uint64       `json:"rx_drop,omitempty"`
 	Gaps   uint64       `json:"gaps,omitempty"`
+	// LowLat: seconds the upload pacer kept queues short for interactive
+	// traffic (games, calls).
+	LowLat uint64 `json:"low_lat,omitempty"`
 }
 
 // statsAck is called by the sessions' read loops.
@@ -138,6 +141,7 @@ func (e *Engine) statsLoop() {
 	defer send.Stop()
 	var prevRx, prevTx, prevLost, prevPk, prevRec uint64
 	prevQDrop, prevRxDrop, prevGaps := e.b.pacer.dropped.Load(), e.b.dropped.Load(), e.b.gaps()
+	prevLowLat := e.b.pacer.inter.Secs.Load()
 	e.rtts.Take()
 	e.b.holds.Take()
 	e.b.qwait.Take()
@@ -230,6 +234,8 @@ func (e *Engine) statsLoop() {
 		qd, rd, gp := e.b.pacer.dropped.Load(), e.b.dropped.Load(), e.b.gaps()
 		m.QDrop, m.RxDrop, m.Gaps = sub0(qd, prevQDrop), sub0(rd, prevRxDrop), sub0(gp, prevGaps)
 		prevQDrop, prevRxDrop, prevGaps = qd, rd, gp
+		ll := e.b.pacer.inter.Secs.Load()
+		m.LowLat, prevLowLat = sub0(ll, prevLowLat), ll
 		m.TURN = len(turn)
 		e.queueStats(m)
 		if e.statsAcked.Load() || unacked < statsNoAck {

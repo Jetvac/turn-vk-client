@@ -109,6 +109,8 @@ data class SplitRules(
     val custom: Boolean = false,
     /** Modes by network. */
     val networks: List<NetRoute> = emptyList(),
+    /** Game apps stay out of the VPN, whatever the mode. */
+    val games: Boolean = false,
 ) {
     /** The route a new rule gets: the opposite of the others'. */
     val other: String get() = if (default == "direct") "vpn" else "direct"
@@ -120,6 +122,7 @@ data class SplitRules(
         o.put("lists", JSONArray().apply { lists.forEach { put(JSONObject().put("list", it.list).put("route", it.route).put("off", it.off)) } })
         o.put("appsOnly", appsOnly)
         if (custom) o.put("custom", true)
+        if (games) o.put("games", true)
         o.put("networks", JSONArray().apply { networks.forEach { put(JSONObject().put("network", it.network).put("mode", it.mode).put("off", it.off)) } })
         return o.toString()
     }
@@ -143,6 +146,7 @@ data class SplitRules(
                 appsOnly = o.optBoolean("appsOnly"),
                 custom = o.optBoolean("custom"),
                 networks = arr("networks") { NetRoute(it.optString("network"), it.optString("mode", "vpn"), it.optBoolean("off")) },
+                games = o.optBoolean("games"),
             )
         }.getOrDefault(SplitRules())
     }
@@ -415,6 +419,16 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
                     fontSize = 12.5.sp, color = pal.muted, lineHeight = 17.sp, modifier = Modifier.padding(top = 4.dp),
                 )
             }
+        }
+
+        Panel {
+            SwitchRow(
+                title = "Игры напрямую",
+                text = "Приложения-игры идут мимо VPN при любом режиме: у большинства игр нет блокировок, а напрямую пинг самый низкий. " +
+                    "Android узнаёт игры по их категории в магазине; другую игру можно добавить ниже правилом «напрямую». Меняется при подключении",
+                checked = rules.games,
+                onChange = { update(rules.copy(games = it)) },
+            )
         }
 
         NetworksPanel(rules, update, active, eff)

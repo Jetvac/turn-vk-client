@@ -22,7 +22,10 @@ import (
 //     Windows and Android ones) take reordering for loss and slow down
 //     (measured: twice the upload speed of runs of 4 packets);
 //   - bulk packets that have waited longer than maxQueueDelay are dropped,
-//     which tells TCP to slow down before a long queue builds.
+//     which tells TCP to slow down before a long queue builds;
+//   - while small packets flow steadily (a game, a call: session.Interactive)
+//     queues are kept shorter: bulk packets wait at most TightBulkWait, and
+//     each path keeps VK's queue short (PathRate.Tight).
 //
 // Sessions to servers that send no FEEDBACK (standard servers, older
 // TurnVK servers) are not paced: packets go out at once, as before.
@@ -59,6 +62,7 @@ type pacer struct {
 	wake    chan struct{}
 	dropped atomic.Uint64
 	other   []*session.Session // pickCopy's scratch, under mu
+	inter   session.Interactive
 }
 
 func newPacer(b *bind) *pacer { return &pacer{b: b, wake: make(chan struct{}, 1)} }
@@ -67,7 +71,11 @@ func newPacer(b *bind) *pacer { return &pacer{b: b, wake: make(chan struct{}, 1)
 func (p *pacer) enqueue(bufs [][]byte) {
 	now := time.Now().UnixNano()
 	p.mu.Lock()
+	small := 0
 	for _, x := range bufs {
+		if len(x) < smallPacket {
+			small++
+		}
 		if len(x) > 2048 {
 			continue
 		}
@@ -83,6 +91,7 @@ func (p *pacer) enqueue(bufs [][]byte) {
 			p.dropped.Add(1)
 		}
 	}
+	p.inter.Note(now, small)
 	start := !p.running
 	p.running = true
 	p.mu.Unlock()
@@ -166,10 +175,15 @@ func (p *pacer) step(out []sendItem) ([]sendItem, time.Duration) {
 		p.hi, p.lo, p.loBytes = nil, nil, 0
 		return out, 0
 	}
+	tight := p.inter.Note(ns, 0)
 	for _, s := range list {
+		s.Pace.Tight.Store(tight)
 		s.Pace.Refill(ns)
 	}
 	cut := ns - int64(maxQueueDelay)
+	if tight {
+		cut = ns - int64(session.TightBulkWait)
+	}
 	for len(p.lo) > 0 && p.lo[0].at < cut {
 		p.loBytes -= len(p.lo[0].b)
 		putBuf(p.lo[0].b)

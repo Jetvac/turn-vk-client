@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
@@ -194,6 +195,17 @@ class TunnelService : VpnService(), mobile.Platform {
         wifiLocks = emptyList()
     }
 
+    /** Installed apps the system files as games (their store category). */
+    @Suppress("DEPRECATION")
+    private fun gameApps(): List<String> = runCatching {
+        packageManager.getInstalledApplications(0).filter { ai ->
+            ai.packageName != packageName && (
+                (Build.VERSION.SDK_INT >= 26 && ai.category == ApplicationInfo.CATEGORY_GAME) ||
+                    (ai.flags and ApplicationInfo.FLAG_IS_GAME) != 0
+                )
+        }.map { it.packageName }
+    }.getOrDefault(emptyList())
+
     // --- mobile.Platform ---
 
     override fun protect(fd: Long): Boolean = protect(fd.toInt())
@@ -230,7 +242,10 @@ class TunnelService : VpnService(), mobile.Platform {
             // apps sent direct that no rule can bring back go around the
             // tunnel.
             runCatching { b.addDisallowedApplication(packageName) }
-            (BYPASS + planApps).toSet().forEach { p ->
+            // "Games direct": the game apps too.
+            val games = if (plan?.optBoolean("games") == true) gameApps() else emptyList()
+            if (games.isNotEmpty()) log("игры напрямую: ${games.size}")
+            (BYPASS + planApps + games).toSet().forEach { p ->
                 try {
                     b.addDisallowedApplication(p)
                 } catch (_: PackageManager.NameNotFoundException) {

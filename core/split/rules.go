@@ -73,6 +73,9 @@ type Rules struct {
 	// Networks switch the mode by the network the device is on
 	// (network.go).
 	Networks []NetRule `json:"networks,omitempty"`
+	// Games: games and their launchers go direct, whatever the mode, even
+	// with split tunneling off (games.go).
+	Games bool `json:"games,omitempty"`
 }
 
 // DefaultRules: off; when turned on, everything goes through the VPN except
@@ -245,6 +248,9 @@ var lanPrefixes = []netip.Prefix{
 
 func newMatcher(r Rules, alwaysVPN []netip.Prefix, lists *Lists) *matcher {
 	r.Normalize()
+	if r.Games {
+		r = withGames(r, FindGames())
+	}
 	m := &matcher{rules: r, exact: map[string]*AppRule{}, norm: map[*AppRule]string{}, vpn: alwaysVPN}
 	if r.On {
 		m.retry = !r.NoRetry

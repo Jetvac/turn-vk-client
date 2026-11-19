@@ -385,6 +385,12 @@ select { font: inherit; color: var(--text); background: var(--card2); border: 1p
       <div class="small muted" style="margin-top:8px">Режим добавляет нужные списки и не трогает ваши правила для программ и сайтов. Путь выбирается для каждого нового соединения, поэтому игра со всеми её серверами и вспомогательными программами идёт одним путём.</div>
     </div>
     <div class="card">
+      <div class="opt">
+        <div class="grow"><div class="lbl">Игры напрямую</div><div class="hint">Лаунчеры (Steam, Epic Games, Riot, Battle.net, EA app, Ubisoft Connect, GOG Galaxy), игры, которые они запускают, и папки с играми идут мимо VPN при любом режиме: у большинства игр нет блокировок, а напрямую пинг самый низкий. Сайты, которые правила отправляют через VPN, по-прежнему идут через VPN. <span id="spGamesFound"></span></div></div>
+        <label class="switch"><input type="checkbox" id="spGames"><i></i></label>
+      </div>
+    </div>
+    <div class="card">
       <div class="title">Режим по сети</div>
       <div class="small muted" id="netNow" style="margin:-4px 0 6px"></div>
       <div id="netRules"></div>
@@ -860,6 +866,14 @@ window.onPicked = (p) => addRule(p.path, p.folder);
 $('spAddApp').onclick = () => tvkPick(false);
 $('spAddDir').onclick = () => tvkPick(true);
 $('spRetry').onchange = () => { const r = spRules(); r.noRetry = !$('spRetry').checked; saveSplit(r); };
+$('spGames').onchange = () => {
+  const r = spRules(); r.games = $('spGames').checked; saveSplit(r);
+  toast(r.games ? 'Игры идут напрямую' : 'Игры — по правилам режима');
+};
+async function renderGames() {
+  const names = (await tvkGameNames()) || [];
+  $('spGamesFound').textContent = names.length ? 'Найдено: ' + names.join(', ') + '.' : 'Лаунчеры на компьютере не найдены: добавьте игру ниже как программу или папку.';
+}
 document.querySelectorAll('#spModes .mode').forEach(el => el.onclick = () => {
   const m = el.dataset.m;
   V.mode = m;
@@ -930,6 +944,7 @@ function renderSplit() {
   renderExApps(apps);
   $('spLAN').checked = !!r.lan;
   $('spRetry').checked = !r.noRetry;
+  $('spGames').checked = !!r.games;
   document.querySelectorAll('#spDefault button').forEach(b => b.classList.toggle('on', b.dataset.v === (r.default || 'vpn')));
   renderDomains();
   renderLists();
@@ -1500,6 +1515,7 @@ $('rFile').onclick = () => { if (reportPath) tvkShowFile(reportPath); };
 $('rOk').onclick = () => $('reportModal').classList.remove('on');
 
 (async () => {
+  renderGames();
   logLines = await tvkLogs();
   onView(await tvkView());
 })();
