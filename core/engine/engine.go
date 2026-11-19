@@ -51,6 +51,9 @@ type Config struct {
 	Client  string
 	// OnStatus is called (from any goroutine) when the status changes.
 	OnStatus func(Status)
+	// Quiet: idle mode for phones (idle.go): an idle tunnel keeps a few
+	// routes, which ping together, so that the radio can sleep.
+	Quiet bool
 }
 
 // TunFactory creates the tunnel interface once the server's WireGuard
@@ -79,7 +82,9 @@ type Status struct {
 	Since      int64  `json:"since"`
 	// Protocol is "direct" (TurnVK server) or "dtls" (standard server).
 	Protocol string `json:"protocol,omitempty"`
-	RTT      int    `json:"rtt_ms,omitempty"` // average over the paths
+	// Quiet: the tunnel is idle and keeps a few routes (idle.go).
+	Quiet bool `json:"quiet,omitempty"`
+	RTT   int  `json:"rtt_ms,omitempty"` // average over the paths
 	// Captcha: VK is waiting for the user to pass its check. The state
 	// shows it only while there is no working session; a connection
 	// that works meanwhile stays "connected".
@@ -240,6 +245,10 @@ type Engine struct {
 	logs logLimiter // merges repeated log lines
 
 	statsAcked atomic.Bool // the server acknowledged a statistics report
+
+	// quiet: idle mode (nil without Config.Quiet), idle.go.
+	quiet *session.Quiet
+	idle  idleState
 }
 
 const (
@@ -340,6 +349,10 @@ func New(cfg Config) (*Engine, error) {
 	}
 	e := &Engine{cfg: cfg, aead: aead, b: newBind(), state: StateStopped, since: time.Now(), done: make(chan struct{})}
 	e.target.Store(int32(cfg.Sessions))
+	if cfg.Quiet {
+		e.quiet = session.NewQuiet()
+		e.b.quiet = e.quiet
+	}
 	e.gen = randomID()
 	if _, err := rand.Read(e.keys.Private[:]); err != nil {
 		return nil, err
@@ -492,9 +505,11 @@ func (e *Engine) worker(i int, s *session.Session) {
 	fails := 0 // failed dials in a row: each tries the next TURN server
 	for e.ctx.Err() == nil {
 		if s == nil {
-			// Fewer routes while VK refuses allocations: this slot rests.
-			if i > 0 && i >= int(e.target.Load()) {
-				if !sleep(e.ctx, 30*time.Second) {
+			// Fewer routes while VK refuses allocations, or while idle:
+			// this slot rests.
+			up := e.idleUp()
+			if i > 0 && i >= e.limit() {
+				if !e.rest(i, up) {
 					return
 				}
 				continue
@@ -552,6 +567,12 @@ func (e *Engine) worker(i int, s *session.Session) {
 			fails = 0
 			e.offline.up()
 			e.silent.up()
+			if i > 0 && i >= e.limit() {
+				// Idle mode began while it opened.
+				s.Close()
+				s, opened = nil, false
+				continue
+			}
 			if opened {
 				e.reconnect.Add(1)
 			}
@@ -590,11 +611,17 @@ func (e *Engine) worker(i int, s *session.Session) {
 			return
 		}
 		e.notify()
+		if i > 0 && i >= e.limit() {
+			// Closed for idle mode: it rests, and coming back is no
+			// reconnect.
+			opened = false
+			continue
+		}
 		// A route that served for a while is replaced at once, unless many
 		// went down together (a network switch, a server restart): then
 		// the new allocations are spread out.
 		wait := jitter(backoff)
-		if t := int(e.target.Load()); healthy && t-len(e.b.list()) <= max(1, t/4) {
+		if t := e.limit(); healthy && t-len(e.b.list()) <= max(1, t/4) {
 			wait = 0
 		}
 		if wait > 0 && !sleep(e.ctx, wait) {
@@ -644,7 +671,7 @@ func (e *Engine) dial(ctx context.Context, i, shift int) (*session.Session, erro
 		Peer: e.peer, TURNServer: server, Username: creds.Username, Password: creds.Password,
 		AEAD: e.aead, Mode: e.cfg.Mode, Net: e.cfg.Net,
 		ConnPassword: e.cfg.Link.Password, DeviceID: e.cfg.DeviceID, Generation: e.gen, Worker: i,
-		OnReset: e.serverReset, Logf: e.logf, OnUnfreed: e.noteUnfreed, RTTs: &e.rtts,
+		OnReset: e.serverReset, Logf: e.logf, OnUnfreed: e.noteUnfreed, RTTs: &e.rtts, Quiet: e.quiet,
 		Direct: mode != modeDTLS, Keys: &e.keys, ServerKey: e.cfg.Link.ServerKey,
 	}
 	if mode == modeUnknown {
@@ -1019,6 +1046,7 @@ func (e *Engine) watchdog() {
 	lastRx, rxAt := e.b.rx.Load(), time.Now()
 	txAtRx := e.b.tx.Load()
 	lastTick := time.Now().UnixNano() // wall clock: it runs on while the device sleeps
+	e.idleStart(time.Now())
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -1039,12 +1067,14 @@ func (e *Engine) watchdog() {
 			}
 			lastTick = wall
 			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
+			e.idle.prevPk = e.b.rx.Load() + e.b.tx.Load()
 			continue
 		} else {
 			lastTick = wall
 		}
 		e.replaceSilentPaths(list)
 		now := time.Now()
+		e.idleTick(now, list)
 		e.raiseTarget(now)
 		if len(list) > 0 {
 			for _, hs := range e.hashes {
@@ -1101,7 +1131,8 @@ func (e *Engine) mayMove(now time.Time) bool {
 	ns := now.UnixNano()
 	return ns-e.movedAt.Load() >= int64(relayMoveEvery) &&
 		ns-e.quotaAt.Load() >= int64(quotaCalm) &&
-		ns-e.wokeAt.Load() >= int64(dozeWindow)
+		ns-e.wokeAt.Load() >= int64(dozeWindow) &&
+		!e.quiet.Relaxed(now)
 }
 
 // replaceSilentPaths closes direct paths that have not heard from the
@@ -1116,7 +1147,8 @@ func (e *Engine) replaceSilentPaths(list []*session.Session) {
 	now := time.Now()
 	// Just after the device slept (the phone in the background), every
 	// route looks silent until its next ping comes back: wait for them.
-	if now.UnixNano()-e.wokeAt.Load() < int64(wakeGrace) {
+	// While idle the routes ping only at each burst: pathDead judges them.
+	if now.UnixNano()-e.wokeAt.Load() < int64(wakeGrace) || e.quiet.Relaxed(now) {
 		return
 	}
 	fresh := 0
@@ -1368,6 +1400,7 @@ func (e *Engine) Status() Status {
 		st.RTT = int(sum / n / int64(time.Millisecond))
 	}
 	st.Protocol = e.protocol()
+	st.Quiet = e.quiet.On()
 	e.mu.Lock()
 	st.State, st.LastError, st.Since = e.state, e.lastErr, e.since.Unix()
 	e.mu.Unlock()

@@ -378,7 +378,9 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
     var eff by remember { mutableStateOf(Effective.now()) }
     val notes = remember(rules) { ruleNotes(rules) }
     // The lists' state, and the connections while connected.
-    LaunchedEffect(active, rules, recent) {
+    val onScreen = rememberOnScreen()
+    LaunchedEffect(active, rules, recent, onScreen) {
+        if (!onScreen) return@LaunchedEffect
         while (true) {
             info = ListsInfo.parse(withContext(Dispatchers.IO) { runCatching { mobile.Mobile.listsInfo() }.getOrDefault("") })
             eff = Effective.now()

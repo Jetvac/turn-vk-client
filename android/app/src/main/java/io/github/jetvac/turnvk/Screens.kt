@@ -133,12 +133,22 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.graphics.drawable.toBitmap
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.currentStateAsState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+
+/** Whether the app is on screen (started): polling stops otherwise. */
+@Composable
+internal fun rememberOnScreen(): Boolean {
+    val state by LocalLifecycleOwner.current.lifecycle.currentStateAsState()
+    return state.isAtLeast(Lifecycle.State.STARTED)
+}
 
 // ---------------------------------------------------------------- theme
 //
@@ -254,10 +264,13 @@ fun App(store: Store, imported: MutableState<String?>, connect: () -> Unit) {
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(status.active) {
         history.clear()
-        if (!status.active) {
-            live = Live()
-            return@LaunchedEffect
-        }
+        if (!status.active) live = Live()
+    }
+    // Polled only while on screen: in the background it would wake the
+    // phone every second for nothing.
+    val onScreen = rememberOnScreen()
+    LaunchedEffect(status.active, onScreen) {
+        if (!status.active || !onScreen) return@LaunchedEffect
         var prev: Status? = null
         var prevT = 0L
         while (true) {
@@ -708,7 +721,7 @@ private fun Stats(s: Status, live: Live, history: List<Pair<Long, Long>>) {
             Chart(history, Modifier.fillMaxWidth().height(70.dp).padding(vertical = 8.dp))
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    MiniTile("Маршруты через VK", "${s.sessions} из ${s.target}", Modifier.weight(1f))
+                    MiniTile("Маршруты через VK", if (s.quiet) "${s.sessions} · простой" else "${s.sessions} из ${s.target}", Modifier.weight(1f))
                     MiniTile("Пинг", if (s.rttMs > 0) "${s.rttMs} мс" else "—", Modifier.weight(1f))
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

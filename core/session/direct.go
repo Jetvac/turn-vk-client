@@ -106,7 +106,7 @@ func (s *Session) Fresh(now time.Time) bool {
 	if w := s.txWait.Load(); w > rx && s.acks.Load() && n-w > ackLimit(s.RTT.Load()) {
 		return false
 	}
-	return n-rx < int64(PathFresh)
+	return n-rx < s.quiet.freshFor(n)
 }
 
 // ackLimit is how long a path whose server confirms what it receives may
@@ -442,22 +442,40 @@ func (s *Session) reattach() {
 }
 
 // pingLoop keeps the path alive, measures it, and closes it when the server
-// stops answering or does not take it back after a reset.
+// stops answering or does not take it back after a reset. While idle
+// (quiet.go) it pings only with the other routes, at each burst.
 func (s *Session) pingLoop() {
-	t := time.NewTicker(pingInterval)
+	q := s.quiet
+	wait := pingInterval
+	t := time.NewTimer(wait)
 	defer t.Stop()
-	// Wall clock: it runs on while the device sleeps, the ticker does not.
+	// Wall clock: it runs on while the device sleeps, the timer does not.
 	lastTick, woke := time.Now().UnixNano(), int64(0)
 	for {
+		burst := q.woken()
 		select {
 		case <-s.done:
 			return
 		case <-t.C:
+		case <-burst:
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
+			}
 		}
-		if wall := time.Now().UnixNano(); wall-lastTick > int64(3*pingInterval) {
+		if wall := time.Now().UnixNano(); wall-lastTick > int64(wait+2*pingInterval) {
 			woke = wall // the device slept: the silence is not the path's
 		}
 		lastTick = time.Now().UnixNano()
+		// Idle: the next ping comes with the next burst (the timer only
+		// stands in for one that never comes).
+		wait = pingInterval
+		if q.On() {
+			wait = 2 * QuietPing
+		}
+		t.Reset(wait)
 		s.mu.Lock()
 		resetAt, pending := s.resetAt, s.pending != nil
 		s.mu.Unlock()
@@ -473,7 +491,8 @@ func (s *Session) pingLoop() {
 			s.reattach()
 			continue
 		}
-		if time.Now().UnixNano()-max(s.LastRx.Load(), woke) > int64(pathDead) {
+		now := time.Now().UnixNano()
+		if now-max(s.LastRx.Load(), woke) > q.deadAfter(now) {
 			// The allocation died without telling (VK dropped it, the
 			// network changed): the engine opens a new one.
 			s.Close()

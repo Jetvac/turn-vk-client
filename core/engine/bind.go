@@ -39,6 +39,10 @@ type bind struct {
 	rx      atomic.Uint64
 	tx      atomic.Uint64
 
+	// quiet: the engine's idle mode (nil without one): a packet sent
+	// while idle brings the routes' next ping burst forward.
+	quiet *session.Quiet
+
 	// For the statistics: how long held packets waited in the reorder
 	// buffer, and small packets in the pacer's queue.
 	holds, qwait session.Hist
@@ -189,6 +193,7 @@ func (b *bind) Send(bufs [][]byte, _ conn.Endpoint) error {
 		return errNoSession
 	}
 	now := time.Now()
+	b.quiet.Nudge(now)
 	if b.paced(list, now) {
 		b.pacer.enqueue(bufs)
 		return nil

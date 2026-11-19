@@ -62,6 +62,8 @@ type Params struct {
 	OnUnfreed func()
 	// RTTs, if set, counts every round trip the path's pings measure.
 	RTTs *Hist
+	// Quiet, if set, is the idle mode the engine switches (quiet.go).
+	Quiet *Quiet
 
 	// Direct selects the direct protocol (TurnVK servers) instead of
 	// DTLS + GETCONF. Keys is the client's WireGuard key pair; ServerKey,
@@ -171,13 +173,14 @@ type Session struct {
 	// (FEEDBACK), so a path that confirms nothing is dead (Fresh).
 	txWait atomic.Int64
 	acks   atomic.Bool
+	quiet  *Quiet
 }
 
 var handshakeSlots = make(chan struct{}, 4)
 
 // Dial opens a session. The context bounds the setup only.
 func Dial(ctx context.Context, p Params) (*Session, error) {
-	s := &Session{ID: p.Worker, Server: p.TURNServer, Started: time.Now(), done: make(chan struct{})}
+	s := &Session{ID: p.Worker, Server: p.TURNServer, Started: time.Now(), done: make(chan struct{}), quiet: p.Quiet}
 	ok := false
 	defer func() {
 		if !ok {

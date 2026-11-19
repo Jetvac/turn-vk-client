@@ -115,6 +115,8 @@ type statsMinute struct {
 	// LowLat: seconds the upload pacer kept queues short for interactive
 	// traffic (games, calls).
 	LowLat uint64 `json:"low_lat,omitempty"`
+	// Quiet: seconds in idle mode (idle.go).
+	Quiet uint64 `json:"quiet,omitempty"`
 }
 
 // statsAck is called by the sessions' read loops.
@@ -142,6 +144,7 @@ func (e *Engine) statsLoop() {
 	var prevRx, prevTx, prevLost, prevPk, prevRec uint64
 	prevQDrop, prevRxDrop, prevGaps := e.b.pacer.dropped.Load(), e.b.dropped.Load(), e.b.gaps()
 	prevLowLat := e.b.pacer.inter.Secs.Load()
+	prevQuiet := e.idle.secs.Load()
 	e.rtts.Take()
 	e.b.holds.Take()
 	e.b.qwait.Take()
@@ -157,11 +160,26 @@ func (e *Engine) statsLoop() {
 	unacked := 0
 	var probed time.Time
 	for {
+		// While idle, reports go out with the routes' ping bursts only, so
+		// that they wake the radio no extra time.
+		burst := e.quiet.Woken()
 		select {
 		case <-e.ctx.Done():
 			return
+		case <-burst:
+			if !e.quiet.On() || e.protocol() != "direct" {
+				continue
+			}
+			if !e.statsAcked.Load() && unacked >= statsNoAck {
+				if time.Since(probed) < statsRetry {
+					continue
+				}
+				probed = time.Now()
+			}
+			unacked += e.sendStats()
+			continue
 		case <-send.C:
-			if e.protocol() != "direct" {
+			if e.protocol() != "direct" || e.quiet.On() {
 				continue
 			}
 			if !e.statsAcked.Load() && unacked >= statsNoAck {
@@ -236,9 +254,11 @@ func (e *Engine) statsLoop() {
 		prevQDrop, prevRxDrop, prevGaps = qd, rd, gp
 		ll := e.b.pacer.inter.Secs.Load()
 		m.LowLat, prevLowLat = sub0(ll, prevLowLat), ll
+		qs := e.idle.secs.Load()
+		m.Quiet, prevQuiet = sub0(qs, prevQuiet), qs
 		m.TURN = len(turn)
 		e.queueStats(m)
-		if e.statsAcked.Load() || unacked < statsNoAck {
+		if (e.statsAcked.Load() || unacked < statsNoAck) && !e.quiet.On() {
 			unacked += e.sendStats()
 		}
 	}

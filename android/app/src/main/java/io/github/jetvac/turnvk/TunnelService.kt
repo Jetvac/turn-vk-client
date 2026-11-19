@@ -72,6 +72,9 @@ class TunnelService : VpnService(), mobile.Platform {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val store by lazy { Store(this) }
     private var wifiLocks: List<WifiManager.WifiLock> = emptyList()
+    private var noteText = ""
+    // Set once the tunnel stops: a late status must not take the Wi-Fi lock.
+    @Volatile private var stopped = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -100,6 +103,7 @@ class TunnelService : VpnService(), mobile.Platform {
 
     private fun run() {
         if (mobile.Mobile.running()) return
+        stopped = false
         val profile = store.current
         if (profile == null) {
             fail("Добавьте сервер: ссылку wdtt://")
@@ -123,7 +127,6 @@ class TunnelService : VpnService(), mobile.Platform {
             mobile.Mobile.setStats(store.serverStats, "TurnVK ${BuildConfig.VERSION_NAME} android")
             mobile.Mobile.start(profile.link, deviceId, sessions.toLong(), store.obfs, this)
             watchNetwork()
-            holdWifi()
         } catch (e: Exception) {
             fail(e.message ?: e.toString())
         }
@@ -137,6 +140,7 @@ class TunnelService : VpnService(), mobile.Platform {
     }
 
     private fun stopTunnel() {
+        stopped = true
         unwatchNetwork()
         releaseWifi()
         worker.execute {
@@ -157,6 +161,7 @@ class TunnelService : VpnService(), mobile.Platform {
     }
 
     override fun onDestroy() {
+        stopped = true
         unwatchNetwork()
         releaseWifi()
         mobile.Mobile.stop()
@@ -164,16 +169,18 @@ class TunnelService : VpnService(), mobile.Platform {
     }
 
     /**
-     * Wi-Fi without power saving while connected: in power saving the phone
-     * wakes for incoming packets only every 100-300 ms, which games feel as
-     * ping spikes. The low-latency lock (Android 10+) works while TurnVK is
-     * on screen; the high-performance one also in the background up to
-     * Android 13 (from 14 it turns into the low-latency lock).
+     * Wi-Fi without power saving while the tunnel carries traffic: in power
+     * saving the phone wakes for incoming packets only every 100-300 ms,
+     * which games feel as ping spikes. The low-latency lock (Android 10+)
+     * works while TurnVK is on screen; the high-performance one also in the
+     * background up to Android 13 (from 14 it turns into the low-latency
+     * lock). An idle tunnel (Status.quiet) lets go of them: Wi-Fi without
+     * power saving drains the battery.
      */
     @Suppress("DEPRECATION")
     @Synchronized
     private fun holdWifi() {
-        if (wifiLocks.isNotEmpty()) return
+        if (stopped || wifiLocks.isNotEmpty()) return
         val wm = applicationContext.getSystemService(WifiManager::class.java) ?: return
         val modes = buildList {
             if (Build.VERSION.SDK_INT >= 29) add(WifiManager.WIFI_MODE_FULL_LOW_LATENCY)
@@ -261,22 +268,27 @@ class TunnelService : VpnService(), mobile.Platform {
         return pfd.detachFd().toLong()
     }
 
+    // From any of the engine's goroutines.
+    @Synchronized
     override fun onStatus(status: String) {
         val s = Status.parse(status)
         val prev = TunnelState.status.value
         TunnelState.setStatus(s)
-        if (s.state != prev.state || s.sessions != prev.sessions || s.captcha != prev.captcha) {
-            val text = when (s.state) {
-                "connected" -> if (s.captcha) {
-                    "Подключено · нужна проверка VK"
-                } else {
-                    "Подключено · маршрутов ${s.sessions} из ${s.target}"
-                }
-                "captcha" -> "Нужно пройти проверку VK"
-                "connecting" -> "Подключение…"
-                "failed" -> "Ошибка: ${s.lastError}"
-                else -> s.state
+        if (s.state == "connected" && !s.quiet) holdWifi() else releaseWifi()
+        val text = when (s.state) {
+            "connected" -> when {
+                s.captcha -> "Подключено · нужна проверка VK"
+                s.quiet -> "Подключено · простой, экономия заряда"
+                else -> "Подключено · маршрутов ${s.sessions} из ${s.target}"
             }
+            "captcha" -> "Нужно пройти проверку VK"
+            "connecting" -> "Подключение…"
+            "failed" -> "Ошибка: ${s.lastError}"
+            else -> s.state
+        }
+        // Only a new text is posted: each post wakes the system's UI.
+        if (text != noteText) {
+            noteText = text
             notify(NOTE_ID, note(text))
         }
         if (s.state != prev.state) updateTile()
@@ -453,6 +465,7 @@ class TunnelService : VpnService(), mobile.Platform {
     }
 
     private fun startForegroundCompat(n: Notification) {
+        noteText = ""
         if (Build.VERSION.SDK_INT >= 34) {
             startForeground(NOTE_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {

@@ -123,6 +123,8 @@ func Start(rawLink, deviceID string, sessions int, obfs string, p Platform) erro
 		Client:   client,
 		Logf:     func(f string, a ...any) { p.Log(fmt.Sprintf(f, a...)) },
 		OnStatus: func(s engine.Status) { b, _ := json.Marshal(s); p.OnStatus(string(b)) },
+		// A phone's battery: an idle tunnel lets the radio sleep.
+		Quiet: true,
 	})
 	if err != nil {
 		mu.Unlock()

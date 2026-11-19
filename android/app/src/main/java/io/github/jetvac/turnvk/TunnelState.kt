@@ -33,6 +33,8 @@ data class Status(
     val protocol: String = "",
     val rttMs: Int = 0,
     val paths: List<PathInfo> = emptyList(),
+    /** The tunnel is idle: a few routes, pinging together (saves battery). */
+    val quiet: Boolean = false,
 ) {
     val active: Boolean get() = state in setOf("connecting", "connected", "captcha")
 
@@ -65,6 +67,7 @@ data class Status(
                 protocol = o.optString("protocol"),
                 rttMs = o.optInt("rtt_ms"),
                 paths = paths.sortedBy { it.id },
+                quiet = o.optBoolean("quiet"),
             )
         }.getOrDefault(Status())
     }
