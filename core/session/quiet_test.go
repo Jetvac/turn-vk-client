@@ -98,8 +98,12 @@ func TestPingLoopQuiet(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	q.Burst(time.Now())
 	waitN(1)
+	// The loop waits for the next burst once it has sent its ping: let it
+	// get there (real bursts are QuietPing apart).
+	time.Sleep(20 * time.Millisecond)
 	q.Burst(time.Now())
 	waitN(2)
+	time.Sleep(20 * time.Millisecond)
 	q.Leave(time.Now())
 	waitN(3)
 	if got := relay.n.Load(); got != 3 {
