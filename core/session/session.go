@@ -426,9 +426,7 @@ func (s *Session) Close() {
 		go func() {
 			defer releasing.Done()
 			if s.tc != nil && s.turnAddr != nil {
-				ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
-				r, err := release(ctx, pionTransactor{s.tc}, s.turnAddr, s.turnUser, s.turnPass)
-				cancel()
+				r, err := releaseRetry(pionTransactor{s.tc}, s.turnAddr, s.turnUser, s.turnPass, releaseWaits)
 				releaseCount[r].Add(1)
 				if err != nil && s.logf != nil {
 					s.logf("route %d: TURN allocation on %s not freed: %v", s.ID, s.Server, err)

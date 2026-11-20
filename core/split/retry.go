@@ -15,6 +15,7 @@ package split
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -285,6 +286,10 @@ func (r *Router) noteFailed(f *flow, host string, err error, ok bool) {
 	name := host
 	if name == "" {
 		name = addr
+	}
+	if ok && f.byApp && r.starting(f.path) && !r.appFailed(f.path) {
+		// A game starting: all of it follows (appwatch.go).
+		go r.appFail(f.path, fmt.Sprintf("%s не открылся напрямую", name))
 	}
 	if ok {
 		r.o.Logf("split: %s did not open direct (%s), opened through the VPN", name, why)

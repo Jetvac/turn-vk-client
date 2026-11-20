@@ -59,6 +59,16 @@ type Config struct {
 	// Device, when set, reports the battery and power state for the
 	// statistics (device.go); called once a minute.
 	Device func() *DeviceState
+	// Direct, when set, reports the split tunneling's direct path for the
+	// statistics (stats.go); called once a minute.
+	Direct func() DirectState
+}
+
+// DirectState: the direct path of split tunneling (split.Router.Stats).
+type DirectState struct {
+	Flows    int    // open direct flows
+	UDPSocks int    // direct UDP sockets open
+	UDPErr   uint64 // direct UDP sends that failed, since the start
 }
 
 // TunFactory creates the tunnel interface once the server's WireGuard

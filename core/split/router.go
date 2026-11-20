@@ -82,6 +82,9 @@ type Router struct {
 	// pass untouched.
 	direct atomic.Int32
 	logged map[string]bool
+	// socks: the route each program's UDP socket took (sockRoute), so
+	// that all its later destinations take it too.
+	socks map[netip.AddrPort]*sockRoute
 
 	hmu   sync.Mutex
 	hosts map[netip.Addr]hostEntry // real address -> name, from DNS answers
@@ -109,7 +112,26 @@ type Router struct {
 	fmu    sync.Mutex
 	failed map[string]*Failure // sites that did not open direct (retry.go)
 
+	amu    sync.Mutex
+	probes map[string]*appProbe // programs sent direct by their rule (appwatch.go)
+
 	history map[histKey]*Conn // ended connections (history.go); under mu
+}
+
+// sockRoute: the route of a program's UDP socket. A game talks to its
+// matchmaking, to the servers it measures and to the match from one
+// socket, and the servers compare the address each of them saw: if one
+// destination went direct and another through the VPN (the program looked
+// up again, and Windows had given the port to another program meanwhile),
+// they saw two addresses, and the match never started. So the socket
+// keeps the program found for it, and the route its program's rule gave
+// (byApp; a route by the destination, a site or an address list, is
+// decided for each destination as before).
+type sockRoute struct {
+	d     Decision
+	byApp bool
+	proc  *Proc
+	last  int64 // unix ns: last used
 }
 
 type flow struct {
@@ -150,6 +172,10 @@ type flow struct {
 	// reject: IPv6 for the VPN, which carries IPv4 only: TCP gets a reset
 	// at once (the program falls back to IPv4), UDP is dropped.
 	reject bool
+	// byApp: sent direct by its program's own rule (appwatch.go); probe:
+	// that program's watch (UDP).
+	byApp  bool
+	probe  *appProbe
 	qwatch atomic.Bool
 	qmu    sync.Mutex
 	qheld  [][]byte
@@ -166,7 +192,7 @@ func New(dev tun.Device, o Options, rules Rules) *Router {
 	if err != nil || mtu < 576 {
 		mtu = 1280
 	}
-	r := &Router{inner: dev, o: o, mtu: mtu, flows: map[flowKey]*flow{}, frags: map[fragKey]*fragState{}, logged: map[string]bool{},
+	r := &Router{inner: dev, o: o, mtu: mtu, flows: map[flowKey]*flow{}, frags: map[fragKey]*fragState{}, logged: map[string]bool{}, socks: map[netip.AddrPort]*sockRoute{},
 		hosts: map[netip.Addr]hostEntry{}, resolved: map[string]resolved{}}
 	r.ctx, r.cancel = context.WithCancel(context.Background())
 	r.injectQ = make(chan []byte, 1024)
@@ -191,6 +217,7 @@ func (r *Router) SetRules(rules Rules) {
 	r.smu.Unlock()
 	r.mu.Lock()
 	r.logged = map[string]bool{}
+	r.socks = map[netip.AddrPort]*sockRoute{}
 	r.mu.Unlock()
 }
 
@@ -202,6 +229,7 @@ func (r *Router) SetLists(l *Lists) {
 	r.smu.Unlock()
 	r.mu.Lock()
 	r.logged = map[string]bool{}
+	r.socks = map[netip.AddrPort]*sockRoute{}
 	r.mu.Unlock()
 }
 
@@ -326,6 +354,16 @@ func (r *Router) Write(bufs [][]byte, offset int) (int, error) {
 }
 
 // writeOut sends packets of direct connections to the computer.
+// unreachable6 tells the program that sent a direct IPv6 datagram that
+// its destination cannot be reached, so that it uses IPv4 at once.
+func (r *Router) unreachable6(k flowKey, payload []byte) {
+	inv := udpPackets(k.src, k.dst, payload, r.mtu, 0, 0)
+	if len(inv) == 0 {
+		return
+	}
+	r.writeOut([][]byte{icmp6Unreachable(k.dst.Addr(), k.src.Addr(), inv[0])}, 0)
+}
+
 func (r *Router) writeOut(pkts [][]byte, offset int) {
 	r.wmu.Lock()
 	_, err := r.inner.Write(pkts, offset)
@@ -381,6 +419,10 @@ func (r *Router) route(b []byte, m *matcher, now int64) bool {
 		}
 	case protoUDP:
 		if f.reject {
+			// IPv6 for the VPN: the program hears so and uses IPv4.
+			if !p.frag || p.firstFrg {
+				r.unreachable6(p.key, p.payload)
+			}
 			return false
 		}
 		if f.qwatch.Load() {
@@ -416,13 +458,29 @@ func (r *Router) newFlow(p *pkt, m *matcher, now int64) *flow {
 		}
 	}
 	var proc *Proc
+	// A UDP socket that a program's rule already routed (sockRoute); not
+	// QUIC, whose route comes from the site's name.
+	sockKeep := p.key.proto == protoUDP && !fixed && !fake && !p.frag && !sniffPort(protoUDP, p.key.dst.Port())
+	var sticky *sockRoute
+	if sockKeep {
+		r.mu.Lock()
+		if s := r.socks[p.key.src]; s != nil {
+			s.last = now
+			sticky = s
+		}
+		r.mu.Unlock()
+	}
 	// With the others direct, TurnVK's own checks (made through the
 	// tunnel on purpose) have to be told apart too.
-	if r.o.Owner != nil && (!fixed && (m.needsProc() || m.anyDirect) || r.watching(now)) {
+	if sticky != nil {
+		proc = sticky.proc
+	} else if r.o.Owner != nil && (!fixed && (m.needsProc() || m.anyDirect) || r.watching(now)) {
 		proc = r.o.Owner.Lookup(p.key.proto, p.key.src, p.key.dst, m.kids)
 	}
 	switch {
 	case fixed:
+	case sticky != nil && sticky.byApp:
+		d = sticky.d
 	case proc != nil && proc.PID == r.self:
 		d = Decision{VPN, "проверка TurnVK"}
 	default:
@@ -435,6 +493,20 @@ func (r *Router) newFlow(p *pkt, m *matcher, now int64) *flow {
 			f.sniffing = true
 			if p.key.proto == protoUDP {
 				f.quic = &quicSniff{prelim: d}
+			}
+		}
+	}
+	// Sent direct by the program's own rule (a game): watched as a whole,
+	// and through the VPN while it fails direct (appwatch.go).
+	if d.Route == Direct && proc != nil && proc.Path != "" && !fixed && !fake {
+		if a, parent := m.appFor(proc); a != nil && d == (Decision{a.Route, m.why(a, parent)}) {
+			if r.appFailed(proc.Path) {
+				d = Decision{VPN, whyAppFailed}
+			} else {
+				f.byApp = true
+				if p.key.proto == protoUDP {
+					f.probe = r.probeFor(proc.Path, now)
+				}
 			}
 		}
 	}
@@ -487,6 +559,11 @@ func (r *Router) newFlow(p *pkt, m *matcher, now int64) *flow {
 	if old := r.flows[p.key]; old != nil {
 		r.mu.Unlock()
 		return old
+	}
+	if sockKeep && sticky == nil && proc != nil && proc.PID != r.self && len(r.socks) < maxFlows {
+		a, parent := m.appFor(proc)
+		byApp := a != nil && d == Decision{a.Route, m.why(a, parent)}
+		r.socks[p.key.src] = &sockRoute{d: d, byApp: byApp, proc: proc, last: now}
 	}
 	if len(r.flows) >= maxFlows {
 		r.evictLocked()
@@ -554,6 +631,7 @@ func (r *Router) expire() {
 		}
 		now := time.Now()
 		r.expireHosts(now)
+		r.expireProbes(now)
 		r.mu.Lock()
 		for k, f := range r.flows {
 			idle := now.Sub(time.Unix(0, f.last.Load()))
@@ -569,6 +647,11 @@ func (r *Router) expire() {
 			}
 			if idle > limit {
 				r.dropLocked(k, f)
+			}
+		}
+		for k, s := range r.socks {
+			if now.Sub(time.Unix(0, s.last)) > natIdle {
+				delete(r.socks, k)
 			}
 		}
 		for k, s := range r.frags {
@@ -626,6 +709,18 @@ type Conn struct {
 	Retried bool `json:"retried,omitempty"`
 	// N: how many such connections (History merges them).
 	N int `json:"n,omitempty"`
+}
+
+// DirectStats: the direct path's numbers for the statistics.
+type DirectStats struct {
+	Flows    int    // open direct flows
+	UDPSocks int    // direct UDP sockets open
+	UDPErr   uint64 // direct UDP sends that failed, since the start
+}
+
+// Stats returns the direct path's numbers.
+func (r *Router) Stats() DirectStats {
+	return DirectStats{Flows: int(r.direct.Load()), UDPSocks: r.udp.count(), UDPErr: r.udp.sendErr.Load()}
 }
 
 // Conns lists the known connections, most recently active first (at most

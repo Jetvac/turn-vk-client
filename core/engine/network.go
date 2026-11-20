@@ -46,7 +46,7 @@ func (e *Engine) netDown(now time.Time) bool {
 // lack of network.
 func (e *Engine) holdRoutes(now time.Time) {
 	if last := e.heldAt.Load(); now.UnixNano()-last >= int64(time.Minute) && e.heldAt.CompareAndSwap(last, now.UnixNano()) {
-		e.logf("no network: the routes are kept until it is back")
+		e.logf("cannot send (no network, or no socket buffers left): the routes are kept until it passes")
 	}
 }
 

@@ -70,6 +70,25 @@ func (p pionTransactor) PerformTransactionWithContext(msg *stun.Message, to net.
 	return res.Msg, nil
 }
 
+// releaseWaits: the pauses before the next tries of a release that could
+// not be sent (no network, no buffers: release.go, NoNetwork). An
+// allocation left behind counts against VK's quota for 10 minutes.
+var releaseWaits = []time.Duration{time.Second, 3 * time.Second, 10 * time.Second}
+
+// releaseRetry is release, tried again after each of waits while the
+// request cannot even be sent.
+func releaseRetry(t transactor, server net.Addr, user, pass string, waits []time.Duration) (releaseResult, error) {
+	for i := 0; ; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout)
+		r, err := release(ctx, t, server, user, pass)
+		cancel()
+		if err == nil || !NoNetwork(err) || i >= len(waits) {
+			return r, err
+		}
+		time.Sleep(waits[i])
+	}
+}
+
 // release frees the allocation on server (Refresh with lifetime 0),
 // authenticating with the long-term credentials (turnAuth, renew.go).
 func release(ctx context.Context, t transactor, server net.Addr, user, pass string) (releaseResult, error) {

@@ -276,8 +276,13 @@ func (s *Session) sendDirect(b []byte) error {
 	return err
 }
 
-// NoNetwork tells whether a socket error means the device has no network
-// (or none that reaches the address).
+// NoNetwork tells whether a socket error means the device cannot send now:
+// it has no network (or none that reaches the address), or the system
+// is out of buffers for every socket at once. The latter is WSAENOBUFS on
+// Windows ("lacked sufficient buffer space or because a queue was full"):
+// it came for a few seconds while a game's anti-cheat driver loaded, and
+// treating it as dead routes closed them all (their allocations could not
+// be freed either, and VK refused new ones for a quarter of an hour).
 func NoNetwork(err error) bool {
 	if err == nil {
 		return false
@@ -286,7 +291,18 @@ func NoNetwork(err error) bool {
 	return strings.Contains(m, "network is unreachable") ||
 		strings.Contains(m, "unreachable network") || // Windows: WSAENETUNREACH
 		strings.Contains(m, "no route to host") ||
-		strings.Contains(m, "machine is not on the network") // ENONET: its network is gone
+		strings.Contains(m, "machine is not on the network") || // ENONET: its network is gone
+		NoBuffers(err)
+}
+
+// NoBuffers: the system has no socket buffers left (ENOBUFS), for now.
+func NoBuffers(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "sufficient buffer space") || // Windows: WSAENOBUFS
+		strings.Contains(m, "no buffer space") // ENOBUFS
 }
 
 // readDirect returns the next unwrapped message from the server.

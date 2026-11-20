@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/pion/stun/v4"
 )
@@ -82,5 +83,40 @@ func TestRelease(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// noBufTURN fails the first sends as Windows does when it has no socket
+// buffers left, then answers like fakeTURN.
+type noBufTURN struct {
+	fails int
+	next  *fakeTURN
+}
+
+func (n *noBufTURN) PerformTransactionWithContext(msg *stun.Message, a net.Addr, i bool, ctx context.Context) (turnResult, error) {
+	if n.fails > 0 {
+		n.fails--
+		return nil, errors.New("write udp4 0.0.0.0:61942->95.163.34.131:19302: wsasendto: An operation on a socket could not be performed because the system lacked sufficient buffer space or because a queue was full.")
+	}
+	return n.next.PerformTransactionWithContext(msg, a, i, ctx)
+}
+
+// A release that cannot be sent is tried again; one VK refuses is not.
+func TestReleaseRetry(t *testing.T) {
+	waits := []time.Duration{time.Millisecond, time.Millisecond, time.Millisecond}
+	tr := &noBufTURN{fails: 2, next: &fakeTURN{t: t, answers: []int{401, 0}}}
+	if r, err := releaseRetry(tr, &net.UDPAddr{}, "u", "p", waits); r != released || err != nil {
+		t.Fatalf("%v, %v", r, err)
+	}
+	tr = &noBufTURN{fails: 9, next: &fakeTURN{t: t}}
+	if r, err := releaseRetry(tr, &net.UDPAddr{}, "u", "p", waits); r != releaseFailed || !NoBuffers(err) || tr.fails != 5 {
+		t.Fatalf("%v, %v, %d sends left", r, err, tr.fails)
+	}
+	f := &fakeTURN{t: t}
+	if r, _ := releaseRetry(f, &net.UDPAddr{}, "u", "p", waits); r != releaseFailed || len(f.reqs) != 1 {
+		t.Fatalf("a timeout was retried: %d requests", len(f.reqs))
+	}
+	if !NoNetwork(errors.New("sendto: no buffer space available")) {
+		t.Fatal("ENOBUFS is not taken for an outage")
 	}
 }

@@ -144,6 +144,7 @@ func Start(rawLink, deviceID string, sessions int, obfs string, p Platform) erro
 		// the user chose to stay always ready).
 		Power:  power,
 		Device: func() *engine.DeviceState { return parseDevice(p.Device()) },
+		Direct: directStats,
 	})
 	if err != nil {
 		mu.Unlock()

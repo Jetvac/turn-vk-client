@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	webview2 "github.com/jchv/go-webview2"
@@ -690,6 +691,9 @@ func (a *app) connect() error {
 		return err
 	}
 	v.Debug = debugRun
+	// The router of this connection, for the statistics (not a.router:
+	// the engine reports while a.mu may be held).
+	var rtNow atomic.Pointer[split.Router]
 	e, err = engine.New(engine.Config{
 		Link: l, DeviceID: a.devID, Sessions: a.s.Sessions, Mode: wrap.ParseMode(a.s.Obfs),
 		Net:     &netx.Net{DNS: netx.DefaultDNS, Protect: v.Protect},
@@ -701,6 +705,14 @@ func (a *app) connect() error {
 		// Not inline: the engine may report while a.mu is held here, and
 		// push asks the engine for its status.
 		OnStatus: func(engine.Status) { go a.push() },
+		Direct: func() engine.DirectState {
+			rt := rtNow.Load()
+			if rt == nil {
+				return engine.DirectState{}
+			}
+			d := rt.Stats()
+			return engine.DirectState{Flows: d.Flows, UDPSocks: d.UDPSocks, UDPErr: d.UDPErr}
+		},
 	})
 	if err != nil {
 		v.Close()
@@ -743,6 +755,7 @@ func (a *app) connect() error {
 			Addr:     c.Address.Addr(),
 			Logf:     a.logf,
 		}, rules)
+		rtNow.Store(rt)
 		a.mu.Lock()
 		if a.eng == e {
 			a.router = rt

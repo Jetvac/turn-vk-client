@@ -23,6 +23,12 @@ const (
 	udpTableOwnerPID    = 1 // UDP_TABLE_OWNER_PID
 	procTTL             = 10 * time.Second
 	treeTTL             = 2 * time.Second
+	// udpFresh: a UDP table older than this is read again before a port
+	// is looked up in it. A UDP socket is known by its port alone, and
+	// Windows hands a closed socket's port to the next program soon: an
+	// old table named the port's previous owner, and that program's route
+	// was taken (one of a game's destinations went through the VPN).
+	udpFresh = time.Second
 )
 
 type tcpSock struct{ local, remote netip.AddrPort }
@@ -89,6 +95,9 @@ func (o *winOwner) find(proto uint8, local, remote netip.AddrPort) (uint32, bool
 				continue
 			}
 		case protoUDP:
+			if try == 0 && time.Since(o.udpAt) > udpFresh {
+				o.readUDP()
+			}
 			for _, s := range o.udp[local.Port()] {
 				if s.addr == local.Addr() || s.addr.IsUnspecified() {
 					return s.pid, true

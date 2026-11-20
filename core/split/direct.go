@@ -271,25 +271,91 @@ type udpNAT struct {
 	mu    sync.Mutex
 	socks map[netip.AddrPort]*natSock // the program's address
 	id    atomic.Uint32
+	// sendErr: sends that failed (the packet is lost, as on a congested
+	// network; counted for the statistics, and logged now and then);
+	// errLog, evictLog: when the last such line was logged, unix ns.
+	sendErr  atomic.Uint64
+	errLog   atomic.Int64
+	evictLog atomic.Int64
+	// no6: until when (unix ns) direct IPv6 is not tried: the computer
+	// has no IPv6 network (the socket could not be bound to one). Its
+	// programs see IPv6 through TurnVK's adapter, and a packet dropped
+	// without a word kept them waiting before they fell back to IPv4.
+	no6    atomic.Int64
+	no6Log atomic.Int64
+}
+
+const (
+	// no6Wait: how long direct IPv6 is answered "unreachable" at once
+	// after a socket could not be bound to an IPv6 network.
+	no6Wait = 30 * time.Second
+	// no6LogEvery: how often that is logged.
+	no6LogEvery = 10 * time.Minute
+)
+
+// A direct UDP socket the far end answered stays open natIdle after its
+// last packet, so that a game waiting quietly in its lobby keeps its
+// outside port (a new one would look like another player to its server);
+// one never answered closes after natIdleQuiet.
+const (
+	natIdle      = 5 * time.Minute
+	natIdleQuiet = 30 * time.Second
+)
+
+// maxNATSocks: direct UDP sockets kept at most. Each holds a pending read
+// with its buffer in the system; a program opening sockets without end
+// (a scan, a game measuring many servers) must not use up the system's
+// buffers, which TurnVK's own routes need too. The one used longest ago
+// gives way.
+var maxNATSocks = 1024
+
+// noteSendErr counts a failed direct send and logs it once a minute.
+func (u *udpNAT) noteSendErr(err error) {
+	if err == nil {
+		return
+	}
+	n := u.sendErr.Add(1)
+	now := time.Now().UnixNano()
+	if last := u.errLog.Load(); now-last >= int64(time.Minute) && u.errLog.CompareAndSwap(last, now) {
+		u.r.o.Logf("split: direct UDP send failed (%d so far): %v", n, err)
+	}
 }
 
 type natSock struct {
 	r      *Router
 	c      *net.UDPConn
 	client netip.AddrPort
-	mu     sync.Mutex
-	fakeOf map[netip.AddrPort]netip.AddrPort // real site -> its placeholder
-	last   atomic.Int64
+	// answered: something came back (natIdle applies, not natIdleQuiet);
+	// probe: the watch of the program that sent on it (appwatch.go).
+	answered atomic.Bool
+	probe    atomic.Pointer[appProbe]
+	mu       sync.Mutex
+	fakeOf   map[netip.AddrPort]netip.AddrPort // real site -> its placeholder
+	last     atomic.Int64
 }
 
 func newUDPNAT(r *Router) *udpNAT { return &udpNAT{r: r, socks: map[netip.AddrPort]*natSock{}} }
 
 func (u *udpNAT) send(f *flow, payload []byte) {
+	if f.probe != nil {
+		u.r.probeSent(f)
+	}
+	v6 := f.key.src.Addr().Is6()
+	if v6 && time.Now().UnixNano() < u.no6.Load() {
+		u.r.unreachable6(f.key, payload)
+		return
+	}
 	s := u.sock(f.key.src)
 	if s == nil {
+		if v6 {
+			u.r.unreachable6(f.key, payload)
+		}
 		return
 	}
 	s.last.Store(time.Now().UnixNano())
+	if f.probe != nil && s.probe.Load() != f.probe {
+		s.probe.Store(f.probe)
+	}
 	dst := f.key.dst
 	if isFake(dst.Addr()) {
 		name := u.r.o.Fake.Name(dst.Addr())
@@ -305,7 +371,8 @@ func (u *udpNAT) send(f *flow, payload []byte) {
 		go func() { s.toSite(p, dst, u.r.resolve(name)) }()
 		return
 	}
-	_, _ = s.c.WriteToUDPAddrPort(payload, u.r.remap(dst))
+	_, err := s.c.WriteToUDPAddrPort(payload, u.r.remap(dst))
+	u.noteSendErr(err)
 }
 
 // toSite sends to a site behind a placeholder; its answers will come back
@@ -321,7 +388,8 @@ func (s *natSock) toSite(payload []byte, fake netip.AddrPort, addrs []netip.Addr
 	}
 	s.fakeOf[real] = fake
 	s.mu.Unlock()
-	_, _ = s.c.WriteToUDPAddrPort(payload, s.r.remap(real))
+	_, err := s.c.WriteToUDPAddrPort(payload, s.r.remap(real))
+	s.r.udp.noteSendErr(err)
 }
 
 func (u *udpNAT) sock(client netip.AddrPort) *natSock {
@@ -333,6 +401,9 @@ func (u *udpNAT) sock(client netip.AddrPort) *natSock {
 	if u.r.ctx.Err() != nil {
 		return nil
 	}
+	if len(u.socks) >= maxNATSocks {
+		u.evictLocked()
+	}
 	lc := net.ListenConfig{Control: u.r.control}
 	network, local := "udp4", "0.0.0.0:0"
 	if client.Addr().Is6() {
@@ -340,7 +411,15 @@ func (u *udpNAT) sock(client netip.AddrPort) *natSock {
 	}
 	pc, err := lc.ListenPacket(u.r.ctx, network, local)
 	if err != nil {
-		u.r.o.Logf("split: UDP socket: %v", err)
+		now := time.Now().UnixNano()
+		if !client.Addr().Is6() {
+			u.r.o.Logf("split: UDP socket: %v", err)
+			return nil
+		}
+		u.no6.Store(now + int64(no6Wait))
+		if last := u.no6Log.Load(); now-last >= int64(no6LogEvery) && u.no6Log.CompareAndSwap(last, now) {
+			u.r.o.Logf("split: no IPv6 network for direct UDP (%v): programs are told IPv6 is unreachable and use IPv4", err)
+		}
 		return nil
 	}
 	s := &natSock{r: u.r, c: pc.(*net.UDPConn), client: client}
@@ -361,15 +440,23 @@ func (u *udpNAT) read(s *natSock) {
 	}()
 	buf := make([]byte, maxDatagram)
 	for {
-		_ = s.c.SetReadDeadline(time.Now().Add(30 * time.Second))
+		_ = s.c.SetReadDeadline(time.Now().Add(natIdleQuiet))
 		n, from, err := s.c.ReadFromUDPAddrPort(buf)
 		if err != nil {
+			idle := natIdleQuiet
+			if s.answered.Load() {
+				idle = natIdle
+			}
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() && u.r.ctx.Err() == nil &&
-				time.Since(time.Unix(0, s.last.Load())) < udpIdle {
+				time.Since(time.Unix(0, s.last.Load())) < idle {
 				continue
 			}
 			return
+		}
+		s.answered.Store(true)
+		if p := s.probe.Load(); p != nil {
+			p.ok.Store(true)
 		}
 		from = u.r.unmap(netip.AddrPortFrom(from.Addr().Unmap(), from.Port()))
 		s.mu.Lock()
@@ -384,6 +471,33 @@ func (u *udpNAT) read(s *natSock) {
 		}
 		u.r.writeOut(udpPackets(from, s.client, buf[:n], u.r.mtu, 0, uint16(u.id.Add(1))), 0)
 	}
+}
+
+// evictLocked closes the socket used longest ago (u.mu held); its reader
+// forgets it.
+func (u *udpNAT) evictLocked() {
+	var old *natSock
+	for _, s := range u.socks {
+		if old == nil || s.last.Load() < old.last.Load() {
+			old = s
+		}
+	}
+	if old == nil {
+		return
+	}
+	delete(u.socks, old.client)
+	old.c.Close()
+	now := time.Now().UnixNano()
+	if last := u.evictLog.Load(); now-last >= int64(time.Minute) && u.evictLog.CompareAndSwap(last, now) {
+		u.r.o.Logf("split: %d direct UDP sockets open, closing the ones idle longest", maxNATSocks)
+	}
+}
+
+// count is the number of direct UDP sockets open.
+func (u *udpNAT) count() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return len(u.socks)
 }
 
 func (u *udpNAT) close() {

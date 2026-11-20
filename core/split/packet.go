@@ -114,6 +114,34 @@ func transport(p *pkt, proto uint8, src, dst netip.Addr, t []byte) bool {
 	return true
 }
 
+// icmp6Unreachable builds the ICMPv6 "destination unreachable, no route"
+// a router would send back for the IPv6 packet inv (as much of it as
+// fits in IPv6's minimum MTU), from dst to src.
+func icmp6Unreachable(src, dst netip.Addr, inv []byte) []byte {
+	if max := 1280 - 40 - 8; len(inv) > max {
+		inv = inv[:max]
+	}
+	b := make([]byte, 40+8+len(inv))
+	b[0] = 0x60
+	binary.BigEndian.PutUint16(b[4:], uint16(8+len(inv)))
+	b[6] = 58 // ICMPv6
+	b[7] = 64
+	s16, d16 := src.As16(), dst.As16()
+	copy(b[8:24], s16[:])
+	copy(b[24:40], d16[:])
+	m := b[40:]
+	m[0], m[1] = 1, 0 // destination unreachable: no route
+	copy(m[8:], inv)
+	var ps uint32
+	for i := 0; i < 16; i += 2 {
+		ps += uint32(s16[i])<<8 | uint32(s16[i+1])
+		ps += uint32(d16[i])<<8 | uint32(d16[i+1])
+	}
+	ps += 58 + uint32(len(m))
+	binary.BigEndian.PutUint16(m[2:], checksum(m, ps))
+	return b
+}
+
 // checksum is the Internet checksum of b, starting from sum.
 func checksum(b []byte, sum uint32) uint16 {
 	for len(b) >= 2 {

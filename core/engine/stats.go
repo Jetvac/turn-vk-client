@@ -127,6 +127,15 @@ type statsMinute struct {
 	Wakes uint64       `json:"wakes,omitempty"`
 	CPU   int64        `json:"cpu_ms,omitempty"`
 	Dev   *DeviceState `json:"dev,omitempty"`
+	// Direct: split tunneling's direct path at the end of the minute
+	// (Config.Direct), with the direct UDP sends that failed during it.
+	Direct *directMinute `json:"direct,omitempty"`
+}
+
+type directMinute struct {
+	Flows    int    `json:"flows"`
+	UDPSocks int    `json:"udp_socks"`
+	UDPErr   uint64 `json:"udp_err,omitempty"`
 }
 
 // statsAck is called by the sessions' read loops.
@@ -156,6 +165,10 @@ func (e *Engine) statsLoop() {
 	prevLowLat := e.b.pacer.inter.Secs.Load()
 	prevQuiet := e.idle.secs.Load()
 	prevWakes, prevCPU := e.wakes.Load(), processCPU()
+	var prevDirErr uint64
+	if e.cfg.Direct != nil {
+		prevDirErr = e.cfg.Direct().UDPErr
+	}
 	e.rtts.Take()
 	e.b.holds.Take()
 	e.b.qwait.Take()
@@ -275,6 +288,13 @@ func (e *Engine) statsLoop() {
 		m.CPU, prevCPU = int64(max(0, cpu-prevCPU)/time.Millisecond), cpu
 		if e.cfg.Device != nil {
 			m.Dev = e.cfg.Device()
+		}
+		if e.cfg.Direct != nil {
+			d := e.cfg.Direct()
+			if d.Flows > 0 || d.UDPSocks > 0 || d.UDPErr != prevDirErr {
+				m.Direct = &directMinute{Flows: d.Flows, UDPSocks: d.UDPSocks, UDPErr: sub0(d.UDPErr, prevDirErr)}
+			}
+			prevDirErr = d.UDPErr
 		}
 		m.TURN = len(turn)
 		e.queueStats(m)

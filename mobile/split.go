@@ -269,6 +269,18 @@ func wrapTun(dev tun.Device, c *engine.WGConfig, p Platform, protect func(uintpt
 	return rt
 }
 
+// directStats: the direct path's numbers for the statistics.
+func directStats() engine.DirectState {
+	sp.mu.Lock()
+	rt := sp.router
+	sp.mu.Unlock()
+	if rt == nil {
+		return engine.DirectState{}
+	}
+	d := rt.Stats()
+	return engine.DirectState{Flows: d.Flows, UDPSocks: d.UDPSocks, UDPErr: d.UDPErr}
+}
+
 func dropRouter() {
 	sp.mu.Lock()
 	sp.router = nil
