@@ -54,6 +54,9 @@ type Config struct {
 	// Quiet: idle mode for phones (idle.go): an idle tunnel keeps a few
 	// routes, which ping together, so that the radio can sleep.
 	Quiet bool
+	// Device, when set, reports the battery and power state for the
+	// statistics (device.go); called once a minute.
+	Device func() *DeviceState
 }
 
 // TunFactory creates the tunnel interface once the server's WireGuard
@@ -196,7 +199,16 @@ type Engine struct {
 	rxClosed  atomic.Uint64
 	txClosed  atomic.Uint64
 	reconnect atomic.Uint64
-	captchas  atomic.Int32
+	wakes     atomic.Uint64 // the device woke from sleep (watchdog)
+	// network.go: the platform reports no network (netLost, since
+	// netLostAt); heldAt: "routes kept" last logged.
+	netLost atomic.Bool
+	// relayprobe.go: relays being probed.
+	probeMu      sync.Mutex
+	relayProbing map[string]bool
+	netLostAt    atomic.Int64
+	heldAt       atomic.Int64
+	captchas     atomic.Int32
 
 	hadSessions atomic.Bool
 	learned     session.LearnedRates // upload rates per TURN server
@@ -659,6 +671,7 @@ func (e *Engine) dial(ctx context.Context, i, shift int) (*session.Session, erro
 	if err != nil {
 		return nil, err
 	}
+	e.probeRelays(creds.Servers)
 	server := e.cfg.TURNServer
 	if server == "" {
 		server = creds.Servers[(i/len(e.hashes)+shift)%len(creds.Servers)]
@@ -672,7 +685,8 @@ func (e *Engine) dial(ctx context.Context, i, shift int) (*session.Session, erro
 		AEAD: e.aead, Mode: e.cfg.Mode, Net: e.cfg.Net,
 		ConnPassword: e.cfg.Link.Password, DeviceID: e.cfg.DeviceID, Generation: e.gen, Worker: i,
 		OnReset: e.serverReset, Logf: e.logf, OnUnfreed: e.noteUnfreed, RTTs: &e.rtts, Quiet: e.quiet,
-		Direct: mode != modeDTLS, Keys: &e.keys, ServerKey: e.cfg.Link.ServerKey,
+		NetDown: func() bool { return e.netDown(time.Now()) },
+		Direct:  mode != modeDTLS, Keys: &e.keys, ServerKey: e.cfg.Link.ServerKey,
 	}
 	if mode == modeUnknown {
 		p.DirectTimeout = 4 * time.Second
@@ -1054,11 +1068,19 @@ func (e *Engine) watchdog() {
 		case <-t.C:
 		}
 		list := e.b.list()
+		// After sleep the routes renew their TURN allocations and
+		// permissions: pion's timers stood still meanwhile, VK's did not
+		// (session/renew.go).
+		at := time.Now()
+		for _, s := range list {
+			s.RenewTURN(at)
+		}
 		if wall := time.Now().UnixNano(); wall-lastTick > int64(sleepGap) {
 			// The device slept (Android in the background): timers stopped
 			// and every route missed its pings. Give them time before
 			// judging any; after a long sleep ask each route now.
 			e.wokeAt.Store(wall)
+			e.wakes.Add(1)
 			if gap := time.Duration(wall - lastTick); gap >= sleepCheck {
 				e.logf("the device was asleep for %s, checking the routes", gap.Round(time.Second))
 				for _, s := range list {
@@ -1068,6 +1090,7 @@ func (e *Engine) watchdog() {
 			lastTick = wall
 			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
 			e.idle.prevPk = e.b.rx.Load() + e.b.tx.Load()
+			e.idle.busyRun = 0 // seconds apart are no run
 			continue
 		} else {
 			lastTick = wall
@@ -1116,6 +1139,11 @@ func (e *Engine) watchdog() {
 			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
 			continue
 		}
+		if e.netDown(now) {
+			e.holdRoutes(now)
+			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
+			continue
+		}
 		e.noteError(reason + ", reconnecting all sessions")
 		for _, s := range list {
 			s.Close()
@@ -1148,7 +1176,7 @@ func (e *Engine) replaceSilentPaths(list []*session.Session) {
 	// Just after the device slept (the phone in the background), every
 	// route looks silent until its next ping comes back: wait for them.
 	// While idle the routes ping only at each burst: pathDead judges them.
-	if now.UnixNano()-e.wokeAt.Load() < int64(wakeGrace) || e.quiet.Relaxed(now) {
+	if now.UnixNano()-e.wokeAt.Load() < int64(wakeGrace) || e.quiet.Relaxed(now) || e.netDown(now) {
 		return
 	}
 	fresh := 0
@@ -1239,6 +1267,11 @@ func answeredAfter(list []*session.Session, sv string, last int64) int {
 // gone or restarted: WireGuard re-keys once paths are back.
 func (e *Engine) replaceDeadPaths(reason string, silent time.Duration, list []*session.Session) {
 	defer e.probing.Store(false)
+	// No network: nothing would answer, and nothing new could open.
+	if now := time.Now(); e.netDown(now) {
+		e.holdRoutes(now)
+		return
+	}
 	for _, s := range list {
 		s.Probe()
 	}

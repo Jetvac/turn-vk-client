@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Jetvac/turn-vk-client/core/session"
 )
 
 // offlineGate holds new routes back while the device has no network
@@ -111,13 +113,7 @@ func (g *offlineGate) wait(ctx context.Context) bool {
 
 // unreachable tells whether err means the device has no network at all.
 func unreachable(err error) bool {
-	if err == nil {
-		return false
-	}
-	m := strings.ToLower(err.Error())
-	return strings.Contains(m, "network is unreachable") ||
-		strings.Contains(m, "unreachable network") || // Windows: WSAENETUNREACH
-		strings.Contains(m, "no route to host")
+	return session.NoNetwork(err)
 }
 
 // logLimiter merges repeated log lines: of lines that differ only in

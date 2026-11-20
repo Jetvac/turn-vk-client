@@ -24,6 +24,11 @@ const (
 	// A messenger's heartbeat or a notification stays below.
 	quietBusy = 30
 	quietBulk = 300
+	// quietDozeRun: busy seconds in a row that end idle mode while the
+	// device dozes (it woke from sleep within dozeWindow): apps sync in
+	// Android's maintenance windows for a few seconds, which the kept
+	// routes carry; bringing every route back for it costs more.
+	quietDozeRun = 5
 	// quietRamp: routes come back this far apart (VK sees a ramp).
 	quietRamp = 100 * time.Millisecond
 )
@@ -65,7 +70,7 @@ func (e *Engine) idleUp() <-chan struct{} {
 // idleStart: the watchdog starts counting.
 func (e *Engine) idleStart(now time.Time) {
 	e.idle.prevPk = e.b.rx.Load() + e.b.tx.Load()
-	e.idle.busyAt = now
+	e.idle.busyAt = now.Round(0)
 	e.idle.busyRun = 0
 }
 
@@ -75,6 +80,10 @@ func (e *Engine) idleTick(now time.Time, list []*session.Session) {
 	if e.quiet == nil {
 		return
 	}
+	// Calm is real time (no monotonic reading): a dozing phone is awake
+	// for a moment every half minute, and 90 awake seconds would take it
+	// most of an hour.
+	now = now.Round(0)
 	pk := e.b.rx.Load() + e.b.tx.Load()
 	d := pk - e.idle.prevPk
 	e.idle.prevPk = pk
@@ -86,7 +95,11 @@ func (e *Engine) idleTick(now time.Time, list []*session.Session) {
 	}
 	if e.quiet.On() {
 		e.idle.secs.Add(1)
-		if d >= quietBulk || e.idle.busyRun >= 2 {
+		run := 2
+		if now.UnixNano()-e.wokeAt.Load() < int64(dozeWindow) {
+			run = quietDozeRun
+		}
+		if d >= quietBulk || e.idle.busyRun >= run {
 			e.leaveIdle(now)
 			return
 		}
@@ -127,7 +140,7 @@ func (e *Engine) leaveIdle(now time.Time) {
 	if !e.quiet.Leave(now) {
 		return
 	}
-	e.idle.busyAt = now
+	e.idle.busyAt = now.Round(0)
 	e.logf("traffic again: back to %d routes", e.limit())
 	e.notify()
 }

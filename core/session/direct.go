@@ -270,7 +270,23 @@ func (s *Session) sendDirect(b []byte) error {
 	n := s.sealer.Seal(*bp, b)
 	s.Pace.OnSend(binary.BigEndian.Uint16((*bp)[2:4]), time.Now().UnixNano())
 	_, err := s.relay.WriteTo((*bp)[:n], s.peer)
+	if err != nil && NoNetwork(err) {
+		s.NetErrAt.Store(time.Now().UnixNano())
+	}
 	return err
+}
+
+// NoNetwork tells whether a socket error means the device has no network
+// (or none that reaches the address).
+func NoNetwork(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "network is unreachable") ||
+		strings.Contains(m, "unreachable network") || // Windows: WSAENETUNREACH
+		strings.Contains(m, "no route to host") ||
+		strings.Contains(m, "machine is not on the network") // ENONET: its network is gone
 }
 
 // readDirect returns the next unwrapped message from the server.
@@ -377,6 +393,7 @@ func (s *Session) readDirectData(b []byte) (int, error) {
 			sent := int64(binary.BigEndian.Uint64(b[2:10]))
 			if rtt := time.Now().UnixNano() - sent; rtt > 0 && rtt < int64(time.Minute) {
 				s.RTT.Store(rtt)
+				s.Lat.Store(s.jit.add(rtt))
 				s.rtts.Add(time.Duration(rtt))
 			}
 		case t == msgFeedback:
@@ -492,7 +509,7 @@ func (s *Session) pingLoop() {
 			continue
 		}
 		now := time.Now().UnixNano()
-		if now-max(s.LastRx.Load(), woke) > q.deadAfter(now) {
+		if now-max(s.LastRx.Load(), woke) > q.deadAfter(now) && (s.params.NetDown == nil || !s.params.NetDown()) {
 			// The allocation died without telling (VK dropped it, the
 			// network changed): the engine opens a new one.
 			s.Close()

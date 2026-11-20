@@ -112,3 +112,83 @@ func TestRelayDown(t *testing.T) {
 		t.Fatalf("after relayDownFor: pick = %s", got)
 	}
 }
+
+// A lossy relay that routes left carries too little to be judged again:
+// its old score stops counting and fades, so it is not drained for good.
+func TestRelayScoreGoesStale(t *testing.T) {
+	const good, worse = "a:1", "b:1"
+	var list []*session.Session
+	for i := 0; i < 8; i++ {
+		list = append(list, route(good), route(worse))
+	}
+	var r relays
+	now := time.Now()
+	r.tick(list, now)
+	w := 0
+	window := func(worseRx, worseLost uint64) {
+		w++
+		for _, s := range list {
+			if s.Server == good {
+				s.RxPackets.Add(1000)
+			} else {
+				s.RxPackets.Add(worseRx)
+				s.RxLost.Add(worseLost)
+			}
+		}
+		r.tick(list, now.Add(time.Duration(w)*relayWindow))
+	}
+	for i := 0; i < 3; i++ {
+		window(920, 80)
+	}
+	if _, ok := r.bad()[worse]; !ok {
+		t.Fatal("lossy relay not judged")
+	}
+	loss := r.stats[worse].loss
+	for i := 0; i < relayStale-1; i++ {
+		window(2, 0) // 16 packets a window: not judged
+	}
+	if _, ok := r.bad()[worse]; !ok {
+		t.Fatal("a score dropped after one quiet window")
+	}
+	window(2, 0)
+	if bad := r.bad(); len(bad) != 0 || r.moveOne(list) != nil {
+		t.Fatalf("stale score still moves routes: %v", bad)
+	}
+	if got := r.stats[worse].loss; got >= loss {
+		t.Fatalf("stale loss %.3f did not fade from %.3f", got, loss)
+	}
+	// Judged again on enough traffic, it counts again.
+	window(920, 80)
+	if _, ok := r.bad()[worse]; !ok {
+		t.Fatal("judged relay not counted again")
+	}
+}
+
+// Before routes measure two relays, direct probes keep new routes off a
+// far slower one; once routes measure, probes no longer judge.
+func TestRelaySeeds(t *testing.T) {
+	const near, far = "a:1", "b:1"
+	var r relays
+	now := time.Now()
+	r.noteSeed(near, 34*time.Millisecond, now)
+	if len(r.bad()) != 0 {
+		t.Fatal("judged on one probe")
+	}
+	r.noteSeed(far, 151*time.Millisecond, now)
+	if _, ok := r.bad()[far]; !ok {
+		t.Fatal("far relay not avoided")
+	}
+	if got := r.pick([]string{near, far}, far, nil); got != near {
+		t.Fatalf("pick = %s", got)
+	}
+	r.noteSeed(far, 60*time.Millisecond, now)
+	if len(r.bad()) != 0 {
+		t.Fatal("a relay a little slower avoided")
+	}
+	// Routes on both relays measured them: their round trips judge.
+	r.noteSeed(far, 151*time.Millisecond, now)
+	r.stats = map[string]*relayStat{near: {rtt: 90 * time.Millisecond, rttWindows: 2}, far: {rtt: 100 * time.Millisecond, rttWindows: 2}}
+	if len(r.bad()) != 0 {
+		t.Fatal("probes judged against routes' round trips")
+	}
+}

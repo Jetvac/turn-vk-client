@@ -16,7 +16,10 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Build
+import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import android.provider.Settings
 import android.service.quicksettings.TileService
 import org.json.JSONObject
@@ -70,6 +73,8 @@ class TunnelService : VpnService(), mobile.Platform {
 
     private val worker = Executors.newSingleThreadExecutor()
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    /** The physical network the routes open on (never the VPN itself). */
+    @Volatile private var underlying: Network? = null
     private val store by lazy { Store(this) }
     private var wifiLocks: List<WifiManager.WifiLock> = emptyList()
     private var noteText = ""
@@ -215,7 +220,23 @@ class TunnelService : VpnService(), mobile.Platform {
 
     // --- mobile.Platform ---
 
-    override fun protect(fd: Long): Boolean = protect(fd.toInt())
+    override fun protect(fd: Long): Boolean {
+        if (!protect(fd.toInt())) return false
+        bindToNetwork(fd.toInt())
+        return true
+    }
+
+    /**
+     * Binds a route's socket to the network it opens on: after a switch
+     * (weak Wi-Fi to mobile data) the old routes keep working over the old
+     * network while new ones open, instead of dying at once (the engine's
+     * SwitchNetwork). A failure leaves the socket on the default network,
+     * as before.
+     */
+    private fun bindToNetwork(fd: Int) {
+        val n = underlying ?: return
+        runCatching { ParcelFileDescriptor.fromFd(fd).use { n.bindSocket(it.fileDescriptor) } }
+    }
 
     override fun openTun(address: String, prefixLen: Long, dns: String, mtu: Long): Long {
         val b = Builder()
@@ -351,6 +372,26 @@ class TunnelService : VpnService(), mobile.Platform {
     override fun packagesForUID(uid: Long): String =
         runCatching { packageManager.getPackagesForUid(uid.toInt())?.joinToString(",") }.getOrNull().orEmpty()
 
+    /**
+     * Battery and power state for the statistics (engine.DeviceState): read
+     * once a minute, no receivers kept. The charge counter (mAh) is finer
+     * than the level; devices that lack it report 0 or Int.MIN_VALUE.
+     */
+    override fun device(): String = runCatching {
+        val bm = getSystemService(BatteryManager::class.java)
+        val pm = getSystemService(PowerManager::class.java)
+        fun prop(id: Int): Int = bm?.getIntProperty(id)?.takeIf { it != Int.MIN_VALUE } ?: 0
+        JSONObject()
+            .put("batt", prop(BatteryManager.BATTERY_PROPERTY_CAPACITY))
+            .put("chg", bm?.isCharging == true)
+            .put("screen", pm?.isInteractive == true)
+            .put("doze", pm?.isDeviceIdleMode == true)
+            .put("saver", pm?.isPowerSaveMode == true)
+            .put("mah", prop(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER) / 1000)
+            .put("ma", prop(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW) / 1000)
+            .toString()
+    }.getOrDefault("")
+
     // --- quick settings tile ---
 
     private fun updateTile() {
@@ -364,18 +405,39 @@ class TunnelService : VpnService(), mobile.Platform {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return
         var first = true
         var current: Network? = null
+        var lost = false
         var kind = ""
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                if (!first && network != current) {
-                    log("сеть сменилась, переподключаем маршруты")
-                    mobile.Mobile.networkChanged()
+                // New routes bind to it (set before the engine hears of it).
+                val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull()
+                if (caps != null && kindOf(caps) != null) underlying = network
+                when {
+                    first -> {}
+                    network == current && lost -> {
+                        log("сеть вернулась, проверяем маршруты")
+                        mobile.Mobile.networkBack()
+                    }
+                    network != current -> {
+                        log("сеть сменилась, переносим маршруты")
+                        mobile.Mobile.networkChanged()
+                    }
                 }
                 first = false
+                lost = false
                 current = network
             }
 
+            override fun onLost(network: Network) {
+                if (network != current) return
+                lost = true
+                if (underlying == network) underlying = null
+                log("сеть пропала, маршруты ждут её")
+                mobile.Mobile.networkLost()
+            }
+
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
+                if (kindOf(caps) != null && network == current) underlying = network
                 val k = kindOf(caps) ?: networkKind()
                 if (k == kind) return
                 kind = k
@@ -414,6 +476,7 @@ class TunnelService : VpnService(), mobile.Platform {
     }
 
     private fun unwatchNetwork() {
+        underlying = null
         val cb = networkCallback ?: return
         networkCallback = null
         runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb) }

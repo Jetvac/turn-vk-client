@@ -64,6 +64,10 @@ type Params struct {
 	RTTs *Hist
 	// Quiet, if set, is the idle mode the engine switches (quiet.go).
 	Quiet *Quiet
+	// NetDown, when set, tells whether the device has no network: a
+	// silent path is kept then instead of closed (it could not be
+	// replaced, nor its allocation freed).
+	NetDown func() bool
 
 	// Direct selects the direct protocol (TurnVK servers) instead of
 	// DTLS + GETCONF. Keys is the client's WireGuard key pair; ServerKey,
@@ -133,6 +137,8 @@ type Session struct {
 	// The allocation, for release on Close: TURN server and credentials.
 	turnAddr           net.Addr
 	turnUser, turnPass string
+	turnPeer           *net.UDPAddr // the WDTT server, as the relay sends to it
+	renew              renewState   // renew.go
 	logf               func(format string, args ...any)
 	onUnfreed          func()
 	rtts               *Hist
@@ -149,8 +155,15 @@ type Session struct {
 	Pace   PathRate
 	rx     RxTrack
 	LastRx atomic.Int64 // unix nanoseconds
+	// NetErrAt: when a send last failed for lack of network, unix ns.
+	NetErrAt atomic.Int64
 	// RTT is the path's last measured round trip (direct protocol), ns.
 	RTT atomic.Int64
+	// Lat is the round trip a packet should expect on the path, jitter
+	// included: smoothed RTT plus twice its mean deviation (jitter.go), ns;
+	// 0 until measured.
+	Lat atomic.Int64
+	jit jitter // read loop only
 	// StatsAck, when set before reading starts, gets the ids of the
 	// statistics reports the server acknowledged (stats.go).
 	StatsAck func(id uint32)
@@ -221,6 +234,8 @@ func Dial(ctx context.Context, p Params) (*Session, error) {
 	}
 	s.Relay = s.relay.LocalAddr().String()
 	s.turnAddr, s.turnUser, s.turnPass, s.logf, s.onUnfreed, s.rtts = turnAddr, p.Username, p.Password, p.Logf, p.OnUnfreed, p.RTTs
+	s.turnPeer = p.Peer
+	s.renew.mark(time.Now().UnixNano(), monoNow())
 	if p.Direct {
 		timeout := p.DirectTimeout
 		if timeout <= 0 {

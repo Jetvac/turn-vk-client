@@ -110,3 +110,30 @@ func TestIdleOff(t *testing.T) {
 		t.Fatal("two routes not both kept")
 	}
 }
+
+// While the device dozes, a maintenance window's few busy seconds stay on
+// the kept routes; longer traffic brings the others back.
+func TestIdleDozing(t *testing.T) {
+	e := idleEngine(16)
+	list := testRoutes(4)
+	t0 := time.Now()
+	e.idleStart(t0)
+	e.idleTick(t0.Add(quietCalm), list)
+	if !e.quiet.On() {
+		t.Fatal("not idle")
+	}
+	at := t0.Add(quietCalm + time.Minute)
+	e.wokeAt.Store(at.UnixNano())
+	for i := 1; i < quietDozeRun; i++ {
+		e.b.rx.Add(quietBusy)
+		e.idleTick(at.Add(time.Duration(i)*time.Second), list)
+	}
+	if !e.quiet.On() {
+		t.Fatal("left idle mode for a dozing phone's sync")
+	}
+	e.b.rx.Add(quietBusy)
+	e.idleTick(at.Add(quietDozeRun*time.Second), list)
+	if e.quiet.On() {
+		t.Fatal("still idle after sustained traffic")
+	}
+}

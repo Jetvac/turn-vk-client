@@ -271,7 +271,7 @@ func (b *bind) pick(list []*session.Session, n int, now time.Time) *session.Sess
 				continue
 			}
 			q := b.queue(s)
-			d := q.arrival(ns, s.RTT.Load())
+			d := q.arrival(ns, pathRTT(s, n))
 			if best == nil || d < bestD {
 				best, bestQ, bestD = s, q, d
 			}
@@ -294,6 +294,20 @@ func (b *bind) pick(list []*session.Session, n int, now time.Time) *session.Sess
 	}
 	bestQ.add(ns, n+wireOverhead)
 	return best
+}
+
+// pathRTT is the round trip pick counts on for a packet of n bytes: for
+// small ones (games, calls, ACKs) the one jitter included, so that a path
+// whose last ping was lucky but which often spikes is not chosen (on a
+// phone's mobile network the slowest pings were eight times the typical
+// one); big ones go by the last ping.
+func pathRTT(s *session.Session, n int) int64 {
+	if n < bulkSize {
+		if l := s.Lat.Load(); l > 0 {
+			return l
+		}
+	}
+	return s.RTT.Load()
 }
 
 func (b *bind) queue(s *session.Session) *pathQueue {

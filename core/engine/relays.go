@@ -17,8 +17,15 @@ import (
 // time. A couple stay on it, so that it is still measured and the tunnel
 // does not hang on a single relay.
 const (
-	relayWindow   = 10 * time.Second
-	relayMinPkts  = 300  // packets a window needs to judge a relay
+	relayWindow  = 10 * time.Second
+	relayMinPkts = 300 // packets a window needs to judge a relay
+	// relayStale: windows in a row without enough packets after which a
+	// relay's loss no longer counts, and fades. As routes move off a lossy
+	// relay, it carries too little to be judged again; its last score
+	// would mark it bad for good and drain it route by route (the stats
+	// showed 32 moves for one "3.8%" in a night).
+	relayStale    = 3
+	relayFade     = 0.7
 	relayBadLoss  = 0.03 // a relay is worse only above this loss…
 	relayBadRatio = 2.0  // …and this many times the best relay's loss
 	relayKeep     = 2    // routes left on a worse relay
@@ -37,6 +44,7 @@ const (
 type relayStat struct {
 	loss     float64 // smoothed loss fraction
 	windows  int     // windows judged
+	unjudged int     // windows in a row since the last judged one
 	rx, lost uint64  // the current window
 	// rtt: the routes' smoothed round trip; rttSum/rttN: the current window.
 	rtt        time.Duration
@@ -51,6 +59,15 @@ type relays struct {
 	prev  map[*session.Session][2]uint64 // counters at the last tick
 	start time.Time
 	down  map[string]time.Time // relays that failed a new route, until
+	// seed: each relay's round trip measured directly (STUN, relayprobe.go)
+	// and when; it judges relays until routes on two of them measure
+	// their own.
+	seed map[string]seedRTT
+}
+
+type seedRTT struct {
+	rtt time.Duration
+	at  time.Time
 }
 
 // failed notes that a new route through server failed (no allocation, no
@@ -113,6 +130,9 @@ func (r *relays) tick(list []*session.Session, now time.Time) bool {
 				st.loss = 0.7*st.loss + 0.3*w
 			}
 			st.windows++
+			st.unjudged = 0
+		} else if st.unjudged++; st.unjudged >= relayStale {
+			st.loss *= relayFade
 		}
 		st.rx, st.lost = 0, 0
 		if st.rttN > 0 {
@@ -138,7 +158,7 @@ func (r *relays) bad() map[string]float64 {
 	best, known := 1.0, 0
 	bestRTT, knownRTT := time.Duration(0), 0
 	for _, st := range r.stats {
-		if st.windows >= 2 {
+		if st.windows >= 2 && st.unjudged < relayStale {
 			best = min(best, st.loss)
 			known++
 		}
@@ -152,7 +172,7 @@ func (r *relays) bad() map[string]float64 {
 	out := map[string]float64{}
 	if known >= 2 && best < relayLinkLoss {
 		for k, st := range r.stats {
-			if st.windows >= 2 && st.loss > relayBadLoss && st.loss > relayBadRatio*best+0.01 {
+			if st.windows >= 2 && st.unjudged < relayStale && st.loss > relayBadLoss && st.loss > relayBadRatio*best+0.01 {
 				out[k] = st.loss
 			}
 		}
@@ -166,9 +186,63 @@ func (r *relays) bad() map[string]float64 {
 				}
 			}
 		}
+	} else {
+		// Routes measure the round trip through the relay to the server,
+		// a direct probe only to the relay: the two are not compared.
+		for k := range r.slowSeeds(time.Now()) {
+			if _, ok := out[k]; !ok {
+				out[k] = 0
+			}
+		}
 	}
 	if len(out) == 0 {
 		return nil
+	}
+	return out
+}
+
+// seedFor: probes older than this no longer judge (the network changes).
+const seedFor = 30 * time.Minute
+
+// noteSeed records a relay's directly measured round trip.
+func (r *relays) noteSeed(server string, rtt time.Duration, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.seed == nil {
+		r.seed = map[string]seedRTT{}
+	}
+	r.seed[server] = seedRTT{rtt, now}
+}
+
+// seeded tells whether server was probed lately.
+func (r *relays) seeded(server string, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	sd, ok := r.seed[server]
+	return ok && now.Sub(sd.at) < seedFor
+}
+
+// slowSeeds: the relays whose probe was much slower than the fastest's
+// (two probed lately at least). Called with r.mu held.
+func (r *relays) slowSeeds(now time.Time) map[string]time.Duration {
+	best, n := time.Duration(0), 0
+	for _, sd := range r.seed {
+		if now.Sub(sd.at) < seedFor {
+			if n == 0 || sd.rtt < best {
+				best = sd.rtt
+			}
+			n++
+		}
+	}
+	if n < 2 {
+		return nil
+	}
+	slow := time.Duration(relaySlowRatio*float64(best)) + relaySlowExtra
+	out := map[string]time.Duration{}
+	for k, sd := range r.seed {
+		if now.Sub(sd.at) < seedFor && sd.rtt > slow {
+			out[k] = best
+		}
 	}
 	return out
 }
@@ -178,6 +252,11 @@ func (r *relays) why(server string) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := r.stats[server]
+	if best, ok := r.slowSeeds(time.Now())[server]; ok {
+		if sd := r.seed[server]; st == nil || st.rttWindows < 2 {
+			return fmt.Sprintf("answered a probe in %d ms (the best in %d ms)", sd.rtt.Milliseconds(), best.Milliseconds())
+		}
+	}
 	if st == nil {
 		return "is worse"
 	}

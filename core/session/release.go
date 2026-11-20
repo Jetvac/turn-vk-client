@@ -3,7 +3,6 @@ package session
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -71,52 +70,18 @@ func (p pionTransactor) PerformTransactionWithContext(msg *stun.Message, to net.
 	return res.Msg, nil
 }
 
-// lifetimeZero is the LIFETIME attribute set to 0: free the allocation.
-type lifetimeZero struct{}
-
-func (lifetimeZero) AddTo(m *stun.Message) error {
-	m.Add(stun.AttrLifetime, []byte{0, 0, 0, 0})
-	return nil
-}
-
-// release frees the allocation on server, authenticating with the
-// long-term credentials; it learns the realm and nonce from the server's
-// 401/438 answers.
+// release frees the allocation on server (Refresh with lifetime 0),
+// authenticating with the long-term credentials (turnAuth, renew.go).
 func release(ctx context.Context, t transactor, server net.Addr, user, pass string) (releaseResult, error) {
-	var realm stun.Realm
-	var nonce stun.Nonce
-	for try := 0; try < 4; try++ {
-		setters := []stun.Setter{stun.TransactionID, stun.NewType(stun.MethodRefresh, stun.ClassRequest), lifetimeZero{}}
-		if nonce != nil {
-			setters = append(setters, stun.NewUsername(user), realm, nonce, stun.NewLongTermIntegrity(user, realm.String(), pass))
-		}
-		setters = append(setters, stun.Fingerprint)
-		msg, err := stun.Build(setters...)
-		if err != nil {
-			return releaseFailed, err
-		}
-		res, err := t.PerformTransactionWithContext(msg, server, false, ctx)
-		if err != nil {
-			return releaseFailed, err
-		}
-		if res.Type.Class == stun.ClassSuccessResponse {
-			return released, nil
-		}
-		var code stun.ErrorCodeAttribute
-		if err := code.GetFrom(res); err != nil {
-			return releaseFailed, fmt.Errorf("refresh: answer without an error code")
-		}
-		switch code.Code {
-		case stun.CodeUnauthorized, stun.CodeStaleNonce:
-			if err := nonce.GetFrom(res); err != nil {
-				return releaseFailed, fmt.Errorf("refresh: %d without a nonce", code.Code)
-			}
-			_ = realm.GetFrom(res) // a stale nonce answer may omit it
-		case stun.CodeAllocMismatch:
-			return releaseGone, nil
-		default:
-			return releaseFailed, fmt.Errorf("refresh: %d %s", code.Code, code.Reason)
-		}
+	a := &turnAuth{user: user, pass: pass}
+	err := a.ask(ctx, t, server, stun.MethodRefresh, lifetimeAttr(0))
+	var ce *codeError
+	switch {
+	case err == nil:
+		return released, nil
+	case errors.As(err, &ce) && ce.code == stun.CodeAllocMismatch:
+		return releaseGone, nil
+	default:
+		return releaseFailed, err
 	}
-	return releaseFailed, errors.New("refresh: no nonce accepted")
 }

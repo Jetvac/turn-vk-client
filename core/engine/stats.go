@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Jetvac/turn-vk-client/core/redact"
 	"github.com/Jetvac/turn-vk-client/core/session"
@@ -68,7 +69,11 @@ func StatsEvent(format string, args ...any) {
 func noteEvent(msg string) {
 	msg = redact.String(msg)
 	if len(msg) > statsEventLen {
-		msg = msg[:statsEventLen] + "…"
+		cut := statsEventLen
+		for cut > 0 && !utf8.RuneStart(msg[cut]) { // not inside a character
+			cut--
+		}
+		msg = msg[:cut] + "…"
 	}
 	statsQ.mu.Lock()
 	defer statsQ.mu.Unlock()
@@ -117,6 +122,11 @@ type statsMinute struct {
 	LowLat uint64 `json:"low_lat,omitempty"`
 	// Quiet: seconds in idle mode (idle.go).
 	Quiet uint64 `json:"quiet,omitempty"`
+	// Battery: times the device woke from sleep, CPU time the app used
+	// (ms), and the battery and power state at the end (Config.Device).
+	Wakes uint64       `json:"wakes,omitempty"`
+	CPU   int64        `json:"cpu_ms,omitempty"`
+	Dev   *DeviceState `json:"dev,omitempty"`
 }
 
 // statsAck is called by the sessions' read loops.
@@ -145,6 +155,7 @@ func (e *Engine) statsLoop() {
 	prevQDrop, prevRxDrop, prevGaps := e.b.pacer.dropped.Load(), e.b.dropped.Load(), e.b.gaps()
 	prevLowLat := e.b.pacer.inter.Secs.Load()
 	prevQuiet := e.idle.secs.Load()
+	prevWakes, prevCPU := e.wakes.Load(), processCPU()
 	e.rtts.Take()
 	e.b.holds.Take()
 	e.b.qwait.Take()
@@ -197,7 +208,10 @@ func (e *Engine) statsLoop() {
 		}
 		now := time.Now()
 		m := statsMinute{T: now.UnixMilli(), State: e.State(), Target: e.cfg.Sessions, Calls: len(e.hashes), HSAge: -1}
-		if gap := now.Sub(last) - statsEvery; gap > 5*time.Second {
+		// Real time: the ticker runs on the monotonic clock, which stands
+		// still while the device sleeps, so a dozing phone's "minute" may
+		// span many.
+		if gap := now.Round(0).Sub(last.Round(0)) - statsEvery; gap > 5*time.Second {
 			m.Slept, m.Gap = true, int(gap/time.Second)
 		}
 		if w := e.wokeAt.Load(); w > last.UnixNano() {
@@ -256,6 +270,12 @@ func (e *Engine) statsLoop() {
 		m.LowLat, prevLowLat = sub0(ll, prevLowLat), ll
 		qs := e.idle.secs.Load()
 		m.Quiet, prevQuiet = sub0(qs, prevQuiet), qs
+		wk, cpu := e.wakes.Load(), processCPU()
+		m.Wakes, prevWakes = sub0(wk, prevWakes), wk
+		m.CPU, prevCPU = int64(max(0, cpu-prevCPU)/time.Millisecond), cpu
+		if e.cfg.Device != nil {
+			m.Dev = e.cfg.Device()
+		}
 		m.TURN = len(turn)
 		e.queueStats(m)
 		if (e.statsAcked.Load() || unacked < statsNoAck) && !e.quiet.On() {

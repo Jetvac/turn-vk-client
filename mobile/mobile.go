@@ -49,6 +49,9 @@ type Platform interface {
 	OwnerUID(proto int, srcIP string, srcPort int, dstIP string, dstPort int) int
 	// PackagesForUID returns the packages with a user ID, comma-separated.
 	PackagesForUID(uid int) string
+	// Device returns the battery and power state as JSON (engine.DeviceState),
+	// for the statistics; "" when unknown. Called once a minute.
+	Device() string
 }
 
 var (
@@ -124,7 +127,8 @@ func Start(rawLink, deviceID string, sessions int, obfs string, p Platform) erro
 		Logf:     func(f string, a ...any) { p.Log(fmt.Sprintf(f, a...)) },
 		OnStatus: func(s engine.Status) { b, _ := json.Marshal(s); p.OnStatus(string(b)) },
 		// A phone's battery: an idle tunnel lets the radio sleep.
-		Quiet: true,
+		Quiet:  true,
+		Device: func() *engine.DeviceState { return parseDevice(p.Device()) },
 	})
 	if err != nil {
 		mu.Unlock()
@@ -201,14 +205,36 @@ func Status() string {
 	return string(b)
 }
 
-// NetworkChanged tells the engine the device switched networks.
+// NetworkChanged tells the engine the device switched networks. The
+// platform binds each route's socket to the network it opened on
+// (Platform.Protect), so the old routes carry the traffic while new ones
+// open on the new network (engine.SwitchNetwork).
 func NetworkChanged() {
-	mu.Lock()
-	e := current
-	mu.Unlock()
-	if e != nil {
-		e.Reconnect("the network changed")
+	if e := engineNow(); e != nil {
+		e.SwitchNetwork("the network changed")
 	}
+}
+
+// NetworkLost tells the engine the device has no network: the routes are
+// kept until it is back.
+func NetworkLost() {
+	if e := engineNow(); e != nil {
+		e.NetworkLost()
+	}
+}
+
+// NetworkBack tells the engine the network it lost is back: the routes
+// are checked, not rebuilt.
+func NetworkBack() {
+	if e := engineNow(); e != nil {
+		e.NetworkBack()
+	}
+}
+
+func engineNow() *engine.Engine {
+	mu.Lock()
+	defer mu.Unlock()
+	return current
 }
 
 // SubmitCaptcha passes the success_token VK issued after the user solved
@@ -316,3 +342,12 @@ func (s *solver) answer(token string, err error) {
 }
 
 func (s *solver) cancel() { s.answer("", errors.New("stopped")) }
+
+// parseDevice reads Platform.Device's answer (nil: unknown).
+func parseDevice(s string) *engine.DeviceState {
+	var d engine.DeviceState
+	if s == "" || json.Unmarshal([]byte(s), &d) != nil {
+		return nil
+	}
+	return &d
+}
