@@ -146,9 +146,53 @@ func (a *app) refreshAutostart() {
 	a.mu.Lock()
 	a.s.Autostart = true
 	a.mu.Unlock()
+	// Only when the task points elsewhere: an elevated program creating a
+	// sign-in task at each start is what Windows Defender's behaviour
+	// model takes for malware settling in ("Behavior:Win32/Persistence"):
+	// 0.9.0 was quarantined right after updating itself.
+	exe, err := os.Executable()
+	if err != nil || taskRuns(exe) {
+		return
+	}
 	if err := setAutostart(true); err != nil {
 		a.logf("start with Windows: updating the task: %v", err)
 	}
+}
+
+// taskRuns reports whether the task starts exe (also when the task cannot
+// be read: then it is left as it is). The task's file is read, not
+// schtasks's output, which comes in the console's code page.
+func taskRuns(exe string) bool {
+	dir := os.Getenv("SystemRoot")
+	if dir == "" {
+		dir = `C:\Windows`
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "System32", "Tasks", taskName))
+	if err != nil {
+		return true
+	}
+	cmd, ok := taskCommand(b)
+	return !ok || strings.EqualFold(filepath.Clean(cmd), filepath.Clean(exe))
+}
+
+// taskCommand reads the program from a task's XML (UTF-16 with a byte
+// order mark, as Windows keeps it, or UTF-8).
+func taskCommand(b []byte) (string, bool) {
+	s := string(b)
+	if len(b) >= 2 && b[0] == 0xFF && b[1] == 0xFE {
+		u := make([]uint16, (len(b)-2)/2)
+		for i := range u {
+			u[i] = binary.LittleEndian.Uint16(b[2+2*i:])
+		}
+		s = string(utf16.Decode(u))
+	}
+	i := strings.Index(s, "<Command>")
+	j := strings.Index(s, "</Command>")
+	if i < 0 || j < i {
+		return "", false
+	}
+	r := strings.NewReplacer("&amp;", "&", "&lt;", "<", "&gt;", ">", "&quot;", `"`, "&apos;", "'")
+	return strings.Trim(r.Replace(s[i+len("<Command>"):j]), `"`), true
 }
 
 // waitForNetwork: right after sign-in the network may not be up yet.

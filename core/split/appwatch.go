@@ -127,6 +127,8 @@ func (r *Router) appFail(path, why string) {
 		}
 	}
 	r.mu.Unlock()
+	// Its anti-cheat follows it (anticheat.go).
+	r.noteGame(path, VPN, time.Now().UnixNano())
 	r.o.Logf("split: %s does not work direct (%s): all of it goes through the VPN for %s (%d UDP flows moved)", name, why, failTTL, moved)
 }
 

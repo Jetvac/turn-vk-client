@@ -81,6 +81,29 @@ func findGames() []Game {
 	return out
 }
 
+// findAntiCheat: the folders of the anti-cheat services (and of Epic
+// Online Services) installed here, in normPath form (anticheat.go).
+func findAntiCheat() []string {
+	pf, pf86 := os.Getenv("ProgramFiles"), os.Getenv("ProgramFiles(x86)")
+	var out []string
+	for _, d := range []string{
+		filepath.Join(pf86, "EasyAntiCheat_EOS"),
+		filepath.Join(pf86, "EasyAntiCheat"),
+		filepath.Join(pf, "EasyAntiCheat_EOS"),
+		filepath.Join(pf, "EasyAntiCheat"),
+		filepath.Join(pf86, `Common Files\BattlEye`),
+		filepath.Join(pf, `Common Files\BattlEye`),
+		filepath.Join(pf, "Riot Vanguard"),
+		filepath.Join(pf, "FACEIT AC"),
+		filepath.Join(pf86, `Epic Games\Epic Online Services`),
+	} {
+		if st, err := os.Stat(d); err == nil && st.IsDir() {
+			out = append(out, normPath(d))
+		}
+	}
+	return out
+}
+
 var vdfPath = regexp.MustCompile(`"path"\s+"([^"]+)"`)
 
 // steamLibraries reads the library folders from Steam's libraryfolders.vdf.

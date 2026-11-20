@@ -115,6 +115,9 @@ type Router struct {
 	amu    sync.Mutex
 	probes map[string]*appProbe // programs sent direct by their rule (appwatch.go)
 
+	gmu  sync.Mutex
+	game gameSeen // the game that ran last (anticheat.go)
+
 	history map[histKey]*Conn // ended connections (history.go); under mu
 }
 
@@ -494,6 +497,19 @@ func (r *Router) newFlow(p *pkt, m *matcher, now int64) *flow {
 			if p.key.proto == protoUDP {
 				f.quic = &quicSniff{prelim: d}
 			}
+		}
+	}
+	// An anti-cheat service goes where the game goes; a game's route is
+	// noted for it (anticheat.go).
+	if proc != nil && proc.Path != "" && !fixed && !fake && proc.PID != r.self {
+		a, parent := m.appFor(proc)
+		switch {
+		case a == nil && isAntiCheat(proc.Path):
+			if g, ok := r.lastGame(now); ok {
+				d = Decision{g.route, whyAntiCheat + g.name}
+			}
+		case isGameRule(a, parent) && (d == Decision{a.Route, m.why(a, parent)} || d.Why == whyAppFailed):
+			r.noteGame(proc.Path, d.Route, now)
 		}
 	}
 	// Sent direct by the program's own rule (a game): watched as a whole,
