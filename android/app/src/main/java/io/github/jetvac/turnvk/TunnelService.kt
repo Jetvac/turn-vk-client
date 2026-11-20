@@ -78,6 +78,7 @@ class TunnelService : VpnService(), mobile.Platform {
     private val store by lazy { Store(this) }
     private var wifiLocks: List<WifiManager.WifiLock> = emptyList()
     private var noteText = ""
+    @Volatile private var power = Power.BALANCED
     // Set once the tunnel stops: a late status must not take the Wi-Fi lock.
     @Volatile private var stopped = false
 
@@ -130,6 +131,9 @@ class TunnelService : VpnService(), mobile.Platform {
             runCatching { mobile.Mobile.setNetwork(networkKind(), "") }
             mobile.Mobile.loadLists()
             mobile.Mobile.setStats(store.serverStats, "TurnVK ${BuildConfig.VERSION_NAME} android")
+            power = store.power
+            mobile.Mobile.setPower(power)
+            TunnelState.setPower(power)
             mobile.Mobile.start(profile.link, deviceId, sessions.toLong(), store.obfs, this)
             watchNetwork()
         } catch (e: Exception) {
@@ -151,6 +155,7 @@ class TunnelService : VpnService(), mobile.Platform {
         worker.execute {
             mobile.Mobile.stop()
             TunnelState.setPlan(null)
+            TunnelState.setPower(null)
             clearCaptcha(this)
             val s = TunnelState.status.value
             if (s.state != "failed") TunnelState.setStatus(Status(state = "stopped"))
@@ -180,7 +185,8 @@ class TunnelService : VpnService(), mobile.Platform {
      * works while TurnVK is on screen; the high-performance one also in the
      * background up to Android 13 (from 14 it turns into the low-latency
      * lock). An idle tunnel (Status.quiet) lets go of them: Wi-Fi without
-     * power saving drains the battery.
+     * power saving drains the battery. The power mode decides in the end:
+     * the saver never holds them, "always" holds them all the time.
      */
     @Suppress("DEPRECATION")
     @Synchronized
@@ -295,7 +301,12 @@ class TunnelService : VpnService(), mobile.Platform {
         val s = Status.parse(status)
         val prev = TunnelState.status.value
         TunnelState.setStatus(s)
-        if (s.state == "connected" && !s.quiet) holdWifi() else releaseWifi()
+        val wifi = s.state == "connected" && when (power) {
+            Power.SAVER -> false
+            Power.ALWAYS -> true
+            else -> !s.quiet
+        }
+        if (wifi) holdWifi() else releaseWifi()
         val text = when (s.state) {
             "connected" -> when {
                 s.captcha -> "Подключено · нужна проверка VK"

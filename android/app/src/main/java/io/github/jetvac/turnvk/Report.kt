@@ -49,7 +49,7 @@ fun buildReport(ctx: Context): String {
     }
 
     val settings = listOf(
-        "routes: ${store.sessions}, disguise: ${store.obfs}, auto captcha: ${store.captchaAuto}, connect at boot: ${store.bootConnect}",
+        "routes: ${store.sessions}, disguise: ${store.obfs}, power: ${store.power}, auto captcha: ${store.captchaAuto}, connect at boot: ${store.bootConnect}",
         "split tunneling: ${describeSplit(SplitRules.parse(store.split))}, saved servers: ${store.profiles.size}",
     )
     return mobile.Mobile.report(

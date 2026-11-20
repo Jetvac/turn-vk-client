@@ -137,3 +137,25 @@ func TestIdleDozing(t *testing.T) {
 		t.Fatal("still idle after sustained traffic")
 	}
 }
+
+// PowerSaver idles sooner and keeps fewer routes.
+func TestIdleSaver(t *testing.T) {
+	e := idleEngine(16)
+	e.cfg.Power = PowerSaver
+	list := testRoutes(8)
+	t0 := time.Now()
+	e.idleStart(t0)
+	e.idleTick(t0.Add(saverCalm-time.Second), list)
+	if e.quiet.On() {
+		t.Fatal("idle before saverCalm")
+	}
+	e.idleTick(t0.Add(saverCalm), list)
+	if !e.quiet.On() || e.limit() != saverRoutes {
+		t.Fatalf("idle %v, limit %d", e.quiet.On(), e.limit())
+	}
+	for _, s := range list {
+		if s.Closed() != (s.ID >= saverRoutes) {
+			t.Fatalf("route %d closed: %v", s.ID, s.Closed())
+		}
+	}
+}

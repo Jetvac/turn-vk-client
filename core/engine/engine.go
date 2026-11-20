@@ -51,9 +51,11 @@ type Config struct {
 	Client  string
 	// OnStatus is called (from any goroutine) when the status changes.
 	OnStatus func(Status)
-	// Quiet: idle mode for phones (idle.go): an idle tunnel keeps a few
-	// routes, which ping together, so that the radio can sleep.
-	Quiet bool
+	// Power: the power mode (phones, idle.go). PowerBalanced and PowerSaver
+	// turn on idle mode: an idle tunnel keeps a few routes, which ping
+	// together, so that the radio can sleep; PowerSaver idles sooner, on
+	// fewer routes. PowerAlways and "" (desktops) never idle.
+	Power string
 	// Device, when set, reports the battery and power state for the
 	// statistics (device.go); called once a minute.
 	Device func() *DeviceState
@@ -361,7 +363,7 @@ func New(cfg Config) (*Engine, error) {
 	}
 	e := &Engine{cfg: cfg, aead: aead, b: newBind(), state: StateStopped, since: time.Now(), done: make(chan struct{})}
 	e.target.Store(int32(cfg.Sessions))
-	if cfg.Quiet {
+	if cfg.Power == PowerBalanced || cfg.Power == PowerSaver {
 		e.quiet = session.NewQuiet()
 		e.b.quiet = e.quiet
 	}

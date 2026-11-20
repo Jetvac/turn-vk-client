@@ -8,7 +8,7 @@ import (
 	"github.com/Jetvac/turn-vk-client/core/session"
 )
 
-// Idle mode (Config.Quiet, for phones): a tunnel that has carried next to
+// Idle mode (Config.Power, for phones): a tunnel that has carried next to
 // nothing for quietCalm keeps only quietRoutes routes, and they ping
 // together, in one burst every session.QuietPing (session/quiet.go). Every
 // route is a TURN allocation that pings and refreshes on its own schedule,
@@ -31,7 +31,34 @@ const (
 	quietDozeRun = 5
 	// quietRamp: routes come back this far apart (VK sees a ramp).
 	quietRamp = 100 * time.Millisecond
+	// PowerSaver idles after saverCalm, on saverRoutes routes.
+	saverRoutes = 2
+	saverCalm   = 30 * time.Second
 )
+
+// The power modes (Config.Power), as the user picks them in the app.
+const (
+	PowerSaver    = "saver"    // idles soon, on 2 routes; Wi-Fi saves power
+	PowerBalanced = "balanced" // idles after 90 s, on 4 routes (the default)
+	PowerAlways   = "always"   // never idles: every route always ready
+)
+
+// idleCalm: how long the tunnel must be calm before it idles.
+func (e *Engine) idleCalm() time.Duration {
+	if e.cfg.Power == PowerSaver {
+		return saverCalm
+	}
+	return quietCalm
+}
+
+// idleKeep: the routes an idle tunnel keeps.
+func (e *Engine) idleKeep() int {
+	n := quietRoutes
+	if e.cfg.Power == PowerSaver {
+		n = saverRoutes
+	}
+	return min(n, e.cfg.Sessions)
+}
 
 type idleState struct {
 	// cap: routes allowed while idle (0: no limit); secs: seconds spent
@@ -108,14 +135,14 @@ func (e *Engine) idleTick(now time.Time, list []*session.Session) {
 		}
 		return
 	}
-	if now.Sub(e.idle.busyAt) < quietCalm || len(list) == 0 || e.mode.Load() == modeUnknown || e.State() != StateConnected {
+	if now.Sub(e.idle.busyAt) < e.idleCalm() || len(list) == 0 || e.mode.Load() == modeUnknown || e.State() != StateConnected {
 		return
 	}
 	e.enterIdle(now, list)
 }
 
 func (e *Engine) enterIdle(now time.Time, list []*session.Session) {
-	keep := min(quietRoutes, e.cfg.Sessions)
+	keep := e.idleKeep()
 	e.idle.cap.Store(int32(keep))
 	if !e.quiet.Enter(now) {
 		return

@@ -98,6 +98,12 @@ object TunnelState {
 
     fun setPlan(p: String?) { _plan.value = p }
 
+    /** The power mode the running tunnel started with; null while stopped. */
+    private val _power = MutableStateFlow<String?>(null)
+    val power: StateFlow<String?> = _power.asStateFlow()
+
+    fun setPower(p: String?) { _power.value = p }
+
     fun setStatus(s: Status) { _status.value = s }
     fun setCaptcha(url: String?) { _captcha.value = url }
     fun setError(e: String?) { _error.value = e }

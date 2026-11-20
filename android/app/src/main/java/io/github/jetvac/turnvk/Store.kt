@@ -79,6 +79,16 @@ class Store(ctx: Context) {
             p.edit().putString("obfs", v).apply()
         }
 
+    /**
+     * Power mode: "saver", "balanced" (the default) or "always" (never
+     * idles). See Power.kt.
+     */
+    var power: String
+        get() = p.getString("power", Power.BALANCED) ?: Power.BALANCED
+        set(v) {
+            p.edit().putString("power", v).apply()
+        }
+
     var captchaAuto: Boolean
         get() = p.getBoolean("captcha_mode", false)
         set(v) {

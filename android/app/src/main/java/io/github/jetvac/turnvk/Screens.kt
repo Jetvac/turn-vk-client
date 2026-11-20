@@ -366,7 +366,7 @@ fun App(store: Store, imported: MutableState<String?>, connect: () -> Unit) {
         Box(Modifier.fillMaxSize().padding(pad)) {
             when (tab) {
                 Tab.Home -> HomeTab(store, revision, refresh, s, live, history, now, connect, onServers = { tab = Tab.Servers },
-                    rules = rules, updateRules = updateRules, onRoutes = { tab = Tab.Routes })
+                    rules = rules, updateRules = updateRules, onRoutes = { tab = Tab.Routes }, onSettings = { tab = Tab.Settings })
                 Tab.Servers -> ServersTab(store, revision, refresh, s.active)
                 Tab.Routes -> RoutesTab(store, rules, updateRules, s.active, onAddApp = { apps = true })
                 Tab.Settings -> SettingsTab(store, revision, refresh, s.active)
@@ -491,6 +491,7 @@ private fun HomeTab(
     rules: SplitRules,
     updateRules: (SplitRules) -> Unit,
     onRoutes: () -> Unit,
+    onSettings: () -> Unit,
 ) {
     val ctx = LocalContext.current
     val error by TunnelState.error.collectAsState()
@@ -558,6 +559,10 @@ private fun HomeTab(
                 action = "Переподключить",
             ) { TunnelService.restart(ctx) }
         }
+
+        val power = remember(revision) { store.power }
+        val runningPower by TunnelState.power.collectAsState()
+        PowerRow(power, if (s.active) runningPower else null, s, onClick = onSettings)
 
         if (s.active) Stats(s, live, history)
 
@@ -1009,6 +1014,7 @@ private fun SettingsTab(store: Store, revision: Int, refresh: () -> Unit, active
     var captchaAuto by remember(revision) { mutableStateOf(store.captchaAuto) }
     var boot by remember(revision) { mutableStateOf(store.bootConnect) }
     var srvStats by remember(revision) { mutableStateOf(store.serverStats) }
+    var power by remember(revision) { mutableStateOf(store.power) }
     // Re-checked whenever the screen is shown again (after the system pages).
     var resumes by remember { mutableIntStateOf(0) }
     LifecycleResumeEffect(Unit) {
@@ -1076,6 +1082,8 @@ private fun SettingsTab(store: Store, revision: Int, refresh: () -> Unit, active
                 )
             }
         }
+
+        PowerPanel(power, batteryOk) { power = it; store.power = it; refresh() }
 
         Panel(padding = 0.dp) {
             Column {

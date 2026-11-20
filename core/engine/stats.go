@@ -302,6 +302,9 @@ func (e *Engine) queueStats(m statsMinute) {
 		"v": 1, "client": e.cfg.Client, "os": runtime.GOOS + "/" + runtime.GOARCH, "sessions": e.cfg.Sessions,
 		"obfs": map[bool]string{true: "video", false: "audio"}[e.cfg.Mode == wrap.Video], "since": e.diag.connectedUnix(), "m": []statsMinute{m},
 	}
+	if e.cfg.Power != "" {
+		head["power"] = e.cfg.Power
+	}
 	if dropped > 0 {
 		head["ev_dropped"] = dropped
 	}

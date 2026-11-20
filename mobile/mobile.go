@@ -61,7 +61,21 @@ var (
 	dataDir string
 	noStats bool
 	client  string
+	power   = engine.PowerBalanced
 )
+
+// SetPower sets the power mode for the next Start: "saver", "balanced"
+// (the default) or "always" (engine.Power*).
+func SetPower(mode string) {
+	mu.Lock()
+	defer mu.Unlock()
+	switch mode {
+	case engine.PowerSaver, engine.PowerAlways:
+		power = mode
+	default:
+		power = engine.PowerBalanced
+	}
+}
 
 // SetStats says whether the engine sends the server statistics of the
 // connection, and how it names the app in them ("TurnVK 0.5.0 android").
@@ -126,8 +140,9 @@ func Start(rawLink, deviceID string, sessions int, obfs string, p Platform) erro
 		Client:   client,
 		Logf:     func(f string, a ...any) { p.Log(fmt.Sprintf(f, a...)) },
 		OnStatus: func(s engine.Status) { b, _ := json.Marshal(s); p.OnStatus(string(b)) },
-		// A phone's battery: an idle tunnel lets the radio sleep.
-		Quiet:  true,
+		// A phone's battery: an idle tunnel lets the radio sleep (unless
+		// the user chose to stay always ready).
+		Power:  power,
 		Device: func() *engine.DeviceState { return parseDevice(p.Device()) },
 	})
 	if err != nil {
