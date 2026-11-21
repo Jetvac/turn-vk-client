@@ -7,6 +7,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
 import android.os.PowerManager
+import android.provider.Settings
 
 /**
  * The diagnostic report for developers (blocking: it runs network checks
@@ -20,6 +21,8 @@ fun buildReport(ctx: Context): String {
     val system = mutableListOf(
         "android: ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})",
         "device: ${Build.MANUFACTURER} ${Build.MODEL}",
+        // The id the server's statistics know this phone by (TunnelService).
+        "device id: ${Settings.Secure.getString(ctx.contentResolver, Settings.Secure.ANDROID_ID) ?: "android"}",
     )
     runCatching {
         val cm = ctx.getSystemService(ConnectivityManager::class.java)

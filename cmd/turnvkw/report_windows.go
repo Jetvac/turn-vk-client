@@ -53,7 +53,7 @@ func (a *app) report() {
 	a.mu.Unlock()
 
 	r.System = append([]string{
-		"device: " + a.devID,
+		"device id: " + a.devID,
 		fmt.Sprintf("program: %s %s/%s", runtime.Version(), runtime.GOOS, runtime.GOARCH),
 	}, winvpn.Describe(v)...)
 	opts := diag.CheckOptions{}

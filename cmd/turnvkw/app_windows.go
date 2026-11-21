@@ -210,6 +210,22 @@ func (a *app) current() *profile {
 	return nil
 }
 
+// markResult: what the page tells the user after a mark.
+type markResult struct {
+	Stats bool `json:"stats"` // it goes to the server's statistics
+}
+
+// mark: the user says something is wrong right now (note: what, may be
+// empty). The line goes to the log and, unless statistics are off, to
+// the server with the next report.
+func (a *app) mark(note string) markResult {
+	a.mu.Lock()
+	e, stats := a.eng, !a.s.NoStats
+	a.mu.Unlock()
+	a.logf("%s", engine.Mark(e, note))
+	return markResult{Stats: stats && e != nil}
+}
+
 func (a *app) logf(f string, args ...any) {
 	line := time.Now().Format("15:04:05 ") + fmt.Sprintf(f, args...)
 	a.mu.Lock()
@@ -510,6 +526,7 @@ func (a *app) bind(w webview2.WebView) {
 	}))
 	must(w.Bind("tvkReport", func() { go a.report() }))
 	must(w.Bind("tvkPing", func() { go a.ping() }))
+	must(w.Bind("tvkMark", func(note string) markResult { return a.mark(note) }))
 	must(w.Bind("tvkGameNames", split.GameNames))
 	must(w.Bind("tvkCheckUpdate", func() { go a.checkUpdate(true) }))
 	must(w.Bind("tvkInstallUpdate", func() { go a.installUpdate() }))
@@ -705,6 +722,14 @@ func (a *app) connect() error {
 		// Not inline: the engine may report while a.mu is held here, and
 		// push asks the engine for its status.
 		OnStatus: func(engine.Status) { go a.push() },
+		Network: func() *engine.NetState {
+			l := v.Link()
+			kind := map[string]string{"wired": "eth", "mobile": "cell"}[l.Kind]
+			if kind == "" {
+				kind = l.Kind
+			}
+			return &engine.NetState{Kind: kind, Quality: l.Quality, RSSI: l.RSSI, Mbps: l.RxMbps, MHz: l.MHz}
+		},
 		Direct: func() engine.DirectState {
 			rt := rtNow.Load()
 			if rt == nil {

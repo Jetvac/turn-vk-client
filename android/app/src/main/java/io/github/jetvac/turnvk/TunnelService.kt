@@ -15,6 +15,7 @@ import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
+import android.net.wifi.WifiInfo
 import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
@@ -22,6 +23,12 @@ import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.provider.Settings
 import android.service.quicksettings.TileService
+import android.telephony.CellSignalStrengthGsm
+import android.telephony.CellSignalStrengthLte
+import android.telephony.CellSignalStrengthNr
+import android.telephony.CellSignalStrengthTdscdma
+import android.telephony.CellSignalStrengthWcdma
+import android.telephony.TelephonyManager
 import org.json.JSONObject
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -40,6 +47,7 @@ class TunnelService : VpnService(), mobile.Platform {
         const val ACTION_CONNECT = "connect"
         const val ACTION_DISCONNECT = "disconnect"
         const val ACTION_RESTART = "restart"
+        const val ACTION_MARK = "mark"
 
         private const val CHANNEL = "tunnel"
         private const val CHANNEL_CAPTCHA = "captcha"
@@ -86,6 +94,11 @@ class TunnelService : VpnService(), mobile.Platform {
         when (intent?.action) {
             ACTION_DISCONNECT -> {
                 stopTunnel()
+                return START_NOT_STICKY
+            }
+            // "Something is wrong now" from the notification.
+            ACTION_MARK -> {
+                Marker.mark(this, "")
                 return START_NOT_STICKY
             }
             // The app, the tile and the boot receiver send ACTION_CONNECT;
@@ -403,6 +416,61 @@ class TunnelService : VpnService(), mobile.Platform {
             .toString()
     }.getOrDefault("")
 
+    /**
+     * The physical network for the statistics (engine.NetState): its kind,
+     * signal and Wi-Fi link, never its name. No extra permissions: Wi-Fi
+     * from the network's capabilities (link and band from Android 12), the
+     * mobile signal from TelephonyManager (Android 10+).
+     */
+    override fun network(): String = runCatching {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val net = underlying ?: cm?.activeNetwork
+        val caps = net?.let { cm?.getNetworkCapabilities(it) }
+        val o = JSONObject()
+        when {
+            caps == null -> o.put("kind", "none")
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> {
+                o.put("kind", "wifi")
+                if (Build.VERSION.SDK_INT >= 29) {
+                    caps.signalStrength.takeIf { it in -127..-1 }?.let { o.put("rssi", it) }
+                }
+                if (Build.VERSION.SDK_INT >= 31) {
+                    (caps.transportInfo as? WifiInfo)?.let { w ->
+                        if (w.rssi in -127..-1) o.put("rssi", w.rssi)
+                        if (w.linkSpeed > 0) o.put("mbps", w.linkSpeed)
+                        if (w.frequency > 0) o.put("mhz", w.frequency)
+                    }
+                }
+            }
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> {
+                o.put("kind", "cell")
+                if (Build.VERSION.SDK_INT >= 29) {
+                    getSystemService(TelephonyManager::class.java)?.signalStrength?.let { ss ->
+                        o.put("bars", ss.level)
+                        val all = ss.cellSignalStrengths
+                        // 5G next to 4G (NSA): the 5G one.
+                        (all.firstOrNull { it is CellSignalStrengthNr } ?: all.firstOrNull())?.let { c ->
+                            if (c.dbm in -150..-1) o.put("rssi", c.dbm)
+                            o.put(
+                                "cell",
+                                when (c) {
+                                    is CellSignalStrengthNr -> "5g"
+                                    is CellSignalStrengthLte -> "lte"
+                                    is CellSignalStrengthWcdma, is CellSignalStrengthTdscdma -> "3g"
+                                    is CellSignalStrengthGsm -> "2g"
+                                    else -> "other"
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> o.put("kind", "eth")
+            else -> o.put("kind", "other")
+        }
+        o.toString()
+    }.getOrDefault("")
+
     // --- quick settings tile ---
 
     private fun updateTile() {
@@ -524,6 +592,9 @@ class TunnelService : VpnService(), mobile.Platform {
         val stop = PendingIntent.getService(
             this, 2, Intent(this, TunnelService::class.java).setAction(ACTION_DISCONNECT), PendingIntent.FLAG_IMMUTABLE,
         )
+        val mark = PendingIntent.getService(
+            this, 3, Intent(this, TunnelService::class.java).setAction(ACTION_MARK), PendingIntent.FLAG_IMMUTABLE,
+        )
         return noteBuilder(CHANNEL)
             .setSmallIcon(R.drawable.ic_stat_vpn)
             .setContentTitle(store.current?.name ?: getString(R.string.app_name))
@@ -531,6 +602,7 @@ class TunnelService : VpnService(), mobile.Platform {
             .setContentIntent(open)
             .setOngoing(true)
             .addAction(Notification.Action.Builder(null as Icon?, "Отключить", stop).build())
+            .addAction(Notification.Action.Builder(null as Icon?, "Что-то не так", mark).build())
             .build()
     }
 

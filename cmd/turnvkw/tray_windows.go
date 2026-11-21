@@ -70,6 +70,7 @@ const (
 	cmdOpen    = 1
 	cmdConnect = 2
 	cmdQuit    = 3
+	cmdMark    = 4
 )
 
 // notifyIconData is NOTIFYICONDATAW.
@@ -279,6 +280,9 @@ func (t *tray) menu() {
 	default:
 		item(cmdConnect, mfString|mfGrayed, "Подключить")
 	}
+	if running {
+		item(cmdMark, mfString, "Сейчас что-то не так — отметить")
+	}
 	item(0, mfSeparator, "")
 	item(cmdQuit, mfString, "Выйти")
 	_, _, _ = procSetMenuDefaultItem.Call(m, cmdOpen, 0)
@@ -306,6 +310,14 @@ func (t *tray) menu() {
 				}
 			}()
 		}
+	case cmdMark:
+		go func() {
+			if t.a.mark("").Stats {
+				t.balloon("Отмечено", "Время и состояние подключения уйдут разработчику со статистикой.")
+			} else {
+				t.balloon("Отмечено в журнале", "Статистика выключена: отметка есть только в журнале и отчёте.")
+			}
+		}()
 	case cmdQuit:
 		t.quit()
 	}

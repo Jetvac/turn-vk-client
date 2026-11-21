@@ -346,6 +346,7 @@ select { font: inherit; color: var(--text); background: var(--card2); border: 1p
       </div>
       <div class="paths" id="paths"></div>
       <div class="small muted" style="margin-top:10px" id="proto"></div>
+      <button class="btn ghost wide" id="markBtn" style="margin-top:12px" title="Отметит этот момент в статистике для разработчика">Сейчас что-то не так</button>
     </div>
 
     <div class="note"><svg><use href="#i-info"/></svg><span>Весь трафик компьютера идёт через серверы звонков VK и шифруется WireGuard.</span></div>
@@ -586,6 +587,17 @@ select { font: inherit; color: var(--text); background: var(--card2); border: 1p
     <div class="row">
       <button class="btn ghost" id="mAnyway">Подключить всё равно</button>
       <button class="btn primary" id="mOk">Понятно</button>
+    </div>
+  </div>
+</div>
+<div class="modal" id="markModal">
+  <div class="dialog" style="max-width:400px">
+    <h3>Что-то не так?</h3>
+    <p>TurnVK отметит этот момент: время и состояние подключения уйдут разработчику со статистикой, и будет видно, что происходило именно тогда. Отмечайте сразу, как заметили.</p>
+    <label class="field"><span>Что не работает (необязательно)</span><input type="text" id="markNote" maxlength="200" placeholder="Например: Telegram не грузит, лагает игра"></label>
+    <div class="row">
+      <button class="btn ghost" id="markCancel">Отмена</button>
+      <button class="btn primary" id="markOk">Отметить</button>
     </div>
   </div>
 </div>
@@ -1494,6 +1506,19 @@ window.onPing = function (r) {
   const n = (v) => v >= 10 ? Math.round(v) : v.toFixed(1);
   t.textContent = 'Обычно ' + n(r.p50) + ' мс, в 95 % замеров до ' + n(r.p95) + ' мс, худший ' + n(r.max) + ' мс. Разброс ' + n(r.jitter) + ' мс, всплесков (на 50 мс выше обычного) ' + r.spikes + ', потеряно ' + r.lost + ' из ' + r.sent + '.';
 };
+
+$('markBtn').onclick = () => {
+  $('markNote').value = '';
+  $('markModal').classList.add('on');
+  $('markNote').focus();
+};
+$('markCancel').onclick = () => $('markModal').classList.remove('on');
+$('markOk').onclick = async () => {
+  $('markModal').classList.remove('on');
+  const r = await tvkMark($('markNote').value);
+  toast(r.stats ? 'Отмечено: разработчик увидит этот момент' : 'Отмечено в журнале (статистика выключена)');
+};
+$('markNote').onkeydown = (e) => { if (e.key === 'Enter') $('markOk').click(); };
 
 let reportPath = '';
 $('reportBtn').onclick = async () => {

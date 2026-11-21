@@ -90,6 +90,7 @@ func (e *Engine) SwitchNetwork(why string) {
 		return
 	}
 	e.netLost.Store(false)
+	e.netChg.Add(1)
 	e.offline.up()
 	e.silent.up()
 	list := e.b.list()

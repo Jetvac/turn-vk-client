@@ -59,6 +59,9 @@ type Config struct {
 	// Device, when set, reports the battery and power state for the
 	// statistics (device.go); called once a minute.
 	Device func() *DeviceState
+	// Network, when set, reports the physical network for the statistics
+	// (netstate.go); called once a minute.
+	Network func() *NetState
 	// Direct, when set, reports the split tunneling's direct path for the
 	// statistics (stats.go); called once a minute.
 	Direct func() DirectState
@@ -212,6 +215,7 @@ type Engine struct {
 	txClosed  atomic.Uint64
 	reconnect atomic.Uint64
 	wakes     atomic.Uint64 // the device woke from sleep (watchdog)
+	netChg    atomic.Uint64 // the network changed (Reconnect, SwitchNetwork)
 	// network.go: the platform reports no network (netLost, since
 	// netLostAt); heldAt: "routes kept" last logged.
 	netLost atomic.Bool
@@ -1335,10 +1339,18 @@ func (e *Engine) Stop() {
 		}
 	}
 	e.mu.Lock()
-	if e.state != StateFailed {
+	failed := e.state == StateFailed
+	if !failed {
 		e.state = StateStopped
 	}
 	e.mu.Unlock()
+	if !failed && !e.cfg.NoStats {
+		if e.diag.connectedUnix() == 0 {
+			noteDown("connecting was stopped", time.Now())
+		} else {
+			noteDown("stopped by the app", time.Now())
+		}
+	}
 	e.finish()
 	e.notify()
 }
@@ -1368,6 +1380,9 @@ func (e *Engine) fail(err error) {
 	e.since = time.Now()
 	e.mu.Unlock()
 	e.logf("stopped: %v", err)
+	if !e.cfg.NoStats {
+		noteDown("failed: "+err.Error(), time.Now())
+	}
 	if e.stop != nil {
 		e.stop()
 	}
@@ -1545,6 +1560,7 @@ func (e *Engine) Reconnect(why string) {
 		return
 	}
 	e.logf("reconnecting: %s", why)
+	e.netChg.Add(1)
 	e.offline.up()
 	e.silent.up()
 	for _, s := range e.b.list() {

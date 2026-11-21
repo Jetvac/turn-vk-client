@@ -39,7 +39,10 @@ const MaxLog = 400
 func (r *Report) Text() string {
 	var b strings.Builder
 	p := func(f string, a ...any) { fmt.Fprintf(&b, f+"\n", a...) }
-	p("=== %s diagnostic report, %s ===", r.App, time.Now().Format("2006-01-02 15:04:05 -0700"))
+	now := time.Now()
+	p("=== %s diagnostic report, %s ===", r.App, now.Format("2006-01-02 15:04:05 -0700"))
+	// The server's statistics are in UTC: this ties the two together.
+	p("times below are local, UTC%s (%s UTC now)", now.Format("-07:00"), now.UTC().Format("15:04"))
 	p("")
 	p("[system]")
 	for _, s := range r.System {

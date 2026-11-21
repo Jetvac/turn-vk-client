@@ -16,24 +16,26 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/json"
-	"fmt"
 	"math/rand/v2"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
-	"github.com/Jetvac/turn-vk-client/core/redact"
 	"github.com/Jetvac/turn-vk-client/core/session"
 	"github.com/Jetvac/turn-vk-client/core/wrap"
 )
 
 const (
-	statsEvery     = time.Minute
-	statsQueueMax  = 30 // reports waiting for an acknowledgement
-	statsEventsMax = 40 // log lines kept between reports
+	statsEvery = time.Minute
+	// statsQueueMax: reports waiting for an acknowledgement; the oldest go
+	// beyond it, and the next report says which minutes were lost.
+	statsQueueMax  = 60
+	statsEventsMax = 60 // kinds of log lines kept between reports (events.go)
 	statsEventLen  = 240
+	// statsParts: a minute's report with many events goes out in up to
+	// this many datagrams (the first holds the numbers).
+	statsParts     = 3
 	statsSendBatch = 3 // reports sent per tick
 	// statsNoAck: the server acknowledged none of this many sends: it does
 	// not collect statistics (an older version, or one not restarted after
@@ -46,6 +48,15 @@ type statsReport struct {
 	id   uint32
 	body []byte
 	sent int
+	t    int64 // the minute's end, unix ms
+	part int   // 0: the minute's numbers; more: its further events
+}
+
+// statsLost: reports the queue let go before the server had them.
+type statsLost struct {
+	N    int   `json:"n"`
+	From int64 `json:"from"` // first lost minute, unix ms
+	To   int64 `json:"to"`   // last
 }
 
 var statsQ = struct {
@@ -53,36 +64,17 @@ var statsQ = struct {
 	reports []*statsReport
 	events  []statsEvent
 	dropped int
-}{}
-
-type statsEvent struct {
-	T   int64  `json:"t"` // unix ms
-	Msg string `json:"m"`
-}
-
-// StatsEvent adds a line to the next report (the apps' own events, such
-// as the check after connecting).
-func StatsEvent(format string, args ...any) {
-	noteEvent(fmt.Sprintf(format, args...))
-}
-
-func noteEvent(msg string) {
-	msg = redact.String(msg)
-	if len(msg) > statsEventLen {
-		cut := statsEventLen
-		for cut > 0 && !utf8.RuneStart(msg[cut]) { // not inside a character
-			cut--
-		}
-		msg = msg[:cut] + "…"
-	}
-	statsQ.mu.Lock()
-	defer statsQ.mu.Unlock()
-	if len(statsQ.events) >= statsEventsMax {
-		statsQ.dropped++
-		return
-	}
-	statsQ.events = append(statsQ.events, statsEvent{T: time.Now().UnixMilli(), Msg: msg})
-}
+	// seq numbers the minutes of this run of the app (run): a gap in seq
+	// means reports were lost, a gap in time without one that the engine
+	// did not run (asleep, or not connected).
+	seq  int
+	run  uint32
+	lost statsLost
+	// down: since when and why there has been no connection (downtime.go).
+	down     time.Time
+	downWhy  string
+	downSeen bool
+}{run: rand.Uint32() | 1}
 
 // statsMinute is one minute of the connection.
 type statsMinute struct {
@@ -130,6 +122,9 @@ type statsMinute struct {
 	// Direct: split tunneling's direct path at the end of the minute
 	// (Config.Direct), with the direct UDP sends that failed during it.
 	Direct *directMinute `json:"direct,omitempty"`
+	// Net: the physical network at the end of the minute (Config.Network),
+	// with the changes during it.
+	Net *NetState `json:"net,omitempty"`
 }
 
 type directMinute struct {
@@ -156,6 +151,9 @@ func (e *Engine) statsLoop() {
 	if e.cfg.NoStats {
 		return
 	}
+	if line, ok := takeDown(time.Now()); ok {
+		e.logf("%s", line)
+	}
 	t := time.NewTicker(statsEvery)
 	defer t.Stop()
 	send := time.NewTicker(10 * time.Second)
@@ -165,6 +163,7 @@ func (e *Engine) statsLoop() {
 	prevLowLat := e.b.pacer.inter.Secs.Load()
 	prevQuiet := e.idle.secs.Load()
 	prevWakes, prevCPU := e.wakes.Load(), processCPU()
+	prevNetChg := e.netChg.Load()
 	var prevDirErr uint64
 	if e.cfg.Direct != nil {
 		prevDirErr = e.cfg.Direct().UDPErr
@@ -296,6 +295,17 @@ func (e *Engine) statsLoop() {
 			}
 			prevDirErr = d.UDPErr
 		}
+		chg := e.netChg.Load()
+		if e.cfg.Network != nil {
+			m.Net = e.cfg.Network()
+		}
+		if chg != prevNetChg {
+			if m.Net == nil {
+				m.Net = &NetState{}
+			}
+			m.Net.Changes = chg - prevNetChg
+		}
+		prevNetChg = chg
 		m.TURN = len(turn)
 		e.queueStats(m)
 		if (e.statsAcked.Load() || unacked < statsNoAck) && !e.quiet.On() {
@@ -317,48 +327,99 @@ func (e *Engine) queueStats(m statsMinute) {
 	statsQ.mu.Lock()
 	events, dropped := statsQ.events, statsQ.dropped
 	statsQ.events, statsQ.dropped = nil, 0
+	statsQ.seq++
+	seq, run, lost := statsQ.seq, statsQ.run, statsQ.lost
+	statsQ.lost = statsLost{}
 	statsQ.mu.Unlock()
 	head := map[string]any{
 		"v": 1, "client": e.cfg.Client, "os": runtime.GOOS + "/" + runtime.GOARCH, "sessions": e.cfg.Sessions,
 		"obfs": map[bool]string{true: "video", false: "audio"}[e.cfg.Mode == wrap.Video], "since": e.diag.connectedUnix(), "m": []statsMinute{m},
+		"seq": seq, "run": run,
 	}
 	if e.cfg.Power != "" {
 		head["power"] = e.cfg.Power
 	}
-	if dropped > 0 {
-		head["ev_dropped"] = dropped
+	if lost.N > 0 {
+		head["lost"] = lost
 	}
-	var body []byte
-	for {
-		if len(events) > 0 {
-			head["ev"] = events
+	// Further parts: the events that did not fit the first, tied to it by
+	// run and seq.
+	more := map[string]any{"v": 1, "client": e.cfg.Client, "seq": seq, "run": run}
+	bodies := packEvents(events, func(part int, ev []statsEvent, left int) []byte {
+		h := head
+		if part > 0 {
+			h = more
+			h["part"] = part
+		}
+		if len(ev) > 0 {
+			h["ev"] = ev
 		} else {
-			delete(head, "ev")
+			delete(h, "ev")
 		}
-		raw, _ := json.Marshal(head)
-		body = deflate(raw)
-		if len(body) <= session.MaxStats || len(events) == 0 {
-			break
+		if part == 0 && dropped+left > 0 {
+			h["ev_dropped"] = dropped + left
+		} else {
+			delete(h, "ev_dropped")
 		}
-		// Too long for one datagram: the oldest lines go.
-		cut := max(1, len(events)/4)
-		head["ev_dropped"] = toInt(head["ev_dropped"]) + cut
-		events = events[cut:]
-	}
-	if len(body) > session.MaxStats {
+		raw, _ := json.Marshal(h)
+		return deflate(raw)
+	})
+	if len(bodies) == 0 {
 		return
 	}
 	statsQ.mu.Lock()
-	statsQ.reports = append(statsQ.reports, &statsReport{id: rand.Uint32() | 1, body: body})
-	if len(statsQ.reports) > statsQueueMax {
-		statsQ.reports = statsQ.reports[len(statsQ.reports)-statsQueueMax:]
+	for i, b := range bodies {
+		statsQ.reports = append(statsQ.reports, &statsReport{id: rand.Uint32() | 1, body: b, t: m.T, part: i})
+	}
+	if n := len(statsQ.reports) - statsQueueMax; n > 0 {
+		for _, r := range statsQ.reports[:n] {
+			if r.part != 0 {
+				continue
+			}
+			l := &statsQ.lost
+			if l.N == 0 {
+				l.From = r.t
+			}
+			l.N++
+			l.To = r.t
+		}
+		statsQ.reports = statsQ.reports[n:]
 	}
 	statsQ.mu.Unlock()
 }
 
-func toInt(v any) int {
-	n, _ := v.(int)
-	return n
+// packEvents spreads the events over at most statsParts datagrams, built
+// by enc (part 0 holds the minute's numbers; left: events left out). What
+// does not fit is left out, the least important and oldest first.
+func packEvents(events []statsEvent, enc func(part int, ev []statsEvent, left int) []byte) [][]byte {
+	left := 0
+	for {
+		var out [][]byte
+		var cur []statsEvent
+		fits := true
+		for _, ev := range events {
+			next := append(cur[:len(cur):len(cur)], ev)
+			if len(cur) == 0 || len(enc(len(out), next, left)) <= session.MaxStats {
+				cur = next
+				continue
+			}
+			out = append(out, enc(len(out), cur, left))
+			cur = []statsEvent{ev}
+		}
+		out = append(out, enc(len(out), cur, left))
+		for _, b := range out {
+			fits = fits && len(b) <= session.MaxStats
+		}
+		if fits && len(out) <= statsParts {
+			return out
+		}
+		if len(events) == 0 {
+			return nil
+		}
+		k := max(1, len(events)/8)
+		events = dropLeast(events, k)
+		left += k
+	}
 }
 
 func deflate(b []byte) []byte {

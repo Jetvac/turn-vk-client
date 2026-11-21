@@ -52,6 +52,9 @@ type Platform interface {
 	// Device returns the battery and power state as JSON (engine.DeviceState),
 	// for the statistics; "" when unknown. Called once a minute.
 	Device() string
+	// Network returns the physical network as JSON (engine.NetState), for
+	// the statistics; "" when unknown. Called once a minute.
+	Network() string
 }
 
 var (
@@ -144,6 +147,13 @@ func Start(rawLink, deviceID string, sessions int, obfs string, p Platform) erro
 		// the user chose to stay always ready).
 		Power:  power,
 		Device: func() *engine.DeviceState { return parseDevice(p.Device()) },
+		Network: func() *engine.NetState {
+			var n engine.NetState
+			if s := p.Network(); s == "" || json.Unmarshal([]byte(s), &n) != nil {
+				return nil
+			}
+			return &n
+		},
 		Direct: directStats,
 	})
 	if err != nil {

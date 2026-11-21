@@ -565,6 +565,7 @@ private fun HomeTab(
         PowerRow(power, if (s.active) runningPower else null, s, onClick = onSettings)
 
         if (s.active) Stats(s, live, history)
+        if (s.active) MarkButton()
 
         Note("Весь трафик идёт через серверы звонков VK и шифруется WireGuard.")
         Spacer(Modifier.height(8.dp))
