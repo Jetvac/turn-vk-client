@@ -35,6 +35,8 @@ data class Status(
     val paths: List<PathInfo> = emptyList(),
     /** The tunnel is idle: a few routes, pinging together (saves battery). */
     val quiet: Boolean = false,
+    /** Little traffic: the light tier's routes; the rest open when it gets busy. */
+    val light: Boolean = false,
 ) {
     val active: Boolean get() = state in setOf("connecting", "connected", "captcha")
 
@@ -68,6 +70,7 @@ data class Status(
                 rttMs = o.optInt("rtt_ms"),
                 paths = paths.sortedBy { it.id },
                 quiet = o.optBoolean("quiet"),
+                light = o.optBoolean("light"),
             )
         }.getOrDefault(Status())
     }

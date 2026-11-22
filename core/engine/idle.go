@@ -36,6 +36,28 @@ const (
 	saverCalm   = 30 * time.Second
 )
 
+// Routes on demand: a tunnel that carries little keeps lightRoutes routes
+// (saverLight in the saver mode), not every one. The stats: every device
+// but a downloading PC peaked at 4–8 Mbit/s, about 0.2 Mbit/s a route, and
+// spent 76–99 % of its minutes under 2 Mbit/s, while a phone leaving idle
+// mode for a notification reopened 28 routes, each a VK allocation, 3–7
+// times an hour. heavyRate a second for heavySecs seconds in a row, or
+// heavyBulk in one, brings every route back (a download gets full speed a
+// few seconds later); after lightCalm with the smoothed rate under
+// lightRate the tunnel is light again. PowerAlways and Config.AllRoutes
+// keep every route.
+const (
+	lightRoutes = 12
+	saverLight  = 8
+	heavyRate   = 3_000_000 / 8 // bytes a second, both ways
+	heavyBulk   = 8_000_000 / 8
+	heavySecs   = 3
+	lightRate   = 1_500_000 / 8
+	lightCalm   = 10 * time.Minute
+	// rateSmooth: the smoothed rate's time constant, seconds.
+	rateSmooth = 30
+)
+
 // The power modes (Config.Power), as the user picks them in the app.
 const (
 	PowerSaver    = "saver"    // idles soon, on 2 routes; Wi-Fi saves power
@@ -73,6 +95,90 @@ type idleState struct {
 	prevPk  uint64
 	busyAt  time.Time // the last busy second
 	busyRun int       // busy seconds in a row
+
+	// Routes on demand, the watchdog's own: the tunnel's bytes at the last
+	// tick, the smoothed rate (bytes a second), heavy seconds in a row, and
+	// when the tunnel was last busy enough for every route.
+	prevBytes uint64
+	rate      float64
+	heavyRun  int
+	heavyAt   time.Time
+	// lightSecs: seconds on the light tier (statistics).
+	lightSecs atomic.Uint64
+}
+
+// lightKeep: the routes a tunnel that carries little keeps; 0: every route.
+func (e *Engine) lightKeep() int {
+	if e.cfg.AllRoutes || e.cfg.Power == PowerAlways {
+		return 0
+	}
+	n := lightRoutes
+	if e.cfg.Power == PowerSaver {
+		n = saverLight
+	}
+	if n >= e.cfg.Sessions {
+		return 0
+	}
+	return n
+}
+
+// light: the light tier holds the routes back now (not idle mode).
+func (e *Engine) light() bool {
+	k := e.lightKeep()
+	return k > 0 && !e.quiet.On() && int(e.idle.cap.Load()) == k
+}
+
+// demandTick runs every second of the watchdog: it measures the tunnel's
+// traffic and moves between the light tier and every route.
+func (e *Engine) demandTick(now time.Time, list []*session.Session) {
+	now = now.Round(0)
+	by := e.b.bytes.Load()
+	d := float64(by - e.idle.prevBytes)
+	e.idle.prevBytes = by
+	e.idle.rate += (d - e.idle.rate) / rateSmooth
+	if d >= heavyRate {
+		e.idle.heavyRun++
+	} else {
+		e.idle.heavyRun = 0
+	}
+	if d >= heavyRate || e.idle.rate >= lightRate || e.idle.heavyAt.IsZero() {
+		e.idle.heavyAt = now
+	}
+	keep := e.lightKeep()
+	if keep == 0 || e.quiet.On() {
+		return
+	}
+	switch c := int(e.idle.cap.Load()); {
+	case c == keep:
+		e.idle.lightSecs.Add(1)
+		if e.idle.heavyRun >= heavySecs || d >= heavyBulk {
+			e.openGate(0)
+			e.idle.heavyAt = now
+			e.logf("busy: back to %d routes", e.limit())
+			e.notify()
+		}
+	case c == 0 && now.Sub(e.idle.heavyAt) >= lightCalm && len(list) > 0 && e.State() == StateConnected:
+		e.idle.cap.Store(int32(keep))
+		for _, s := range list {
+			if s.ID >= keep {
+				s.Close() // its worker rests until it gets busy
+			}
+		}
+		e.logf("light traffic: %d of %d routes kept, the rest come back when it gets busy", min(keep, len(list)), len(list))
+		e.notify()
+	}
+}
+
+// openGate sets the cap on the routes (0: none) and lets the resting
+// slots under it reopen.
+func (e *Engine) openGate(c int) {
+	e.idle.mu.Lock()
+	defer e.idle.mu.Unlock()
+	e.idle.cap.Store(int32(c))
+	if e.idle.up != nil {
+		close(e.idle.up)
+	}
+	e.idle.up = make(chan struct{})
 }
 
 // limit is how many routes the engine keeps now.
@@ -156,14 +262,10 @@ func (e *Engine) enterIdle(now time.Time, list []*session.Session) {
 	e.notify()
 }
 
+// leaveIdle: traffic again. The light tier's routes come back; every one
+// only if the traffic turns out heavy (demandTick).
 func (e *Engine) leaveIdle(now time.Time) {
-	e.idle.mu.Lock()
-	e.idle.cap.Store(0)
-	if e.idle.up != nil {
-		close(e.idle.up)
-	}
-	e.idle.up = make(chan struct{})
-	e.idle.mu.Unlock()
+	e.openGate(e.lightKeep())
 	if !e.quiet.Leave(now) {
 		return
 	}

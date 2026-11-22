@@ -187,6 +187,8 @@ type Session struct {
 	txWait atomic.Int64
 	acks   atomic.Bool
 	quiet  *Quiet
+	// testProbe stands in for the network in tests (testing.go).
+	testProbe func(*Session)
 }
 
 var handshakeSlots = make(chan struct{}, 4)
@@ -391,6 +393,13 @@ func (s *Session) Write(b []byte) error {
 // Probe sends a keepalive; a server that lost the session answers it with
 // a reset, which closes the session.
 func (s *Session) Probe() {
+	if s.testProbe != nil {
+		if !s.Closed() {
+			s.markProbe()
+			s.testProbe(s)
+		}
+		return
+	}
 	if s.direct {
 		if !s.Closed() {
 			s.probe()

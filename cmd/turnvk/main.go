@@ -54,6 +54,7 @@ func main() {
 	pings := flag.Int("pings", 50, "number of pings, 5 per second")
 	stats := flag.Bool("stats", false, "print speed and route round trips every second")
 	noStats := flag.Bool("no-server-stats", false, "send the server no statistics of the connection")
+	allRoutes := flag.Bool("all-routes", false, "keep every route open (no light tier while traffic is light); on for -download and -upload")
 	upload := flag.Int("upload", 0, "upload this many MB through the tunnel, print the speed and exit")
 	uploadURL := flag.String("upload-url", "https://speed.cloudflare.com/__up", "where -upload sends its data (HTTP POST)")
 	flag.Parse()
@@ -94,7 +95,9 @@ func main() {
 		// TURNVK_SCORE=off: plain rotation over VK's TURN servers (comparisons).
 		NoRelayScoring: os.Getenv("TURNVK_SCORE") == "off",
 		NoStats:        *noStats,
-		Client:         "turnvk-cli " + version + " " + runtime.GOOS,
+		// Speed tests measure every route from the first second.
+		AllRoutes: *allRoutes || *download != "" || *upload > 0,
+		Client:    "turnvk-cli " + version + " " + runtime.GOOS,
 		Logf: func(f string, a ...any) {
 			log.Printf(f, a...)
 		},

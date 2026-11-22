@@ -14,7 +14,8 @@ var t0 = time.Date(2026, 11, 20, 16, 0, 0, 0, time.UTC)
 
 // fake writes an hour of two devices' reports: from minute 10 to 20 only
 // "a" loses packets, from 30 to 40 both do, and at 50 "a"'s tunnel stalls
-// while its routes answer; "a" marks the moment at 52.
+// while its routes answer; "a" marks the moment at 52. At 25 "a" logs the
+// old idle handshake line, which is no trouble.
 func fake(t *testing.T) string {
 	var b bytes.Buffer
 	rec := func(dev string, rep map[string]any, at time.Time) {
@@ -35,6 +36,9 @@ func fake(t *testing.T) string {
 			if dev == "aaaa1111" && i == 50 {
 				rep["ev"] = []any{map[string]any{"t": at.UnixMilli(), "m": "no answer from the server for 1m0s while sending; every path answers, re-keying"}}
 			}
+			if dev == "aaaa1111" && i == 25 {
+				rep["ev"] = []any{map[string]any{"t": at.UnixMilli(), "m": "WireGuard: no handshake for 4m6s, the server stopped answering"}}
+			}
 			if dev == "aaaa1111" && i == 52 {
 				rep["ev"] = []any{map[string]any{"t": at.UnixMilli(), "m": "user mark: something is wrong now: «telegram»"}}
 			}
@@ -46,6 +50,22 @@ func fake(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// The idle handshake line of older clients is routine, the new one (while
+// sending) and stopped paths are trouble.
+func TestHandshakeLines(t *testing.T) {
+	old := "WireGuard: no handshake for 4m6s, the server stopped answering"
+	if isTrouble(old) || !isRoutine(old) {
+		t.Fatal("idle handshake line taken for trouble")
+	}
+	now := "WireGuard: no handshake for 4m6s while sending: the server does not answer"
+	if !isTrouble(now) || isRoutine(now) {
+		t.Fatal("handshake lost while sending not taken for trouble")
+	}
+	if !isTrouble("no answer from the server for 3s while sending; replacing 1 of 32 paths that stopped answering") {
+		t.Fatal("stopped paths not taken for trouble")
+	}
 }
 
 func TestShow(t *testing.T) {
@@ -69,6 +89,9 @@ func TestShow(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("no %q in\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "11-20 16:20 – 16:30") {
+		t.Errorf("the idle handshake line made a bad stretch:\n%s", got)
 	}
 	var ov strings.Builder
 	overview(&ov, a, time.UTC)

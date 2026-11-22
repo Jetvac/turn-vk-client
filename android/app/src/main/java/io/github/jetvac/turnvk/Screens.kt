@@ -727,7 +727,15 @@ private fun Stats(s: Status, live: Live, history: List<Pair<Long, Long>>) {
             Chart(history, Modifier.fillMaxWidth().height(70.dp).padding(vertical = 8.dp))
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    MiniTile("Маршруты через VK", if (s.quiet) "${s.sessions} · простой" else "${s.sessions} из ${s.target}", Modifier.weight(1f))
+                    MiniTile(
+                        "Маршруты через VK",
+                        when {
+                            s.quiet -> "${s.sessions} · простой"
+                            s.light -> "${s.sessions} · по нагрузке"
+                            else -> "${s.sessions} из ${s.target}"
+                        },
+                        Modifier.weight(1f),
+                    )
                     MiniTile("Пинг", if (s.rttMs > 0) "${s.rttMs} мс" else "—", Modifier.weight(1f))
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

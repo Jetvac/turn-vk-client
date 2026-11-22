@@ -55,6 +55,10 @@ func (a *app) checkUpdate(manual bool) {
 	a.mu.Unlock()
 	if changed && r != nil {
 		a.logf("update available: %s", r.Version)
+		// The window may stay hidden for days (the icon by the clock).
+		if theTray != nil && !manual {
+			theTray.balloon("Доступна TurnVK "+r.Version, "Откройте TurnVK и нажмите «Обновить»: настройки и серверы сохранятся.")
+		}
 	}
 	if manual && r == nil {
 		a.eval("onUpdateState", map[string]any{"latest": true})

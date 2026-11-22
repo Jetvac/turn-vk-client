@@ -116,6 +116,20 @@ class Store(ctx: Context) {
             p.edit().putBoolean("server_stats", v).apply()
         }
 
+    /** When the tunnel service last heard from GitHub about updates (ms). */
+    var updateCheckedAt: Long
+        get() = p.getLong("update_checked_at", 0L)
+        set(v) {
+            p.edit().putLong("update_checked_at", v).apply()
+        }
+
+    /** The newest version a notification announced. */
+    var updateNotified: String
+        get() = p.getString("update_notified", "") ?: ""
+        set(v) {
+            p.edit().putString("update_notified", v).apply()
+        }
+
     /**
      * Split tunneling rules (JSON, as the engine keeps them; see
      * SplitRules). The apps an older version let around the tunnel become

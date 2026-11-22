@@ -52,6 +52,8 @@ type settings struct {
 	Autostart bool `json:"autostart"`
 	// NoStats: send the server no statistics (on by default).
 	NoStats bool `json:"no_stats"`
+	// AllRoutes: every route open all the time (no light tier, idle.go).
+	AllRoutes bool `json:"all_routes"`
 	// CloseQuits: closing the window quits TurnVK instead of leaving it
 	// in the notification area (tray_windows.go).
 	CloseQuits bool `json:"close_quits"`
@@ -405,6 +407,13 @@ func (a *app) bind(w webview2.WebView) {
 		a.mu.Unlock()
 		a.push()
 	}))
+	must(w.Bind("tvkSetAllRoutes", func(on bool) {
+		a.mu.Lock()
+		a.s.AllRoutes = on
+		a.save()
+		a.mu.Unlock()
+		a.push()
+	}))
 	must(w.Bind("tvkSetOptions", func(sessions int, obfs string, connectOnStart bool) {
 		a.mu.Lock()
 		if sessions >= 1 && sessions <= 64 {
@@ -713,12 +722,13 @@ func (a *app) connect() error {
 	var rtNow atomic.Pointer[split.Router]
 	e, err = engine.New(engine.Config{
 		Link: l, DeviceID: a.devID, Sessions: a.s.Sessions, Mode: wrap.ParseMode(a.s.Obfs),
-		Net:     &netx.Net{DNS: netx.DefaultDNS, Protect: v.Protect},
-		Captcha: a.captcha,
-		VKCache: a.vkCache,
-		Logf:    a.logf,
-		NoStats: a.s.NoStats,
-		Client:  "TurnVK " + version + " windows",
+		Net:       &netx.Net{DNS: netx.DefaultDNS, Protect: v.Protect},
+		Captcha:   a.captcha,
+		VKCache:   a.vkCache,
+		Logf:      a.logf,
+		NoStats:   a.s.NoStats,
+		AllRoutes: a.s.AllRoutes,
+		Client:    "TurnVK " + version + " windows",
 		// Not inline: the engine may report while a.mu is held here, and
 		// push asks the engine for its status.
 		OnStatus: func(engine.Status) { go a.push() },

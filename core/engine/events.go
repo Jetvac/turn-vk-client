@@ -41,7 +41,8 @@ const (
 // routineLines: lines that come in the normal course of things.
 var routineLines = []string{
 	"idle: ", "traffic again", "TURN credentials", "answer a probe", "joining as new guest",
-	"moves to guest", "last minute:",
+	"moves to guest", "last minute:", "handshake (after sleep)", "the server answers again",
+	"light traffic:", "busy: back to",
 }
 
 func eventLevel(msg string) int {

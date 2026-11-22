@@ -114,6 +114,9 @@ func (p *pacer) loop() {
 		for _, it := range out {
 			if err := it.s.Write(it.b); err == nil {
 				p.b.tx.Add(1)
+				if !it.dup {
+					p.b.bytes.Add(uint64(len(it.b)))
+				}
 			} else if !it.dup {
 				it.s.Close()
 				_ = p.b.sendAny(p.b.list(), it.b, it.s)

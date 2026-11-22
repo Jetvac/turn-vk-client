@@ -38,6 +38,9 @@ type bind struct {
 	dropped atomic.Uint64
 	rx      atomic.Uint64
 	tx      atomic.Uint64
+	// bytes: the tunnel's packets both ways, copies aside (routes on
+	// demand, idle.go).
+	bytes atomic.Uint64
 
 	// quiet: the engine's idle mode (nil without one): a packet sent
 	// while idle brings the routes' next ping burst forward.
@@ -111,6 +114,7 @@ func (b *bind) has(s *session.Session) bool {
 // the bind afterwards.
 func (b *bind) deliver(pkt []byte) {
 	b.rx.Add(1)
+	b.bytes.Add(uint64(len(pkt)))
 	select {
 	case b.recv <- pkt:
 	default:
@@ -211,6 +215,7 @@ func (b *bind) Send(bufs [][]byte, _ conn.Endpoint) error {
 	for i, p := range bufs {
 		if s := plan[i]; s != nil && s.Write(p) == nil {
 			b.tx.Add(1)
+			b.bytes.Add(uint64(len(p)))
 			continue
 		} else if s != nil {
 			s.Close()
@@ -249,6 +254,7 @@ func (b *bind) sendAny(list []*session.Session, p []byte, skip *session.Session)
 		}
 		if err := s.Write(p); err == nil {
 			b.tx.Add(1)
+			b.bytes.Add(uint64(len(p)))
 			return nil
 		}
 		s.Close()

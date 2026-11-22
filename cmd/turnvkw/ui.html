@@ -510,6 +510,10 @@ select { font: inherit; color: var(--text); background: var(--card2); border: 1p
         <div class="hint">Больше маршрутов — выше скорость, но дольше подключение и больше гостей VK.</div>
         <div class="slider"><input type="range" id="sessions" min="4" max="64" step="4"><b id="sessVal">32</b></div>
       </div>
+      <div class="opt">
+        <div class="grow"><div class="lbl">Все маршруты сразу</div><div class="hint">Пока трафика мало, TurnVK держит открытыми 12 маршрутов, остальные открываются за пару секунд, когда начинается загрузка. Включите, чтобы все маршруты были открыты всегда: загрузки сразу на полной скорости, но VK видит больше выделений и чаще ограничивает</div></div>
+        <label class="switch"><input type="checkbox" id="allroutes"><i></i></label>
+      </div>
       <div class="opt" style="display:block">
         <div class="lbl">Маскировка трафика</div>
         <div class="hint">Под какой звонок VK оформлены пакеты.</div>
@@ -721,7 +725,8 @@ window.onView = function (v) {
       last = { t: now, rx: s.rx_bytes, tx: s.tx_bytes };
       drawChart();
     } else if (!last || s.rx_bytes < last.rx) last = { t: now, rx: s.rx_bytes, tx: s.tx_bytes };
-    $('routes').textContent = s.sessions + ' из ' + s.target;
+    $('routes').textContent = s.light ? s.sessions + ' · по нагрузке' : s.sessions + ' из ' + s.target;
+    $('routes').title = s.light ? 'Трафика мало: ещё ' + (s.target - s.sessions) + ' маршрутов откроются, когда начнётся загрузка' : '';
     $('ping').textContent = s.rtt_ms ? s.rtt_ms + ' мс' : '—';
     $('traffic').textContent = '↓ ' + size(s.rx_bytes) + '  ↑ ' + size(s.tx_bytes);
     $('addr').textContent = s.address || 'определяется…';
@@ -737,6 +742,7 @@ window.onView = function (v) {
   $('autoconn').checked = v.settings.connect_on_start;
   $('autostart').checked = v.settings.autostart;
   $('srvstats').checked = !v.settings.no_stats;
+  $('allroutes').checked = !!v.settings.all_routes;
   $('totray').checked = !v.settings.close_quits;
   $('ver').textContent = v.version; $('dev').textContent = v.device;
 };
@@ -846,6 +852,7 @@ document.querySelectorAll('#obfs button').forEach(b => b.onclick = () => {
 });
 $('autoconn').onchange = sendOptions;
 $('srvstats').onchange = () => tvkSetStats($('srvstats').checked);
+$('allroutes').onchange = () => tvkSetAllRoutes($('allroutes').checked);
 $('totray').onchange = () => tvkSetCloseQuits(!$('totray').checked);
 $('autostart').onchange = async () => {
   try { await tvkSetAutostart($('autostart').checked); }

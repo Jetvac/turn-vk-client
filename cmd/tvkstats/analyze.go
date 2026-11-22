@@ -16,7 +16,8 @@ const (
 // routine: events of the normal course of things (as core/engine/events.go).
 var routine = []string{
 	"idle: ", "traffic again", "TURN credentials", "answer a probe", "joining as new guest",
-	"moves to guest", "ping test:",
+	"moves to guest", "ping test:", "handshake (after sleep)", "the server answers again",
+	"light traffic:", "busy: back to",
 }
 
 func isRoutine(msg string) bool {
@@ -25,7 +26,15 @@ func isRoutine(msg string) bool {
 			return true
 		}
 	}
-	return false
+	return idleHandshake(msg)
+}
+
+// idleHandshake: the line clients up to 0.9.2 logged whenever WireGuard had
+// not re-keyed for four minutes, which an idle tunnel never does (a phone
+// asleep overnight logged it every few minutes, for no fault). Newer ones
+// log it only "while sending", and then it is trouble.
+func idleHandshake(msg string) bool {
+	return strings.HasPrefix(msg, "WireGuard: no handshake for") && strings.Contains(msg, "the server stopped answering")
 }
 
 func isMark(msg string) bool { return strings.HasPrefix(msg, "user mark:") }
@@ -33,10 +42,13 @@ func isMark(msg string) bool { return strings.HasPrefix(msg, "user mark:") }
 // trouble: events that mean the connection had a problem.
 var trouble = []string{
 	"re-keying", "reconnecting", "stopped answering", "silent for", "loses ", "no network",
-	"stopped:", "failed", "no answer", "without a connection",
+	"stopped:", "failed", "no answer", "without a connection", "does not answer",
 }
 
 func isTrouble(msg string) bool {
+	if idleHandshake(msg) {
+		return false
+	}
 	for _, s := range trouble {
 		if strings.Contains(msg, s) {
 			return true
@@ -57,6 +69,7 @@ type agg struct {
 	p95         float64
 	lost, pk    uint64
 	quiet       uint64
+	light       uint64 // seconds on the light tier (routes on demand)
 	slept       bool
 	reconnects  uint64
 	fresh, want int // the worst minute's routes answering / wanted
@@ -98,6 +111,7 @@ func (g *agg) add(m *minute) {
 		}
 	}
 	g.quiet += m.Quiet
+	g.light += m.Light
 	g.slept = g.slept || m.Slept
 	g.reconnects += m.Reconnects
 	if m.State != "connected" {

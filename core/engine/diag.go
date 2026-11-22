@@ -47,10 +47,37 @@ const (
 	// noHandshake: with no answer to the handshake for this long after the
 	// tunnel came up, the log says so.
 	noHandshake = 15 * time.Second
-	// staleHandshake: WireGuard re-keys every two minutes; no handshake for
-	// this long means the server stopped answering.
+	// staleHandshake: WireGuard re-keys every two minutes while it sends; no
+	// handshake for this long, with staleSent bytes sent since anything came
+	// back, means the server stopped answering. An idle tunnel sends
+	// nothing and does not re-key: a phone asleep overnight logged "the
+	// server stopped answering" every few minutes, for no fault.
 	staleHandshake = 4 * time.Minute
+	staleSent      = 1024
 )
+
+// staleWatch follows WireGuard's handshakes for the log.
+type staleWatch struct {
+	rx, txMark uint64 // WireGuard's bytes in, and out when they last grew
+	stale      bool
+}
+
+// update takes WireGuard's counters and the handshake's age; it returns
+// a line for the log, or "".
+func (w *staleWatch) update(rx, tx uint64, age time.Duration) string {
+	if rx != w.rx || tx < w.txMark {
+		w.rx, w.txMark = rx, tx
+	}
+	switch {
+	case age > staleHandshake && !w.stale && tx-w.txMark >= staleSent:
+		w.stale = true
+		return fmt.Sprintf("WireGuard: no handshake for %s while sending: the server does not answer", age.Round(time.Second))
+	case age <= staleHandshake && w.stale:
+		w.stale = false
+		return "WireGuard: the server answers again"
+	}
+	return ""
+}
 
 type diagState struct {
 	mu        sync.Mutex
@@ -110,7 +137,8 @@ func (e *Engine) monitor() {
 	nextSample := start.Add(sampleEvery)
 	var minRx, minTx uint64
 	minutes := 0
-	warned, stale := false, false
+	warned := false
+	var stale staleWatch
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -141,12 +169,8 @@ func (e *Engine) monitor() {
 			e.logf("WireGuard: no answer to the handshake for %s; the routes are open but the server does not answer through them (server down, or it does not accept this device)", noHandshake)
 		}
 		if d.first != 0 && !hs.IsZero() {
-			if age := now.Sub(hs); age > staleHandshake && !stale {
-				stale = true
-				e.logf("WireGuard: no handshake for %s, the server stopped answering", age.Round(time.Second))
-			} else if age <= staleHandshake && stale {
-				stale = false
-				e.logf("WireGuard: the server answers again")
+			if line := stale.update(rx, tx, now.Sub(hs)); line != "" {
+				e.logf("%s", line)
 			}
 		}
 		if now.Before(nextSample) {

@@ -33,6 +33,8 @@ import org.json.JSONObject
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 
 /**
  * The VPN service: runs the Go engine (mobile.Mobile) and gives it the TUN
@@ -51,8 +53,10 @@ class TunnelService : VpnService(), mobile.Platform {
 
         private const val CHANNEL = "tunnel"
         private const val CHANNEL_CAPTCHA = "captcha"
+        private const val CHANNEL_UPDATE = "update"
         private const val NOTE_ID = 1
         private const val NOTE_CAPTCHA = 2
+        private const val NOTE_UPDATE = 3
 
         /** Packages whose traffic never enters the tunnel. */
         val BYPASS = listOf("com.vkontakte.android", "com.vk.calls")
@@ -80,6 +84,7 @@ class TunnelService : VpnService(), mobile.Platform {
     }
 
     private val worker = Executors.newSingleThreadExecutor()
+    private var updates: ScheduledExecutorService? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     /** The physical network the routes open on (never the VPN itself). */
     @Volatile private var underlying: Network? = null
@@ -149,6 +154,7 @@ class TunnelService : VpnService(), mobile.Platform {
             TunnelState.setPower(power)
             mobile.Mobile.start(profile.link, deviceId, sessions.toLong(), store.obfs, this)
             watchNetwork()
+            watchUpdates()
         } catch (e: Exception) {
             fail(e.message ?: e.toString())
         }
@@ -164,6 +170,7 @@ class TunnelService : VpnService(), mobile.Platform {
     private fun stopTunnel() {
         stopped = true
         unwatchNetwork()
+        unwatchUpdates()
         releaseWifi()
         worker.execute {
             mobile.Mobile.stop()
@@ -186,6 +193,7 @@ class TunnelService : VpnService(), mobile.Platform {
     override fun onDestroy() {
         stopped = true
         unwatchNetwork()
+        unwatchUpdates()
         releaseWifi()
         mobile.Mobile.stop()
         super.onDestroy()
@@ -572,6 +580,50 @@ class TunnelService : VpnService(), mobile.Platform {
                 description = "Когда VK просит подтвердить, что вы не робот"
                 enableVibration(true)
             }
+        )
+        nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_UPDATE, "Обновления", NotificationManager.IMPORTANCE_DEFAULT).apply {
+                description = "Когда вышла новая версия TurnVK"
+            }
+        )
+    }
+
+    // --- updates ---
+
+    /**
+     * While the tunnel runs, asks GitHub for a new version now and then
+     * (Updater.checkInBackground: at most every 12 hours) and tells the user
+     * once per version.
+     */
+    @Synchronized
+    private fun watchUpdates() {
+        if (updates != null) return
+        updates = Executors.newSingleThreadScheduledExecutor().also {
+            it.scheduleWithFixedDelay({ runCatching { checkUpdate() } }, 2, 60, TimeUnit.MINUTES)
+        }
+    }
+
+    @Synchronized
+    private fun unwatchUpdates() {
+        updates?.shutdownNow()
+        updates = null
+    }
+
+    private fun checkUpdate() {
+        val a = Updater.checkInBackground(this) ?: return
+        if (a.version.isEmpty() || store.updateNotified == a.version) return
+        store.updateNotified = a.version
+        log("доступна версия ${a.version}")
+        val open = PendingIntent.getActivity(this, 4, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        notify(
+            NOTE_UPDATE,
+            noteBuilder(CHANNEL_UPDATE)
+                .setSmallIcon(R.drawable.ic_stat_vpn)
+                .setContentTitle("Доступна TurnVK ${a.version}")
+                .setContentText("Нажмите, чтобы обновить. Настройки и серверы сохранятся.")
+                .setContentIntent(open)
+                .setAutoCancel(true)
+                .build(),
         )
     }
 

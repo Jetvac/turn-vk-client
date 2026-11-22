@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"time"
 
@@ -39,6 +40,24 @@ const (
 	// may land on a relay far slower than the others).
 	relaySlowRatio = 2.0
 	relaySlowExtra = 50 * time.Millisecond
+
+	// Reliability: on some relays routes die far more often than on
+	// others that lose no more packets (the stats: one VK relay killed
+	// twice the routes per hour of another and stopped relaying twelve
+	// times as often). New routes lean to the more reliable relay in
+	// proportion: a relay weighs 1/(routes died per route-hour +
+	// relayRateFloor), one little seen counting as relayPriorRate over
+	// relayPriorHours, and what is known fades by half every relayMemory.
+	// The choice changes only when the weights are relayPreferRatio
+	// apart; the weaker relay keeps its weighted share of the routes.
+	relayMemory      = time.Hour
+	relayPriorRate   = 0.2
+	relayPriorHours  = 2.0
+	relayRateFloor   = 0.1
+	relayPreferRatio = 1.25
+	relayNoteEvery   = 10 * time.Minute
+	// relayTickMax: a longer gap between ticks is a sleep, no route time.
+	relayTickMax = 5 * time.Second
 )
 
 type relayStat struct {
@@ -51,18 +70,69 @@ type relayStat struct {
 	rttWindows int
 	rttSum     time.Duration
 	rttN       int
+	// drops: routes through the relay that died (went silent, missed
+	// probes, never came up); routeSec: seconds of route time on it. Both
+	// fade with relayMemory.
+	drops    float64
+	routeSec float64
 }
+
+// rate: routes died per route-hour, a relay little seen counting as
+// relayPriorRate (nil: unknown).
+func (st *relayStat) rate() float64 {
+	if st == nil {
+		return relayPriorRate
+	}
+	return (st.drops + relayPriorRate*relayPriorHours) / (st.routeSec/3600 + relayPriorHours)
+}
+
+// weight: how far new routes trust the relay.
+func (st *relayStat) weight() float64 { return 1 / (st.rate() + relayRateFloor) }
 
 type relays struct {
 	mu    sync.Mutex
 	stats map[string]*relayStat
 	prev  map[*session.Session][2]uint64 // counters at the last tick
 	start time.Time
+	last  time.Time            // the last tick (route time, fading)
 	down  map[string]time.Time // relays that failed a new route, until
 	// seed: each relay's round trip measured directly (STUN, relayprobe.go)
 	// and when; it judges relays until routes on two of them measure
 	// their own.
 	seed map[string]seedRTT
+	// note: a line for the log when new routes start leaning to another
+	// relay (takeNote); notedAt: when one was last made.
+	note    string
+	notedAt time.Time
+}
+
+// stat returns server's stat, created. Called with r.mu held.
+func (r *relays) stat(server string) *relayStat {
+	if r.stats == nil {
+		r.stats = map[string]*relayStat{}
+	}
+	st := r.stats[server]
+	if st == nil {
+		st = &relayStat{}
+		r.stats[server] = st
+	}
+	return st
+}
+
+// noteDrop records a route through server that died.
+func (r *relays) noteDrop(server string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stat(server).drops++
+}
+
+// takeNote returns the line about the relays new routes lean to, once.
+func (r *relays) takeNote() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := r.note
+	r.note = ""
+	return n
 }
 
 type seedRTT struct {
@@ -86,9 +156,24 @@ func (r *relays) failed(server string, now time.Time) {
 func (r *relays) tick(list []*session.Session, now time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.stats == nil {
-		r.stats, r.prev, r.start = map[string]*relayStat{}, map[*session.Session][2]uint64{}, now
+	if r.prev == nil {
+		r.prev, r.start = map[*session.Session][2]uint64{}, now
 	}
+	// Route time, and what is known fading with time (a sleep counts no
+	// route time, but fades it).
+	var dt time.Duration
+	if !r.last.IsZero() {
+		dt = now.Sub(r.last)
+	}
+	r.last = now
+	if dt > 0 {
+		f := math.Exp2(-float64(dt) / float64(relayMemory))
+		for _, st := range r.stats {
+			st.drops *= f
+			st.routeSec *= f
+		}
+	}
+	accrue := dt > 0 && dt <= relayTickMax
 	seen := make(map[*session.Session]bool, len(list))
 	for _, s := range list {
 		if !s.Direct() {
@@ -98,10 +183,9 @@ func (r *relays) tick(list []*session.Session, now time.Time) bool {
 		rx, lost := s.RxPackets.Load(), s.RxLost.Load()
 		p := r.prev[s]
 		r.prev[s] = [2]uint64{rx, lost}
-		st := r.stats[s.Server]
-		if st == nil {
-			st = &relayStat{}
-			r.stats[s.Server] = st
+		st := r.stat(s.Server)
+		if accrue {
+			st.routeSec += dt.Seconds()
 		}
 		if rx >= p[0] && lost >= p[1] {
 			st.rx += rx - p[0]
@@ -273,8 +357,8 @@ func (r *relays) why(server string) string {
 }
 
 // pick chooses the relay for a new route: the usual rotation, unless that
-// relay is worse than another or failed lately; then the good relay with
-// the fewest routes.
+// relay is worse than another or failed lately (then the good relay with
+// the fewest routes), or another is clearly more reliable (prefer).
 func (r *relays) pick(servers []string, def string, list []*session.Session) string {
 	if len(servers) < 2 {
 		return def
@@ -293,11 +377,8 @@ func (r *relays) pick(servers []string, def string, list []*session.Session) str
 		}
 	}
 	r.mu.Unlock()
-	if len(bad) == 0 {
-		return def
-	}
 	if _, isBad := bad[def]; !isBad {
-		return def
+		return r.prefer(servers, def, list, bad, now)
 	}
 	count := map[string]int{}
 	for _, s := range list {
@@ -314,6 +395,50 @@ func (r *relays) pick(servers []string, def string, list []*session.Session) str
 	}
 	if best == "" {
 		return def
+	}
+	return best
+}
+
+// prefer chooses among the relays VK offers (bad ones aside) by how
+// reliable they are: def keeps the new route unless another is clearly
+// more reliable and def already carries its share of the routes on them,
+// weighted by reliability (relayKeep at least). Routes are not moved for
+// it: those on the weaker relay are replaced elsewhere as they die.
+func (r *relays) prefer(servers []string, def string, list []*session.Session, bad map[string]float64, now time.Time) string {
+	count := map[string]int{}
+	for _, s := range list {
+		count[s.Server]++
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	w := map[string]float64{}
+	sum, n := 0.0, 0
+	best := ""
+	for _, sv := range servers {
+		if _, isBad := bad[sv]; isBad {
+			continue
+		}
+		if _, seen := w[sv]; seen {
+			continue
+		}
+		w[sv] = r.stats[sv].weight()
+		sum += w[sv]
+		n += count[sv]
+		if best == "" || w[sv] > w[best] {
+			best = sv
+		}
+	}
+	wd, ok := w[def]
+	if !ok || best == def || w[best] < relayPreferRatio*wd {
+		return def
+	}
+	if count[def] < relayKeep || float64(count[def]) < wd/sum*float64(n+1) {
+		return def
+	}
+	if now.Sub(r.notedAt) >= relayNoteEvery {
+		r.notedAt = now
+		r.note = fmt.Sprintf("new routes lean to TURN server %s: routes die %.2f times per route-hour on %s, %.2f on it",
+			best, r.stats[def].rate(), def, r.stats[best].rate())
 	}
 	return best
 }

@@ -148,10 +148,16 @@ func (s *Session) touch(now int64) {
 // probe pings the path now; Fresh turns false if no answer comes within
 // probeWait.
 func (s *Session) probe() {
+	s.markProbe()
+	_ = s.ping()
+}
+
+// markProbe notes a probe going out, unless an earlier one is still
+// unanswered (Fresh counts from that one).
+func (s *Session) markProbe() {
 	if s.probeAt.Load() <= s.LastRx.Load() {
 		s.probeAt.Store(time.Now().UnixNano())
 	}
-	_ = s.ping()
 }
 
 // bye tells the server the path is closing, so it stops using it at once.

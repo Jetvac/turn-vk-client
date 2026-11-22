@@ -73,6 +73,7 @@ type minute struct {
 	Slept      bool      `json:"slept"`
 	Gap        int       `json:"gap"`
 	Quiet      uint64    `json:"quiet"`
+	Light      uint64    `json:"light"`
 	Ping       *lat      `json:"ping"`
 	Net        *netState `json:"net"`
 

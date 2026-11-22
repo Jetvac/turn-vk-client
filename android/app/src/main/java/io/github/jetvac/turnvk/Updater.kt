@@ -55,6 +55,28 @@ object Updater {
         }
     }
 
+    /** How often the tunnel service asks GitHub in the background. */
+    private const val BACKGROUND_EVERY = 12 * 3600_000L
+
+    /**
+     * From the tunnel service, on a worker thread: asks GitHub at most every
+     * [BACKGROUND_EVERY] (kept across restarts; a failed try is repeated at
+     * the next call) and returns the newer version, if any. A phone whose
+     * owner never opens the app otherwise never hears of one: the stats
+     * showed phones two versions behind, with bugs long fixed.
+     */
+    fun checkInBackground(ctx: Context): Available? {
+        val store = Store(ctx)
+        val now = System.currentTimeMillis()
+        if (now - store.updateCheckedAt < BACKGROUND_EVERY) return _available.value
+        val json = runCatching { mobile.Mobile.checkUpdate(BuildConfig.VERSION_NAME) }.getOrNull() ?: return null
+        store.updateCheckedAt = now
+        lastCheck = now
+        val a = if (json.isEmpty()) null else Available(JSONObject(json).optString("version"), json)
+        _available.value = a
+        return a
+    }
+
     /** Downloads the new version and opens the installer. */
     suspend fun install(ctx: Context) {
         val a = _available.value ?: return

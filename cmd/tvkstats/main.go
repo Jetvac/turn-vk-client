@@ -222,7 +222,9 @@ func show(w io.Writer, a *archive, d *device, from, to time.Time, every time.Dur
 			g.add(m)
 		}
 		bev := between(evs, t, end)
-		if g.n == 0 {
+		// A dozing phone reports no minutes, but its events count: a stall
+		// on waking is judged on them alone.
+		if g.n == 0 && !anyTrouble(bev) {
 			if why := gapReason(d, t, end); why != "" {
 				fmt.Fprintf(w, "%-11s %s\n", stamp(t, tz), why)
 			}
@@ -293,13 +295,29 @@ func show(w io.Writer, a *archive, d *device, from, to time.Time, every time.Dur
 	}
 }
 
+// anyTrouble: some event among evs means the connection had a problem.
+func anyTrouble(evs []*event) bool {
+	for _, e := range evs {
+		if isTrouble(e.M) {
+			return true
+		}
+	}
+	return false
+}
+
 func row(when string, g *agg, o others, evs []*event, v string) string {
 	state := "connected"
 	if g.notUp > 0 {
 		state = "down " + strconv.Itoa(g.notUp) + "m"
 	}
+	if g.light >= uint64(30*g.n) {
+		state = "light"
+	}
 	if g.quiet >= uint64(30*g.n) {
 		state = "idle"
+	}
+	if g.n == 0 {
+		state = "asleep"
 	}
 	if g.slept {
 		state += " zz"

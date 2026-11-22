@@ -112,8 +112,10 @@ type statsMinute struct {
 	// LowLat: seconds the upload pacer kept queues short for interactive
 	// traffic (games, calls).
 	LowLat uint64 `json:"low_lat,omitempty"`
-	// Quiet: seconds in idle mode (idle.go).
+	// Quiet: seconds in idle mode; Light: seconds on the light tier of
+	// routes on demand (idle.go).
 	Quiet uint64 `json:"quiet,omitempty"`
+	Light uint64 `json:"light,omitempty"`
 	// Battery: times the device woke from sleep, CPU time the app used
 	// (ms), and the battery and power state at the end (Config.Device).
 	Wakes uint64       `json:"wakes,omitempty"`
@@ -161,7 +163,7 @@ func (e *Engine) statsLoop() {
 	var prevRx, prevTx, prevLost, prevPk, prevRec uint64
 	prevQDrop, prevRxDrop, prevGaps := e.b.pacer.dropped.Load(), e.b.dropped.Load(), e.b.gaps()
 	prevLowLat := e.b.pacer.inter.Secs.Load()
-	prevQuiet := e.idle.secs.Load()
+	prevQuiet, prevLight := e.idle.secs.Load(), e.idle.lightSecs.Load()
 	prevWakes, prevCPU := e.wakes.Load(), processCPU()
 	prevNetChg := e.netChg.Load()
 	var prevDirErr uint64
@@ -280,8 +282,9 @@ func (e *Engine) statsLoop() {
 		prevQDrop, prevRxDrop, prevGaps = qd, rd, gp
 		ll := e.b.pacer.inter.Secs.Load()
 		m.LowLat, prevLowLat = sub0(ll, prevLowLat), ll
-		qs := e.idle.secs.Load()
+		qs, ls := e.idle.secs.Load(), e.idle.lightSecs.Load()
 		m.Quiet, prevQuiet = sub0(qs, prevQuiet), qs
+		m.Light, prevLight = sub0(ls, prevLight), ls
 		wk, cpu := e.wakes.Load(), processCPU()
 		m.Wakes, prevWakes = sub0(wk, prevWakes), wk
 		m.CPU, prevCPU = int64(max(0, cpu-prevCPU)/time.Millisecond), cpu

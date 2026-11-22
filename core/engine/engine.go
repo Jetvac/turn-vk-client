@@ -12,6 +12,8 @@ import (
 	mrand "math/rand/v2"
 	"net"
 	"net/http"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,6 +58,9 @@ type Config struct {
 	// together, so that the radio can sleep; PowerSaver idles sooner, on
 	// fewer routes. PowerAlways and "" (desktops) never idle.
 	Power string
+	// AllRoutes keeps every route open all the time: no light tier
+	// (idle.go). PowerAlways does the same.
+	AllRoutes bool
 	// Device, when set, reports the battery and power state for the
 	// statistics (device.go); called once a minute.
 	Device func() *DeviceState
@@ -102,6 +107,9 @@ type Status struct {
 	Protocol string `json:"protocol,omitempty"`
 	// Quiet: the tunnel is idle and keeps a few routes (idle.go).
 	Quiet bool `json:"quiet,omitempty"`
+	// Light: the tunnel carries little and keeps the light tier's routes;
+	// the rest come back when it gets busy (idle.go).
+	Light bool `json:"light,omitempty"`
 	RTT   int  `json:"rtt_ms,omitempty"` // average over the paths
 	// Captcha: VK is waiting for the user to pass its check. The state
 	// shows it only while there is no working session; a connection
@@ -246,6 +254,8 @@ type Engine struct {
 	// massSilentLog: when "many routes silent" was last logged.
 	wokeAt        atomic.Int64
 	massSilentLog atomic.Int64
+	// wakeRekeyAt: when keys were last renewed after a sleep (unix ns).
+	wakeRekeyAt atomic.Int64
 
 	// target: how many routes the engine keeps now (cfg.Sessions, less
 	// while VK refuses allocations); quotaAt/targetAt: when error 486
@@ -314,6 +324,53 @@ func (e *Engine) rehandshake(why string) {
 			}
 		}
 	}()
+}
+
+// WireGuard renews its keys only as it sends, and keys older than
+// wgRekeyAge carry nothing (younger ones still do, and are renewed in the
+// background). So a phone that slept wakes with dead keys, and the first
+// packets after the wake wait for a handshake that may need tries of its
+// own: stalls of 9 s and more in the stats. After such a sleep the engine
+// renews them as soon as a route answers, at most every wakeRekeyEvery (a
+// dozing phone wakes every half minute).
+const (
+	wgRekeyAge     = 3 * time.Minute // WireGuard's REJECT_AFTER_TIME
+	wakeRekeyEvery = 5 * time.Minute
+)
+
+// rekeyAfterSleep: the device woke (wall clock, unix ns).
+func (e *Engine) rekeyAfterSleep(list []*session.Session, woke int64) {
+	_, _, hs, ok := e.wgStats()
+	if !ok || !e.wakeRekeyDue(len(list), hs, woke) {
+		return
+	}
+	go e.whenAnswered(list, woke, wakeGrace, func() { e.rehandshake("after sleep") })
+}
+
+// wakeRekeyDue: a wake with routes, WireGuard's last handshake older than
+// wgRekeyAge, and no such renewal for wakeRekeyEvery (it counts as done).
+func (e *Engine) wakeRekeyDue(routes int, hs time.Time, woke int64) bool {
+	if routes == 0 || hs.IsZero() || time.Unix(0, woke).Sub(hs) < wgRekeyAge {
+		return false
+	}
+	last := e.wakeRekeyAt.Load()
+	return woke-last >= int64(wakeRekeyEvery) && e.wakeRekeyAt.CompareAndSwap(last, woke)
+}
+
+// whenAnswered runs f once a route has answered since woke, if one does
+// within the time given.
+func (e *Engine) whenAnswered(list []*session.Session, woke int64, within time.Duration, f func()) {
+	for waited := time.Duration(0); waited < within; waited += 100 * time.Millisecond {
+		if !sleep(e.ctx, 100*time.Millisecond) {
+			return
+		}
+		for _, s := range list {
+			if s.LastRx.Load() > woke {
+				f()
+				return
+			}
+		}
+	}
 }
 
 // hashState is one VK call. Its sessions are split into groups of
@@ -506,6 +563,11 @@ func (e *Engine) start(ctx context.Context, mk TunFactory) error {
 	}
 	e.logf("connected: address %s, MTU %d, %d VK call(s), %d sessions, %s protocol", e.wg.Address, e.wg.MTU, len(e.hashes), e.cfg.Sessions, e.protocol())
 
+	// The light tier from the start: more routes open when traffic needs
+	// them (idle.go).
+	if k := e.lightKeep(); k > 0 {
+		e.idle.cap.Store(int32(k))
+	}
 	e.workers.Add(e.cfg.Sessions)
 	go e.worker(0, first)
 	for i := 1; i < e.cfg.Sessions; i++ {
@@ -693,6 +755,9 @@ func (e *Engine) dial(ctx context.Context, i, shift int) (*session.Session, erro
 		server = creds.Servers[(i/len(e.hashes)+shift)%len(creds.Servers)]
 		if !e.cfg.NoRelayScoring && shift == 0 {
 			server = e.relays.pick(creds.Servers, server, e.b.list())
+			if line := e.relays.takeNote(); line != "" {
+				e.logf("%s", line)
+			}
 		}
 	}
 	mode := e.mode.Load()
@@ -750,6 +815,7 @@ func (e *Engine) dial(ctx context.Context, i, shift int) (*session.Session, erro
 		// The TURN server did not allocate, or the route never came up.
 		if e.cfg.TURNServer == "" {
 			e.relays.failed(server, time.Now())
+			e.relays.noteDrop(server)
 		}
 	}
 	return s, err
@@ -1102,10 +1168,12 @@ func (e *Engine) watchdog() {
 				for _, s := range list {
 					go s.Probe()
 				}
+				e.rekeyAfterSleep(list, wall)
 			}
 			lastTick = wall
 			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
 			e.idle.prevPk = e.b.rx.Load() + e.b.tx.Load()
+			e.idle.prevBytes = e.b.bytes.Load()
 			e.idle.busyRun = 0 // seconds apart are no run
 			continue
 		} else {
@@ -1114,6 +1182,7 @@ func (e *Engine) watchdog() {
 		e.replaceSilentPaths(list)
 		now := time.Now()
 		e.idleTick(now, list)
+		e.demandTick(now, list)
 		e.raiseTarget(now)
 		if len(list) > 0 {
 			for _, hs := range e.hashes {
@@ -1248,6 +1317,7 @@ func (e *Engine) replaceSilentPaths(list []*session.Session) {
 		n := 0
 		for _, s := range cands {
 			if down[s.Server] {
+				e.relays.noteDrop(s.Server)
 				s.Close()
 				n++
 			} else {
@@ -1261,6 +1331,7 @@ func (e *Engine) replaceSilentPaths(list []*session.Session) {
 	}
 	for _, s := range cands {
 		e.logf("route %d (%s) silent for %s, replacing it", s.ID, s.Server, s.Silent(now).Round(time.Second))
+		e.relays.noteDrop(s.Server)
 		s.Close()
 	}
 }
@@ -1278,9 +1349,17 @@ func answeredAfter(list []*session.Session, sv string, last int64) int {
 	return n
 }
 
-// replaceDeadPaths probes every path and closes those that do not answer
-// (their workers open new ones). If none answers, the server is likely
-// gone or restarted: WireGuard re-keys once paths are back.
+// deadProbeWait: how long the paths have to answer a probe of
+// replaceDeadPaths (a variable for tests).
+var deadProbeWait = 2500 * time.Millisecond
+
+// replaceDeadPaths probes every path and replaces those that do not
+// answer (their workers open new ones). A path is dead only when it misses
+// two probes in a row: one lost ping or answer is no dead route, and every
+// route replaced costs a VK allocation (the stats showed a PC replacing
+// one or two healthy routes every couple of minutes while it sent next to
+// nothing). If none answers, the server is likely gone or restarted:
+// WireGuard re-keys once paths are back.
 func (e *Engine) replaceDeadPaths(reason string, silent time.Duration, list []*session.Session) {
 	defer e.probing.Store(false)
 	// No network: nothing would answer, and nothing new could open.
@@ -1288,33 +1367,109 @@ func (e *Engine) replaceDeadPaths(reason string, silent time.Duration, list []*s
 		e.holdRoutes(now)
 		return
 	}
-	for _, s := range list {
-		s.Probe()
-	}
-	if !sleep(e.ctx, 2500*time.Millisecond) {
-		return
+	dead := list
+	for round := 0; round < 2 && len(dead) > 0; round++ {
+		for _, s := range dead {
+			s.Probe()
+		}
+		if !sleep(e.ctx, deadProbeWait) {
+			return
+		}
+		now := time.Now()
+		var still []*session.Session
+		for _, s := range dead {
+			if !s.Closed() && !s.Fresh(now) {
+				still = append(still, s)
+			}
+		}
+		dead = still
 	}
 	now := time.Now()
-	dead := 0
+	alive := 0
 	for _, s := range list {
-		if !s.Fresh(now) {
-			s.Close()
-			dead++
+		if !s.Closed() && s.Fresh(now) {
+			alive++
 		}
 	}
 	switch {
-	case dead == 0:
+	case len(dead) == 0:
 		// Every path answers: the traffic itself may simply get no
 		// reply. Only a long silence suggests lost WireGuard keys.
 		if silent >= silentActive {
 			e.logf("%s; every path answers, re-keying", reason)
 			e.rehandshake("silent tunnel")
 		}
-	case dead == len(list):
+	case alive == 0:
+		for _, s := range dead {
+			s.Close()
+		}
 		e.noteError(fmt.Sprintf("%s; no path answers, reconnecting", reason))
 	default:
-		e.logf("%s; replacing %d of %d paths that stopped answering", reason, dead, len(list))
+		closed, note := e.closeDead(dead, list, now)
+		e.logf("%s; replacing %d of %d paths that stopped answering%s", reason, closed, len(list), note)
 	}
+}
+
+// closeDead closes paths that missed both probes while others answered,
+// and says where they were for the log. A TURN server all of whose routes
+// are among them stopped relaying: new routes avoid it. Of the rest at
+// most a quarter of the routes close now; the others are left to their
+// own pathDead, so that a mass of new allocations does not run into VK's
+// limit at once (the stats: ten replaced together met error 486 and left
+// 24 routes for a quarter of an hour).
+func (e *Engine) closeDead(dead, list []*session.Session, now time.Time) (int, string) {
+	total, silent := map[string]int{}, map[string]int{}
+	for _, s := range list {
+		total[s.Server]++
+	}
+	for _, s := range dead {
+		silent[s.Server]++
+	}
+	down := map[string]bool{}
+	for sv, n := range silent {
+		if n == total[sv] && n >= 2 && e.cfg.TURNServer == "" {
+			down[sv] = true
+			e.logf("TURN server %s stopped relaying, new routes avoid it for %s", sv, relayDownFor)
+			e.relays.failed(sv, now)
+		}
+	}
+	limit := max(2, len(list)/4)
+	closed, others := 0, 0
+	by := map[string]int{}
+	for _, s := range dead {
+		if !down[s.Server] {
+			if others >= limit {
+				continue
+			}
+			others++
+		}
+		e.relays.noteDrop(s.Server)
+		s.Close()
+		closed++
+		by[s.Server]++
+	}
+	note := serversNote(by)
+	if left := len(dead) - closed; left > 0 {
+		note += fmt.Sprintf("; %d more wait for their own timeout", left)
+	}
+	return closed, note
+}
+
+// serversNote lists TURN servers and how many routes each, for the log.
+func serversNote(by map[string]int) string {
+	if len(by) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(by))
+	for k := range by {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = fmt.Sprintf("%s ×%d", k, by[k])
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
 }
 
 // Stop disconnects and releases the tunnel.
@@ -1461,6 +1616,7 @@ func (e *Engine) Status() Status {
 	}
 	st.Protocol = e.protocol()
 	st.Quiet = e.quiet.On()
+	st.Light = e.light()
 	e.mu.Lock()
 	st.State, st.LastError, st.Since = e.state, e.lastErr, e.since.Unix()
 	e.mu.Unlock()

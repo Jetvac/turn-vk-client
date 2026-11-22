@@ -70,7 +70,9 @@ func TestIdleMode(t *testing.T) {
 	e.idleTick(at(quietCalm+session.QuietPing+3*time.Second), list[:quietRoutes])
 	e.b.tx.Add(quietBusy)
 	e.idleTick(at(quietCalm+session.QuietPing+4*time.Second), list[:quietRoutes])
-	if e.quiet.On() || e.limit() != 16 {
+	// Out of idle mode, the light tier's routes come back (routes on
+	// demand: every one only for heavy traffic).
+	if e.quiet.On() || e.limit() != lightRoutes || !e.Status().Light {
 		t.Fatalf("still idle after busy seconds: %v, limit %d", e.quiet.On(), e.limit())
 	}
 	select {
