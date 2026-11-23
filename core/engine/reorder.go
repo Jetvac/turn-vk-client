@@ -12,6 +12,13 @@ package engine
 // ReorderHold; then whatever is held goes on in order and the gap is
 // counted as lost. Late packets and duplicates pass at once (WireGuard
 // drops replays itself).
+//
+// On a lossy link most gaps are losses: waiting the whole hold for each
+// delays everything behind it for nothing (the stats: a phone on a lossy
+// evening link gave up on 50-360 gaps a minute, each after the full
+// hold). An adaptive Reorder (Adapt) measures how late the packets that do
+// fill gaps come, those that came after it gave up included, and holds
+// about as long as they need, between ReorderHoldMin and Hold.
 
 import (
 	"encoding/binary"
@@ -25,6 +32,21 @@ const (
 	reorderMax   = 512             // packets held per stream before giving up
 	reorderJump  = 4096            // a counter this far ahead starts afresh
 	reorderStale = 2 * time.Minute // streams unused this long are forgotten
+
+	// ReorderHoldMin: the shortest hold of an adaptive Reorder.
+	ReorderHoldMin = 2 * time.Millisecond
+	// reorderSamples: how late the latest gap-filling packets came, the
+	// adaptive hold goes by these.
+	reorderSamples = 256
+	// reorderTune: the hold is worked out again every so many events
+	// (gaps filled, given up on, or filled after that), once there were
+	// twice as many.
+	reorderTune = 16
+	// reorderMissed, reorderMissAge: counters given up on, remembered per
+	// stream this many and this long, to tell a late packet from a lost
+	// one.
+	reorderMissed  = 256
+	reorderMissAge = 200 * time.Millisecond
 )
 
 // WGData returns the receiver index and counter of a WireGuard transport
@@ -44,6 +66,9 @@ type Reorder[T any] struct {
 	// Waited, if set, gets how long each held item waited (called with
 	// the lock held: it must not block or call back).
 	Waited func(time.Duration)
+	// Adapt: the hold follows how late gap-filling packets come, between
+	// ReorderHoldMin and Hold (see above). Set before the first Push.
+	Adapt bool
 
 	mu      sync.Mutex
 	streams map[uint32]*reorderStream[T]
@@ -54,6 +79,14 @@ type Reorder[T any] struct {
 	pushes int
 
 	Held, Late, Gaps uint64 // counters, under mu
+
+	// The adaptive hold, under mu: the latest samples of how late a
+	// gap-filling packet came, the events since the start, the hold now
+	// (0: not worked out yet).
+	late   [reorderSamples]time.Duration
+	nLate  int
+	events int
+	cur    time.Duration
 }
 
 type reorderStream[T any] struct {
@@ -61,6 +94,10 @@ type reorderStream[T any] struct {
 	held  map[uint64]heldItem[T]
 	timer *time.Timer
 	used  time.Time
+	// since: when the timer started (the wait for the gap began);
+	// missed: counters given up on, and their since (adaptive hold).
+	since  time.Time
+	missed map[uint64]time.Time
 }
 
 // Push hands one item on, now or once the packets before it arrived.
@@ -87,14 +124,22 @@ func (r *Reorder[T]) Push(idx uint32, counter uint64, item T) {
 	s.used = now
 	switch {
 	case counter == s.next:
+		if r.Adapt && len(s.held) > 0 {
+			r.noteLate(now.Sub(s.since)) // a gap filled
+		}
 		out = append(out, item)
 		s.next++
 		out = s.drain(out, r.Waited, now)
 	case counter < s.next:
 		r.Late++
+		if t, ok := s.missed[counter]; ok && r.Adapt {
+			delete(s.missed, counter)
+			r.noteLate(now.Sub(t)) // came after the gap was given up on
+		}
 		out = append(out, item) // late or a duplicate: WireGuard decides
 	case counter-s.next > reorderJump || len(s.held) >= reorderMax:
 		// Far ahead, or too much held: give up on the gap.
+		r.giveUp(s, now)
 		out = s.flush(out, r.Waited, now)
 		r.Gaps++
 		out = append(out, item)
@@ -105,11 +150,8 @@ func (r *Reorder[T]) Push(idx uint32, counter uint64, item T) {
 			r.Held++
 		}
 		if s.timer == nil {
-			hold := r.Hold
-			if hold <= 0 {
-				hold = ReorderHold
-			}
-			s.timer = time.AfterFunc(hold, func() { r.expire(idx, s) })
+			s.since = now
+			s.timer = time.AfterFunc(r.hold(), func() { r.expire(idx, s) })
 		}
 	}
 	if len(s.held) == 0 && s.timer != nil {
@@ -130,9 +172,93 @@ func (r *Reorder[T]) expire(idx uint32, s *reorderStream[T]) {
 	var out []T
 	if len(s.held) > 0 {
 		r.Gaps++
-		out = s.flush(nil, r.Waited, time.Now())
+		now := time.Now()
+		r.giveUp(s, now)
+		out = s.flush(nil, r.Waited, now)
 	}
 	r.handOut(out)
+}
+
+// hold: how long a gap is waited for now. r.mu is held.
+func (r *Reorder[T]) hold() time.Duration {
+	h := r.Hold
+	if h <= 0 {
+		h = ReorderHold
+	}
+	if r.Adapt && r.cur > 0 && r.cur < h {
+		return r.cur
+	}
+	return h
+}
+
+// HoldNow: how long a gap is waited for now.
+func (r *Reorder[T]) HoldNow() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.hold()
+}
+
+// noteLate notes how late a gap-filling packet came. r.mu is held.
+func (r *Reorder[T]) noteLate(d time.Duration) {
+	r.late[r.nLate%reorderSamples] = d
+	r.nLate++
+	r.tune()
+}
+
+// giveUp notes the counters a flush of s skips, so that one coming later
+// counts as late rather than lost (adaptive hold). r.mu is held.
+func (r *Reorder[T]) giveUp(s *reorderStream[T], now time.Time) {
+	if !r.Adapt || len(s.held) == 0 {
+		return
+	}
+	if s.missed == nil {
+		s.missed = map[uint64]time.Time{}
+	}
+	if len(s.missed) >= reorderMissed/2 {
+		for c, t := range s.missed {
+			if now.Sub(t) > reorderMissAge {
+				delete(s.missed, c)
+			}
+		}
+	}
+	since := s.since
+	if since.IsZero() {
+		since = now
+	}
+	last := s.next
+	for k := range s.held {
+		last = max(last, k)
+	}
+	for c := s.next; c < last && len(s.missed) < reorderMissed; c++ {
+		if _, ok := s.held[c]; !ok {
+			s.missed[c] = since
+		}
+	}
+	r.tune()
+}
+
+// tune counts an event and, every reorderTune of them, works the hold out
+// again: about the 98th percentile of how late gap-filling packets came,
+// with a margin. Gaps given up on with none filling later were losses:
+// they bring the hold down to ReorderHoldMin. r.mu is held.
+func (r *Reorder[T]) tune() {
+	r.events++
+	if r.events%reorderTune != 0 || r.events < 2*reorderTune {
+		return
+	}
+	top := r.Hold
+	if top <= 0 {
+		top = ReorderHold
+	}
+	h := ReorderHoldMin
+	if n := min(r.nLate, reorderSamples); n > 0 {
+		s := make([]time.Duration, n)
+		copy(s, r.late[:n])
+		sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+		q := s[(n-1)*98/100]
+		h = max(h, q+q/4+500*time.Microsecond)
+	}
+	r.cur = min(h, top)
 }
 
 // handOut lets mu go and calls Out with each item, in order with the other

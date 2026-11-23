@@ -233,6 +233,20 @@ func (r *relays) tick(list []*session.Session, now time.Time) bool {
 	return true
 }
 
+// losses gives each relay's smoothed loss, for the choice of path per
+// packet (bind.setLoss).
+func (r *relays) losses() map[string]float64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := make(map[string]float64, len(r.stats))
+	for sv, st := range r.stats {
+		if st.windows > 0 {
+			m[sv] = st.loss
+		}
+	}
+	return m
+}
+
 // bad lists the relays clearly worse than the best one: losing more
 // packets, or much slower. Loss is not judged when every relay loses
 // (the device's own link does).

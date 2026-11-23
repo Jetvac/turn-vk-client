@@ -38,6 +38,9 @@ type bind struct {
 	dropped atomic.Uint64
 	rx      atomic.Uint64
 	tx      atomic.Uint64
+	// asks: packets sent that the server answers (all but WireGuard's
+	// keepalives), for the watchdog's "sending, no answer" (keepalive).
+	asks atomic.Uint64
 	// bytes: the tunnel's packets both ways, copies aside (routes on
 	// demand, idle.go).
 	bytes atomic.Uint64
@@ -63,6 +66,7 @@ func newBind() *bind {
 	b.pacer = newPacer(b)
 	b.reorder.Out = b.deliver
 	b.reorder.Waited = b.holds.Add
+	b.reorder.Adapt = true
 	empty := []*session.Session{}
 	b.sessions.Store(&empty)
 	return b
@@ -214,8 +218,7 @@ func (b *bind) Send(bufs [][]byte, _ conn.Endpoint) error {
 	b.qmu.Unlock()
 	for i, p := range bufs {
 		if s := plan[i]; s != nil && s.Write(p) == nil {
-			b.tx.Add(1)
-			b.bytes.Add(uint64(len(p)))
+			b.sent(p, true)
 			continue
 		} else if s != nil {
 			s.Close()
@@ -225,6 +228,26 @@ func (b *bind) Send(bufs [][]byte, _ conn.Endpoint) error {
 		}
 	}
 	return nil
+}
+
+// wgKeepalive: the size of WireGuard's keepalive, a transport message with
+// no payload (16 bytes of header, 16 of tag). The server's WireGuard does
+// not answer it; every other packet gets an answer within its
+// KeepaliveTimeout (10 s): data a passive keepalive, a handshake its
+// response.
+const wgKeepalive = 32
+
+// sent counts one packet that went out (counted: false for a duplicate of
+// one already counted).
+func (b *bind) sent(p []byte, counted bool) {
+	b.tx.Add(1)
+	if !counted {
+		return
+	}
+	b.bytes.Add(uint64(len(p)))
+	if len(p) != wgKeepalive {
+		b.asks.Add(1)
+	}
 }
 
 // paced reports whether some session's server sends FEEDBACK, so that
@@ -253,8 +276,7 @@ func (b *bind) sendAny(list []*session.Session, p []byte, skip *session.Session)
 			continue
 		}
 		if err := s.Write(p); err == nil {
-			b.tx.Add(1)
-			b.bytes.Add(uint64(len(p)))
+			b.sent(p, true)
 			return nil
 		}
 		s.Close()
@@ -330,6 +352,8 @@ func (b *bind) queue(s *session.Session) *pathQueue {
 type pathQueue struct {
 	bytes float64
 	at    int64 // unix ns of the last update
+	// loss: the fraction of packets the path loses lately (setLoss).
+	loss float64
 }
 
 const (
@@ -338,6 +362,10 @@ const (
 	bulkRun      = 4         // bulk packets kept on one session in a row
 	stickSlack   = 0.025     // s: how much later a bulk packet may arrive to stay on its session
 	wireOverhead = 40        // RTP header, tag, TURN ChannelData
+	// lossCost: s a lost packet costs (a retransmission, a stutter): a
+	// path losing 5% looks 10 ms further away, so traffic leaves a relay
+	// that started losing within seconds, without new allocations.
+	lossCost = 0.2
 )
 
 func (q *pathQueue) backlog(now int64) float64 {
@@ -353,9 +381,34 @@ func (q *pathQueue) add(now int64, n int) {
 	q.at = now
 }
 
-// arrival estimates in seconds when a packet sent now gets through.
+// arrival estimates in seconds when a packet sent now gets through, the
+// cost of the path's losses included.
 func (q *pathQueue) arrival(now int64, rtt int64) float64 {
-	return q.backlog(now)/pathRate + float64(rtt)/2e9
+	return q.backlog(now)/pathRate + float64(rtt)/2e9 + q.loss*lossCost
+}
+
+// setLoss sets each path's recent loss for pick: the worse of what the
+// server reports it got of this path's packets (uplink) and what the
+// path's VK relay loses of the server's (downlink, relays.go). The stats:
+// a relay that lost 5% for half an hour got a full share of the traffic
+// while its routes moved away one by one, and ping spiked to 700 ms. When
+// every path loses alike (the device's own link) nothing changes.
+func (b *bind) setLoss(list []*session.Session, relay map[string]float64) {
+	loss := make([]float64, len(list))
+	for i, s := range list {
+		l := relay[s.Server]
+		if s.Pace.HasFeedback() {
+			if _, up, _ := s.Pace.State(); up > l {
+				l = up
+			}
+		}
+		loss[i] = min(l, 0.5)
+	}
+	b.qmu.Lock()
+	for i, s := range list {
+		b.queue(s).loss = loss[i]
+	}
+	b.qmu.Unlock()
 }
 
 // endpoint is the only peer address: the server, reached through sessions.

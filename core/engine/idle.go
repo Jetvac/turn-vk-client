@@ -54,6 +54,11 @@ const (
 	heavySecs   = 3
 	lightRate   = 1_500_000 / 8
 	lightCalm   = 10 * time.Minute
+	// lightCalmPC: lightCalm without a power mode (a computer). The
+	// stats: computers left the light tier about every two hours, each
+	// time asking VK for some 20 allocations (VK credentials 0.26 → 1.9 an
+	// hour, error 486 0.1 → 0.5), for little saved: they do not sleep.
+	lightCalmPC = 30 * time.Minute
 	// rateSmooth: the smoothed rate's time constant, seconds.
 	rateSmooth = 30
 )
@@ -122,6 +127,14 @@ func (e *Engine) lightKeep() int {
 	return n
 }
 
+// lightAfter: how long the traffic stays light before the light tier.
+func (e *Engine) lightAfter() time.Duration {
+	if e.cfg.Power == "" {
+		return lightCalmPC
+	}
+	return lightCalm
+}
+
 // light: the light tier holds the routes back now (not idle mode).
 func (e *Engine) light() bool {
 	k := e.lightKeep()
@@ -157,7 +170,10 @@ func (e *Engine) demandTick(now time.Time, list []*session.Session) {
 			e.logf("busy: back to %d routes", e.limit())
 			e.notify()
 		}
-	case c == 0 && now.Sub(e.idle.heavyAt) >= lightCalm && len(list) > 0 && e.State() == StateConnected:
+	case c == 0 && now.Sub(e.idle.heavyAt) >= e.lightAfter() && len(list) > 0 && e.State() == StateConnected:
+		if e.shrinkWait(list, keep, now) {
+			return
+		}
 		e.idle.cap.Store(int32(keep))
 		for _, s := range list {
 			if s.ID >= keep {
@@ -249,6 +265,9 @@ func (e *Engine) idleTick(now time.Time, list []*session.Session) {
 
 func (e *Engine) enterIdle(now time.Time, list []*session.Session) {
 	keep := e.idleKeep()
+	if e.shrinkWait(list, keep, now) {
+		return
+	}
 	e.idle.cap.Store(int32(keep))
 	if !e.quiet.Enter(now) {
 		return
@@ -260,6 +279,34 @@ func (e *Engine) enterIdle(now time.Time, list []*session.Session) {
 	}
 	e.logf("idle: %d of %d routes kept, they ping together every %s (saves battery)", min(keep, len(list)), len(list), session.QuietPing.Round(time.Second))
 	e.notify()
+}
+
+// shrinkWait tells whether closing the routes over keep (idle mode, the
+// light tier) has to wait: the routes kept are those of the first slots,
+// and closing now would keep a silent one while closing one that answers,
+// or pull routes from under a check of the paths (replaceDeadPaths). The
+// stats: a phone went idle in the second five of its twelve routes fell
+// silent, kept silent ones, and the check that followed found no route
+// answering and rebuilt the whole tunnel. A silent route is replaced or
+// answers within seconds; the next tick tries again.
+func (e *Engine) shrinkWait(list []*session.Session, keep int, now time.Time) bool {
+	if e.probing.Load() {
+		return true
+	}
+	keptSilent, closedAnswers := false, false
+	for _, s := range list {
+		if s.Closed() {
+			continue
+		}
+		fresh := s.Fresh(now)
+		if s.ID < keep && !fresh {
+			keptSilent = true
+		}
+		if s.ID >= keep && fresh {
+			closedAnswers = true
+		}
+	}
+	return keptSilent && closedAnswers
 }
 
 // leaveIdle: traffic again. The light tier's routes come back; every one

@@ -12,6 +12,7 @@ import (
 	mrand "math/rand/v2"
 	"net"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1140,7 +1141,7 @@ func (e *Engine) watchdog() {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	lastRx, rxAt := e.b.rx.Load(), time.Now()
-	txAtRx := e.b.tx.Load()
+	txAtRx := e.b.asks.Load()
 	lastTick := time.Now().UnixNano() // wall clock: it runs on while the device sleeps
 	e.idleStart(time.Now())
 	for {
@@ -1171,7 +1172,7 @@ func (e *Engine) watchdog() {
 				e.rekeyAfterSleep(list, wall)
 			}
 			lastTick = wall
-			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
+			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.asks.Load()
 			e.idle.prevPk = e.b.rx.Load() + e.b.tx.Load()
 			e.idle.prevBytes = e.b.bytes.Load()
 			e.idle.busyRun = 0 // seconds apart are no run
@@ -1189,7 +1190,9 @@ func (e *Engine) watchdog() {
 				hs.holdGuests(now)
 			}
 		}
-		if !e.cfg.NoRelayScoring && e.relays.tick(list, now) && e.mayMove(now) {
+		judged := !e.cfg.NoRelayScoring && e.relays.tick(list, now)
+		e.b.setLoss(list, e.relays.losses())
+		if judged && e.mayMove(now) {
 			if s := e.relays.moveOne(list); s != nil {
 				e.movedAt.Store(now.UnixNano())
 				e.logf("route %d: TURN server %s %s, moving the route to a better one", s.ID, s.Server, e.relays.why(s.Server))
@@ -1197,19 +1200,22 @@ func (e *Engine) watchdog() {
 			}
 		}
 		if rx := e.b.rx.Load(); rx != lastRx || len(list) == 0 {
-			lastRx, rxAt, txAtRx = rx, time.Now(), e.b.tx.Load()
+			lastRx, rxAt, txAtRx = rx, time.Now(), e.b.asks.Load()
 			continue
 		}
 		silent := time.Since(rxAt)
 		reason := ""
 		direct := e.mode.Load() == modeDirect
 		switch {
-		case direct && silent > silentProbe && e.b.tx.Load()-txAtRx >= 5:
+		case direct && silent > silentProbe && e.b.asks.Load()-txAtRx >= 5:
 			// Direct paths are probed, not dropped, so look early.
 			reason = fmt.Sprintf("no answer from the server for %s while sending", silent.Round(time.Second))
-		case silent > silentActive && e.b.tx.Load()-txAtRx >= 10:
+		case silent > silentActive && e.b.asks.Load()-txAtRx >= 10:
 			reason = fmt.Sprintf("no answer from the server for %s while sending", silent.Round(time.Second))
-		case silent > staleRx:
+		case silent > staleRx && (!direct || e.b.asks.Load() > txAtRx):
+			// A quiet direct tunnel gets nothing back: its paths' pings
+			// tell whether they live (replaceSilentPaths). Only something
+			// sent and unanswered calls for a check and new keys.
 			reason = "no data from the server for 3 minutes"
 		}
 		if reason == "" {
@@ -1221,19 +1227,19 @@ func (e *Engine) watchdog() {
 			if e.probing.CompareAndSwap(false, true) {
 				go e.replaceDeadPaths(reason, silent, list)
 			}
-			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
+			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.asks.Load()
 			continue
 		}
 		if e.netDown(now) {
 			e.holdRoutes(now)
-			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
+			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.asks.Load()
 			continue
 		}
 		e.noteError(reason + ", reconnecting all sessions")
 		for _, s := range list {
 			s.Close()
 		}
-		lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.tx.Load()
+		lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.asks.Load()
 	}
 }
 
@@ -1388,6 +1394,13 @@ func (e *Engine) replaceDeadPaths(reason string, silent time.Duration, list []*s
 	alive := 0
 	for _, s := range list {
 		if !s.Closed() && s.Fresh(now) {
+			alive++
+		}
+	}
+	// Routes opened during the check count too: a tunnel with one that
+	// answers is no tunnel to rebuild.
+	for _, s := range e.b.list() {
+		if !slices.Contains(list, s) && !s.Closed() && s.Fresh(now) {
 			alive++
 		}
 	}

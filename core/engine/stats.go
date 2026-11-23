@@ -109,6 +109,8 @@ type statsMinute struct {
 	QDrop  uint64       `json:"q_drop,omitempty"`
 	RxDrop uint64       `json:"rx_drop,omitempty"`
 	Gaps   uint64       `json:"gaps,omitempty"`
+	// RHold: ms the reorder buffer waits for a gap now (adaptive).
+	RHold float64 `json:"rhold,omitempty"`
 	// LowLat: seconds the upload pacer kept queues short for interactive
 	// traffic (games, calls).
 	LowLat uint64 `json:"low_lat,omitempty"`
@@ -280,6 +282,7 @@ func (e *Engine) statsLoop() {
 		qd, rd, gp := e.b.pacer.dropped.Load(), e.b.dropped.Load(), e.b.gaps()
 		m.QDrop, m.RxDrop, m.Gaps = sub0(qd, prevQDrop), sub0(rd, prevRxDrop), sub0(gp, prevGaps)
 		prevQDrop, prevRxDrop, prevGaps = qd, rd, gp
+		m.RHold = float64(e.b.reorder.HoldNow()/(100*time.Microsecond)) / 10
 		ll := e.b.pacer.inter.Secs.Load()
 		m.LowLat, prevLowLat = sub0(ll, prevLowLat), ll
 		qs, ls := e.idle.secs.Load(), e.idle.lightSecs.Load()

@@ -59,21 +59,21 @@ func TestRoutesOnDemand(t *testing.T) {
 	}
 }
 
-// After lightCalm without much traffic the tunnel is light again: the
+// After lightAfter without much traffic the tunnel is light again: the
 // routes over the light tier close (their workers rest).
 func TestRoutesBackToLight(t *testing.T) {
 	e := demandEngine(32)
 	t0 := time.Now()
 	tick(e, t0, heavyBulk)
 	list := testRoutes(32)
-	e.demandTick(t0.Add(lightCalm/2), list)
+	e.demandTick(t0.Add(e.lightAfter()/2), list)
 	if e.limit() != 32 {
-		t.Fatal("light again before lightCalm")
+		t.Fatal("light again before lightAfter")
 	}
 	e.idle.rate = 0 // the download long over
-	e.demandTick(t0.Add(lightCalm+time.Second), list)
+	e.demandTick(t0.Add(e.lightAfter()+time.Second), list)
 	if e.limit() != lightRoutes || !e.Status().Light {
-		t.Fatalf("not light after lightCalm: limit %d", e.limit())
+		t.Fatalf("not light after lightAfter: limit %d", e.limit())
 	}
 	for _, s := range list {
 		if s.Closed() != (s.ID >= lightRoutes) {
@@ -84,7 +84,7 @@ func TestRoutesBackToLight(t *testing.T) {
 	// every route.
 	e = demandEngine(32)
 	tick(e, t0, heavyBulk)
-	for s := 1; s <= int(lightCalm/time.Second)+5; s += 10 {
+	for s := 1; s <= int(e.lightAfter()/time.Second)+5; s += 10 {
 		e.idle.rate = 2 * lightRate
 		e.demandTick(t0.Add(time.Duration(s)*time.Second), list[:lightRoutes])
 	}
