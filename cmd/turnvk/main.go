@@ -46,6 +46,7 @@ func main() {
 	turnS := flag.String("turn", "", "TURN server host:port (default: the ones VK returns)")
 	dns := flag.String("dns", strings.Join(netx.DefaultDNS, ","), "DNS servers for VK and TURN names (empty: system)")
 	socks := flag.String("socks", "127.0.0.1:1080", "SOCKS5 proxy address")
+	socksAuthS := flag.String("socks-auth", os.Getenv("TURNVK_SOCKS_AUTH"), "SOCKS5 user:password (default: a random password, printed at start; none: no password, any program can use the proxy)")
 	test := flag.Bool("test", false, "check the tunnel (exit IP, DNS) and exit")
 	download := flag.String("download", "", "download a URL through the tunnel, print the speed and exit")
 	hold := flag.Duration("hold", 0, "with -test: keep requesting once a second for this long")
@@ -62,6 +63,10 @@ func main() {
 
 	if *linkS == "" {
 		*linkS = os.Getenv("TURNVK_LINK")
+	}
+	socksAuth, err := parseSocksAuth(*socksAuthS)
+	if err != nil {
+		log.Fatal(err)
 	}
 	l, err := link.Parse(*linkS)
 	if err != nil {
@@ -166,8 +171,12 @@ func main() {
 		}
 		os.Exit(code)
 	default:
-		go serveSOCKS(ctx, *socks, tnet)
-		log.Printf("SOCKS5 proxy on %s", *socks)
+		go serveSOCKS(ctx, *socks, socksAuth, tnet.DialContext)
+		if socksAuth.user == "" {
+			log.Printf("SOCKS5 proxy on %s, no password: any program on this computer can use it", *socks)
+		} else {
+			log.Printf("SOCKS5 proxy on %s, user %s, password %s (socks5h://%s:%s@%s)", *socks, socksAuth.user, socksAuth.pass, socksAuth.user, socksAuth.pass, *socks)
+		}
 		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
 		for {

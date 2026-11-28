@@ -60,7 +60,7 @@ func TestNoNetworkKeepsRoutes(t *testing.T) {
 	}
 	e.NetworkLost()
 	e.probing.Store(true)
-	e.replaceDeadPaths("test", time.Minute, list)
+	e.replaceDeadPaths("test", e.b.rx.Load(), list)
 	for _, s := range list {
 		if s.Closed() {
 			t.Fatal("a route closed without network")

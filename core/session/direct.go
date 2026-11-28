@@ -51,6 +51,20 @@ const (
 	ackWaitMin     = 300 * time.Millisecond
 	helloRetry     = time.Second
 	reattachWithin = 10 * time.Second
+
+	// helloRunAt: HELLO flag, the run's start follows the generation
+	// (8 bytes, unix ms).
+	helloRunAt = 0x01
+)
+
+// A HELLO refused because a newer connection of this device holds it is
+// sent again staleTries times, staleRetry apart and doubling. On a phone
+// that newer connection is mostly this app's own previous run, whose last
+// HELLO crossed the new run's, or a clock that stepped back on a network
+// switch: a fresh HELLO wins. (Variables for tests.)
+var (
+	staleTries = 2
+	staleRetry = 500 * time.Millisecond
 )
 
 // WELCOME status codes.
@@ -259,10 +273,18 @@ func (s *Session) helloBytes(p Params) ([]byte, []byte) {
 	if len(gen) > 64 {
 		gen = gen[:64]
 	}
-	b = append(b, 0, byte(len(dev)))
+	flags := byte(0)
+	if p.RunAt > 0 {
+		flags |= helloRunAt
+	}
+	b = append(b, flags, byte(len(dev)))
 	b = append(b, dev...)
 	b = append(b, byte(len(gen)))
 	b = append(b, gen...)
+	if p.RunAt > 0 {
+		// Servers before it ignore what follows the generation.
+		b = binary.BigEndian.AppendUint64(b, uint64(p.RunAt))
+	}
 	return b, nonce
 }
 
@@ -342,6 +364,7 @@ func (s *Session) readDirect(p []byte) (int, error) {
 func (s *Session) attach(p Params, deadline time.Time) (welcomeMsg, error) {
 	buf := make([]byte, maxPacket)
 	clockFixed := false
+	stale := 0
 	for {
 		hello, nonce := s.helloBytes(p)
 		if err := s.sendDirect(hello); err != nil {
@@ -369,6 +392,14 @@ func (s *Session) attach(p Params, deadline time.Time) (welcomeMsg, error) {
 				clockOffset.Store(w.clock - time.Now().UnixMilli())
 				clockFixed = true
 				break
+			}
+			if w.status == welcomeStale && stale < staleTries {
+				wait := staleRetry << stale
+				if time.Now().Add(wait).Before(deadline) {
+					stale++
+					time.Sleep(wait)
+					break
+				}
 			}
 			_ = s.relay.SetReadDeadline(time.Time{})
 			return w, w.err()

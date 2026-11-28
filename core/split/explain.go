@@ -58,6 +58,10 @@ func Explain(r Rules, lists *Lists, target, app string, addrs []netip.Addr) (Exp
 			e.Host = u
 		}
 	}
+	if p != nil && ruOut(&r, app) {
+		e.Route, e.Why = Direct, "российское приложение: не входит в VPN"
+		return e, nil
+	}
 	if len(dsts) == 0 {
 		d := m.decide(netip.Addr{}, host, p)
 		e.Route, e.Why = d.Route, d.Why

@@ -111,6 +111,8 @@ data class SplitRules(
     val networks: List<NetRoute> = emptyList(),
     /** Game apps stay out of the VPN, whatever the mode. */
     val games: Boolean = false,
+    /** Russian apps follow the rules; off, they stay out of the VPN. */
+    val ruVpn: Boolean = false,
 ) {
     /** The route a new rule gets: the opposite of the others'. */
     val other: String get() = if (default == "direct") "vpn" else "direct"
@@ -123,6 +125,7 @@ data class SplitRules(
         o.put("appsOnly", appsOnly)
         if (custom) o.put("custom", true)
         if (games) o.put("games", true)
+        if (ruVpn) o.put("ruVpn", true)
         o.put("networks", JSONArray().apply { networks.forEach { put(JSONObject().put("network", it.network).put("mode", it.mode).put("off", it.off)) } })
         return o.toString()
     }
@@ -147,6 +150,7 @@ data class SplitRules(
                 custom = o.optBoolean("custom"),
                 networks = arr("networks") { NetRoute(it.optString("network"), it.optString("mode", "vpn"), it.optBoolean("off")) },
                 games = o.optBoolean("games"),
+                ruVpn = o.optBoolean("ruVpn"),
             )
         }.getOrDefault(SplitRules())
     }
@@ -430,6 +434,21 @@ internal fun RoutesTab(store: Store, rules: SplitRules, update: (SplitRules) -> 
                     "Android узнаёт игры по их категории в магазине; другую игру можно добавить ниже правилом «напрямую». Меняется при подключении",
                 checked = rules.games,
                 onChange = { update(rules.copy(games = it)) },
+            )
+        }
+
+        Panel {
+            var ruFound by remember { mutableStateOf(emptyList<String>()) }
+            LaunchedEffect(Unit) { ruFound = withContext(Dispatchers.IO) { TunnelService.ruApps(ctx) } }
+            val names = ruFound.map { labels.get(it).first }.sorted()
+            SwitchRow(
+                title = "Российские приложения мимо VPN",
+                text = "MAX, Госуслуги, банки, маркетплейсы, Яндекс, VK и другие российские приложения не входят в VPN при любом режиме: " +
+                    "они видят обычную сеть без VPN и настоящий адрес телефона, а адрес сервера VPN не узнают. " +
+                    "Правило «через VPN» для такого приложения сильнее. Меняется при подключении" +
+                    (if (names.isNotEmpty()) ". Установлены: " + names.joinToString(", ") else ""),
+                checked = !rules.ruVpn,
+                onChange = { update(rules.copy(ruVpn = !it)) },
             )
         }
 

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -60,7 +61,7 @@ func TestDeadPathsNeedTwoMisses(t *testing.T) {
 		}
 	})
 	e.probing.Store(true)
-	e.replaceDeadPaths("test", 3*time.Second, list)
+	e.replaceDeadPaths("test", e.b.rx.Load(), list)
 	if got := closedOnes(list); len(got) != 2 || got[0] != 6 || got[1] != 7 {
 		t.Fatalf("closed %v, want [6 7]", got)
 	}
@@ -78,7 +79,7 @@ func TestDeadRelayAvoided(t *testing.T) {
 	e, list := pathsEngine(t, []string{"a:1", "a:1", "a:1", "a:1", "b:1", "b:1", "b:1", "b:1"})
 	answers(list[:4]...)
 	e.probing.Store(true)
-	e.replaceDeadPaths("test", 3*time.Second, list)
+	e.replaceDeadPaths("test", e.b.rx.Load(), list)
 	if got := closedOnes(list); len(got) != 4 || got[0] != 4 {
 		t.Fatalf("closed %v, want the four on b", got)
 	}
@@ -97,7 +98,7 @@ func TestDeadPathsCapped(t *testing.T) {
 	e, list := pathsEngine(t, servers)
 	answers(list[0], list[1], list[8], list[9])
 	e.probing.Store(true)
-	e.replaceDeadPaths("test", 3*time.Second, list)
+	e.replaceDeadPaths("test", e.b.rx.Load(), list)
 	if got := closedOnes(list); len(got) != 4 {
 		t.Fatalf("closed %v, want 4 of the 12 dead", got)
 	}
@@ -107,7 +108,7 @@ func TestDeadPathsCapped(t *testing.T) {
 func TestNoPathAnswers(t *testing.T) {
 	e, list := pathsEngine(t, []string{"a:1", "a:1", "b:1", "b:1"})
 	e.probing.Store(true)
-	e.replaceDeadPaths("test", 3*time.Second, list)
+	e.replaceDeadPaths("test", e.b.rx.Load(), list)
 	if got := closedOnes(list); len(got) != 4 {
 		t.Fatalf("closed %v, want all", got)
 	}
@@ -231,5 +232,43 @@ func TestRelayRouteTime(t *testing.T) {
 	st := r.stats["a:1"]
 	if st.routeSec < 0.99 || st.routeSec > 1.01 || st.drops < 0.49 || st.drops > 0.51 {
 		t.Fatalf("after relayMemory: route time %v, drops %v", st.routeSec, st.drops)
+	}
+}
+
+// Every path answers and nothing came back: the keys are suspected only
+// once WireGuard's own keepalive (10 s) could have come; anything from the
+// server meanwhile proves them (phones re-keyed hundreds of times at 8-10 s
+// of silence, Nov 2026).
+func TestRekeyWaitsForKeepalive(t *testing.T) {
+	old, oldPoll := keysSuspect, keysPoll
+	keysSuspect, keysPoll = 300*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { keysSuspect, keysPoll = old, oldPoll })
+	run := func(answerAfter time.Duration) (bool, time.Duration) {
+		e, list := pathsEngine(t, []string{"a:1", "a:1", "b:1", "b:1"})
+		var rekeyed atomic.Bool
+		e.cfg = Config{NoStats: true, Logf: func(f string, a ...any) {
+			if strings.Contains(fmt.Sprintf(f, a...), "re-keying") {
+				rekeyed.Store(true)
+			}
+		}}
+		answers(list...)
+		e.b.sent(make([]byte, wgKeepalive), true) // WireGuard's keepalive wants no answer
+		if e.b.waiting(time.Now()) != 0 {
+			t.Fatal("a keepalive waits for an answer")
+		}
+		start := time.Now()
+		e.b.sent(make([]byte, 100), true)
+		if answerAfter > 0 {
+			time.AfterFunc(answerAfter, func() { e.b.deliver(make([]byte, 100)) })
+		}
+		e.probing.Store(true)
+		e.replaceDeadPaths("test", e.b.rx.Load(), list)
+		return rekeyed.Load(), time.Since(start)
+	}
+	if rekeyed, took := run(150 * time.Millisecond); rekeyed || took > 280*time.Millisecond {
+		t.Fatalf("the server's keepalive came, yet re-keyed %v after %s", rekeyed, took)
+	}
+	if rekeyed, took := run(0); !rekeyed || took < keysSuspect {
+		t.Fatalf("nothing came back: re-keyed %v after %s, want after %s", rekeyed, took, keysSuspect)
 	}
 }

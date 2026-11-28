@@ -50,6 +50,9 @@ type Params struct {
 	DeviceID     string
 	Generation   string
 	Worker       int
+	// RunAt: when this run of the app began (unix ms, the device's own
+	// clock). A TurnVK server lets the later run of a device hold it.
+	RunAt int64
 
 	// OnReset is called when the server says it no longer knows this
 	// session (it restarted): the other sessions are likely stale too.

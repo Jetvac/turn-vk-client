@@ -161,6 +161,12 @@ func newApp() *app {
 	a.devID = "pc-" + hex.EncodeToString(sum[:8])
 	a.captcha = webcaptcha.New(a.logf)
 	a.fake = split.NewFake()
+	if a.path != "" {
+		// Elevated by now: the servers' links are for administrators only.
+		if err := lockDir(filepath.Dir(a.path)); err != nil {
+			a.logf("settings folder: %v", err)
+		}
+	}
 	a.load()
 	a.loadLists() // before the window: nothing to show yet
 	return a

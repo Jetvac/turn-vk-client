@@ -41,6 +41,9 @@ type bind struct {
 	// asks: packets sent that the server answers (all but WireGuard's
 	// keepalives), for the watchdog's "sending, no answer" (keepalive).
 	asks atomic.Uint64
+	// askAt: when the first of them since the server's last packet went
+	// out (unix ns; 0: none waits for an answer).
+	askAt atomic.Int64
 	// bytes: the tunnel's packets both ways, copies aside (routes on
 	// demand, idle.go).
 	bytes atomic.Uint64
@@ -118,6 +121,9 @@ func (b *bind) has(s *session.Session) bool {
 // the bind afterwards.
 func (b *bind) deliver(pkt []byte) {
 	b.rx.Add(1)
+	if b.askAt.Load() != 0 {
+		b.askAt.Store(0)
+	}
 	b.bytes.Add(uint64(len(pkt)))
 	select {
 	case b.recv <- pkt:
@@ -247,7 +253,20 @@ func (b *bind) sent(p []byte, counted bool) {
 	b.bytes.Add(uint64(len(p)))
 	if len(p) != wgKeepalive {
 		b.asks.Add(1)
+		if b.askAt.Load() == 0 {
+			b.askAt.CompareAndSwap(0, time.Now().UnixNano())
+		}
 	}
+}
+
+// waiting reports how long the first packet sent since the server's last
+// one has waited for anything to come back (0: nothing waits).
+func (b *bind) waiting(now time.Time) time.Duration {
+	at := b.askAt.Load()
+	if at == 0 {
+		return 0
+	}
+	return now.Sub(time.Unix(0, at))
 }
 
 // paced reports whether some session's server sends FEEDBACK, so that

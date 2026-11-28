@@ -61,6 +61,17 @@ class TunnelService : VpnService(), mobile.Platform {
         /** Packages whose traffic never enters the tunnel. */
         val BYPASS = listOf("com.vkontakte.android", "com.vk.calls")
 
+        /**
+         * Installed Russian apps (MAX, Госуслуги, banks, Yandex...: the
+         * engine's list), which stay out of the tunnel unless the rules say
+         * otherwise (AppPlan "ru").
+         */
+        @Suppress("DEPRECATION")
+        fun ruApps(ctx: Context): List<String> = runCatching {
+            ctx.packageManager.getInstalledApplications(0).map { it.packageName }
+                .filter { it != ctx.packageName && mobile.Mobile.isRuApp(it) }
+        }.getOrDefault(emptyList())
+
         fun connect(ctx: Context) {
             val i = Intent(ctx, TunnelService::class.java).setAction(ACTION_CONNECT)
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
@@ -300,7 +311,12 @@ class TunnelService : VpnService(), mobile.Platform {
             // "Games direct": the game apps too.
             val games = if (plan?.optBoolean("games") == true) gameApps() else emptyList()
             if (games.isNotEmpty()) log("игры напрямую: ${games.size}")
-            (BYPASS + planApps + games).toSet().forEach { p ->
+            // Russian apps: inside the tunnel they would see the VPN and
+            // learn its exit address. Out, unless a rule sends them in.
+            val ruIn = plan?.optJSONArray("ruIn")?.let { a -> (0 until a.length()).map { a.getString(it) } }.orEmpty().toSet()
+            val ru = if (plan?.optBoolean("ru") == true) ruApps(this).filter { it !in ruIn } else emptyList()
+            if (ru.isNotEmpty()) log("российские приложения мимо VPN: ${ru.size}")
+            (BYPASS + planApps + games + ru).toSet().forEach { p ->
                 try {
                     b.addDisallowedApplication(p)
                 } catch (_: PackageManager.NameNotFoundException) {

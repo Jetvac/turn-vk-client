@@ -111,6 +111,11 @@ func AppPlan() string {
 	return string(b)
 }
 
+// IsRuApp tells whether a package is a Russian app (MAX, Госуслуги,
+// banks...), which stays out of the tunnel when AppPlan has "ru", unless it
+// is in "ruIn".
+func IsRuApp(pkg string) bool { return split.IsRuApp(pkg) }
+
 // NormDomain cleans up a site's name as typed ("" and an error when it is
 // not one).
 func NormDomain(s string) (string, error) {

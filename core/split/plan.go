@@ -13,13 +13,17 @@ type AppPlan struct {
 	// Games: game apps are kept out too ("games direct"), unless only
 	// chosen apps enter.
 	Games bool `json:"games,omitempty"`
+	// Ru: Russian apps (IsRuApp) are kept out too, except RuIn, which the
+	// user's own rules send through the VPN (ruapps.go).
+	Ru   bool     `json:"ru,omitempty"`
+	RuIn []string `json:"ruIn,omitempty"`
 }
 
 // PlanApps works the plan out from the rules.
 func PlanApps(r Rules) AppPlan {
 	r.Normalize()
 	if !r.On {
-		return AppPlan{Mode: "disallow", Games: r.Games}
+		return AppPlan{Mode: "disallow", Games: r.Games, Ru: !r.RuVPN}
 	}
 	// Sites beat the rules for programs, so a site sent through the VPN
 	// reaches into apps sent direct. Address lists only refine the
@@ -56,6 +60,15 @@ func PlanApps(r Rules) AppPlan {
 		direct = nil
 	}
 	// Game apps go out even then: a game's traffic is mostly its servers'
-	// addresses, and the lowest ping is the point.
-	return AppPlan{Mode: "disallow", Apps: direct, Games: r.Games}
+	// addresses, and the lowest ping is the point. Russian apps too: inside
+	// the tunnel they see the VPN and learn its exit address.
+	p := AppPlan{Mode: "disallow", Apps: direct, Games: r.Games, Ru: !r.RuVPN}
+	if p.Ru {
+		for _, a := range vpn {
+			if IsRuApp(a) {
+				p.RuIn = append(p.RuIn, a)
+			}
+		}
+	}
+	return p
 }

@@ -76,6 +76,9 @@ type Rules struct {
 	// Games: games and their launchers go direct, whatever the mode, even
 	// with split tunneling off (games.go).
 	Games bool `json:"games,omitempty"`
+	// RuVPN: Russian apps follow the rules like the others; off (the
+	// default), Android keeps them out of the tunnel (ruapps.go).
+	RuVPN bool `json:"ruVpn,omitempty"`
 }
 
 // DefaultRules: off; when turned on, everything goes through the VPN except

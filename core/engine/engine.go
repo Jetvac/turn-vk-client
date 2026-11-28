@@ -145,7 +145,6 @@ const (
 	setupTimeout    = 45 * time.Second
 	firstWait       = 2 * time.Minute // longest wait for VK before the first session
 	staleRx         = 180 * time.Second
-	silentActive    = 8 * time.Second
 	silentProbe     = 2 * time.Second // direct protocol: probe the paths
 	// pathReplace: a direct path silent this long while others answer is
 	// replaced (three missed pings).
@@ -240,6 +239,11 @@ type Engine struct {
 	relays      relays               // loss per TURN server
 	rekeying    atomic.Bool
 	lastReset   atomic.Int64
+	// runAt: when this run began (unix ms), for the server to order runs;
+	// staleSince: the first refusal for a newer connection of this device
+	// since a HELLO was last accepted (unix ns; 0: none).
+	runAt      int64
+	staleSince atomic.Int64
 
 	// keys is this connection's own WireGuard key pair (direct protocol:
 	// the server never sees the private key). mode is modeUnknown until
@@ -439,7 +443,7 @@ func New(cfg Config) (*Engine, error) {
 		e.quiet = session.NewQuiet()
 		e.b.quiet = e.quiet
 	}
-	e.gen = randomID()
+	e.gen, e.runAt = randomID(), time.Now().UnixMilli()
 	if _, err := rand.Read(e.keys.Private[:]); err != nil {
 		return nil, err
 	}
@@ -511,6 +515,7 @@ func (e *Engine) start(ctx context.Context, mk TunFactory) error {
 	for attempt := 0; ; attempt++ {
 		first, err = e.dial(ctx, 0, attempt)
 		if err == nil {
+			e.staleSince.Store(0)
 			break
 		}
 		var we *waitError
@@ -523,7 +528,7 @@ func (e *Engine) start(ctx context.Context, mk TunFactory) error {
 			attempt--
 			continue
 		}
-		if fatal(err) || ctx.Err() != nil || e.ctx.Err() != nil || attempt >= 4 {
+		if e.isFatal(err) || ctx.Err() != nil || e.ctx.Err() != nil || (attempt >= 4 && !stale(err)) {
 			return err
 		}
 		e.logf("first session failed (%v), retrying", err)
@@ -620,7 +625,7 @@ func (e *Engine) worker(i int, s *session.Session) {
 				if e.ctx.Err() != nil {
 					return
 				}
-				if fatal(err) {
+				if e.isFatal(err) {
 					e.fail(err)
 					return
 				}
@@ -656,6 +661,7 @@ func (e *Engine) worker(i int, s *session.Session) {
 				continue
 			}
 			fails = 0
+			e.staleSince.Store(0)
 			e.offline.up()
 			e.silent.up()
 			if i > 0 && i >= e.limit() {
@@ -727,7 +733,7 @@ func (e *Engine) readLoop(s *session.Session) {
 		n, err := s.Read(buf)
 		if err != nil {
 			putBuf(buf)
-			if d := s.Denied(); d != nil && e.ctx.Err() == nil {
+			if d := s.Denied(); d != nil && e.ctx.Err() == nil && e.isFatal(d) {
 				e.fail(d)
 			}
 			return
@@ -765,7 +771,7 @@ func (e *Engine) dial(ctx context.Context, i, shift int) (*session.Session, erro
 	p := session.Params{
 		Peer: e.peer, TURNServer: server, Username: creds.Username, Password: creds.Password,
 		AEAD: e.aead, Mode: e.cfg.Mode, Net: e.cfg.Net,
-		ConnPassword: e.cfg.Link.Password, DeviceID: e.cfg.DeviceID, Generation: e.gen, Worker: i,
+		ConnPassword: e.cfg.Link.Password, DeviceID: e.cfg.DeviceID, Generation: e.gen, Worker: i, RunAt: e.runAt,
 		OnReset: e.serverReset, Logf: e.logf, OnUnfreed: e.noteUnfreed, RTTs: &e.rtts, Quiet: e.quiet,
 		NetDown: func() bool { return e.netDown(time.Now()) },
 		Direct:  mode != modeDTLS, Keys: &e.keys, ServerKey: e.cfg.Link.ServerKey,
@@ -1133,8 +1139,10 @@ func (hs *hashState) credsKey(g int, cs *credSlot) string {
 }
 
 // watchdog recycles the sessions when the server has gone silent:
-//   - the tunnel is in use (packets go out) but nothing has come back for
-//     silentActive: a server that lost our sessions without telling us;
+//   - the tunnel is in use (packets go out) but nothing has come back: the
+//     direct protocol probes its paths after silentProbe and re-keys only
+//     past keysSuspect; the DTLS one reconnects past keysSuspect (a server
+//     that lost our sessions without telling us);
 //   - nothing at all has come back for staleRx: with WireGuard re-keying
 //     every two minutes a healthy tunnel always receives within that.
 func (e *Engine) watchdog() {
@@ -1210,8 +1218,8 @@ func (e *Engine) watchdog() {
 		case direct && silent > silentProbe && e.b.asks.Load()-txAtRx >= 5:
 			// Direct paths are probed, not dropped, so look early.
 			reason = fmt.Sprintf("no answer from the server for %s while sending", silent.Round(time.Second))
-		case silent > silentActive && e.b.asks.Load()-txAtRx >= 10:
-			reason = fmt.Sprintf("no answer from the server for %s while sending", silent.Round(time.Second))
+		case e.b.waiting(now) > keysSuspect && e.b.asks.Load()-txAtRx >= 10:
+			reason = fmt.Sprintf("no answer from the server for %s while sending", e.b.waiting(now).Round(time.Second))
 		case silent > staleRx && (!direct || e.b.asks.Load() > txAtRx):
 			// A quiet direct tunnel gets nothing back: its paths' pings
 			// tell whether they live (replaceSilentPaths). Only something
@@ -1225,7 +1233,7 @@ func (e *Engine) watchdog() {
 			// Each path answers pings: find the dead ones and replace
 			// only those; the others keep the tunnel up.
 			if e.probing.CompareAndSwap(false, true) {
-				go e.replaceDeadPaths(reason, silent, list)
+				go e.replaceDeadPaths(reason, lastRx, list)
 			}
 			lastRx, rxAt, txAtRx = e.b.rx.Load(), time.Now(), e.b.asks.Load()
 			continue
@@ -1359,14 +1367,26 @@ func answeredAfter(list []*session.Session, sv string, last int64) int {
 // replaceDeadPaths (a variable for tests).
 var deadProbeWait = 2500 * time.Millisecond
 
+// keysSuspect: WireGuard answers any data with a keepalive within its
+// KeepaliveTimeout (10 s) when it has nothing else to send, so while every
+// path answers, the keys are suspect only when nothing came back this long
+// after the first packet that wanted an answer (a variable for tests). The
+// stats (Nov 2026): phones re-keyed hundreds of times at 8-10 s of
+// silence, before that keepalive could have arrived.
+var keysSuspect = 13 * time.Second
+
+// keysPoll: how often that wait looks for the server's answer.
+var keysPoll = 250 * time.Millisecond
+
 // replaceDeadPaths probes every path and replaces those that do not
 // answer (their workers open new ones). A path is dead only when it misses
 // two probes in a row: one lost ping or answer is no dead route, and every
 // route replaced costs a VK allocation (the stats showed a PC replacing
 // one or two healthy routes every couple of minutes while it sent next to
 // nothing). If none answers, the server is likely gone or restarted:
-// WireGuard re-keys once paths are back.
-func (e *Engine) replaceDeadPaths(reason string, silent time.Duration, list []*session.Session) {
+// WireGuard re-keys once paths are back. rx0 is the count of the server's
+// packets when the silence was noticed.
+func (e *Engine) replaceDeadPaths(reason string, rx0 uint64, list []*session.Session) {
 	defer e.probing.Store(false)
 	// No network: nothing would answer, and nothing new could open.
 	if now := time.Now(); e.netDown(now) {
@@ -1407,10 +1427,21 @@ func (e *Engine) replaceDeadPaths(reason string, silent time.Duration, list []*s
 	switch {
 	case len(dead) == 0:
 		// Every path answers: the traffic itself may simply get no
-		// reply. Only a long silence suggests lost WireGuard keys.
-		if silent >= silentActive {
-			e.logf("%s; every path answers, re-keying", reason)
-			e.rehandshake("silent tunnel")
+		// reply. Anything from the server meanwhile proves the keys;
+		// otherwise wait out WireGuard's keepalive before re-keying.
+		for e.b.rx.Load() == rx0 {
+			w := e.b.waiting(time.Now())
+			if w == 0 {
+				return
+			}
+			if w >= keysSuspect {
+				e.logf("no answer from the server for %s while sending; every path answers, re-keying", w.Round(time.Second))
+				e.rehandshake("silent tunnel")
+				return
+			}
+			if !sleep(e.ctx, min(keysSuspect-w, keysPoll)) {
+				return
+			}
 		}
 	case alive == 0:
 		for _, s := range dead {
@@ -1679,9 +1710,36 @@ func (g *captchaGate) SolveCaptcha(ctx context.Context, uri string) (string, err
 	return g.next.SolveCaptcha(ctx, uri)
 }
 
-func fatal(err error) bool {
+// staleGiveUp: refusals because a newer connection of this device holds it
+// end the run only once they have gone on this long with no HELLO of the
+// run accepted meanwhile: then another copy of the app really holds the
+// device. Until then they come from this app's own previous run, or from a
+// clock that stepped back (a phone stopped for good with "this device
+// connected again elsewhere", Nov 2026).
+const staleGiveUp = time.Minute
+
+// isFatal reports whether err ends the run: any refusal by the server, but
+// one for a newer connection of this device only after staleGiveUp.
+func (e *Engine) isFatal(err error) bool {
 	var d *session.DeniedError
-	return errors.As(err, &d)
+	if !errors.As(err, &d) {
+		return false
+	}
+	if !stale(err) {
+		return true
+	}
+	now := time.Now().UnixNano()
+	if e.staleSince.CompareAndSwap(0, now) {
+		e.logf("the server holds a newer connection of this device (this app's previous run?): trying again")
+		return false
+	}
+	return time.Duration(now-e.staleSince.Load()) > staleGiveUp
+}
+
+// stale reports a refusal for a newer connection of this device.
+func stale(err error) bool {
+	var d *session.DeniedError
+	return errors.As(err, &d) && d.Reason == "newer_connection"
 }
 
 func sleep(ctx context.Context, d time.Duration) bool {
